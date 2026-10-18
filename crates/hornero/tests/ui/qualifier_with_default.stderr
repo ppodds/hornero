@@ -1,0 +1,5 @@
+error: `qualifier` selects which provider to inject, so it cannot be combined with `default` or `with`
+ --> tests/ui/qualifier_with_default.rs:7:35
+  |
+7 |     #[inject(default, qualifier = Primary)]
+  |                                   ^^^^^^^

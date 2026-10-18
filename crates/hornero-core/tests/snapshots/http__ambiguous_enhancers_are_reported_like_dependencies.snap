@@ -1,0 +1,11 @@
+---
+source: crates/hornero-core/tests/http.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] ambiguous dependency
+    guard PassGuard (in App) requires `PassGuard`, which is visible from several sources:
+      - PassGuard (in PassModuleA)
+      - PassGuard (in PassModuleB)
+    hint: provide `PassGuard` locally, or import only one of the modules that export it (a global module counts as imported everywhere).

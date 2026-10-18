@@ -1,0 +1,5 @@
+error: field `name` is not an `Arc<T>`, so it cannot be injected; wrap it in `Arc`, or add `#[inject(default)]` or `#[inject(with = expr)]`
+ --> tests/ui/non_arc_field.rs:5:11
+  |
+5 |     name: String,
+  |           ^^^^^^

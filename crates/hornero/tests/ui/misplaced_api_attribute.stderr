@@ -1,0 +1,33 @@
+error: `#[api_body(...)]` goes on a route method of an impl block marked `#[routes]`
+ --> tests/ui/misplaced_api_attribute.rs:7:1
+  |
+7 | #[api_body(Upload)]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `api_body` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: expected an HTTP status code between 100 and 599
+  --> tests/ui/misplaced_api_attribute.rs:24:20
+   |
+24 |     #[api_response(700)]
+   |                    ^^^
+
+error: `#[api_exclude]` takes no arguments
+  --> tests/ui/misplaced_api_attribute.rs:36:5
+   |
+36 |     #[api_exclude(true)]
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+error: `content_type` needs a `body = Type`
+  --> tests/ui/misplaced_api_attribute.rs:48:40
+   |
+48 |     #[api_response(200, content_type = "text/csv")]
+   |                                        ^^^^^^^^^^
+
+error: `#[api_response(...)]` goes below `#[controller(...)]` on a controller struct, or on a route method of an impl block marked `#[routes]`
+  --> tests/ui/misplaced_api_attribute.rs:58:5
+   |
+58 |     #[api_response(200)]
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `api_response` (in Nightly builds, run with -Z macro-backtrace for more info)

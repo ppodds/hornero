@@ -1,0 +1,4 @@
+/target
+*.snap.new
+*.db
+/.claude/

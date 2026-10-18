@@ -1,0 +1,22 @@
+[package]
+name = "hornero-sea-orm"
+description = "SeaORM integration for hornero: a SeaOrmModule providing the database connection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+sqlite = ["sea-orm/sqlx-sqlite"]
+
+[dependencies]
+hornero.workspace = true
+sea-orm = { workspace = true, features = ["runtime-tokio-rustls", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+hornero-testing.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+tokio.workspace = true

@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] scope violation
+    PinnedService (in App) is pinned to singleton scope but depends on a request-scoped provider.
+    chain: PinnedService -> AuditLog [request]

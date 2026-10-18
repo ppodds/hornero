@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] missing dependency
+    Client (in App) requires `Url@Archive`, but no provider of it is visible there.
+    hint: no module provides `Url@Archive`, but the same type is provided as `Url@Primary` (in UrlModule), `Url@Replica` (in UrlModule); check the qualifier (`#[inject(qualifier = Q)]` on the consumer, `.qualified::<Q>()` on the provider).

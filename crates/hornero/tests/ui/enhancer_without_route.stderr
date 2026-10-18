@@ -1,0 +1,5 @@
+error: this attribute needs a route attribute such as `#[get("/path")]` on the same method
+  --> tests/ui/enhancer_without_route.rs:17:5
+   |
+17 |     #[guards(AuthGuard)]
+   |     ^

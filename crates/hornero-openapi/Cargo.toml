@@ -1,0 +1,30 @@
+[package]
+name = "hornero-openapi"
+description = "OpenAPI documents and Swagger UI for hornero, inferred from the route table with utoipa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["swagger-ui"]
+# Serves Swagger UI next to the JSON document. The UI's assets are embedded at build time.
+swagger-ui = ["dep:utoipa-swagger-ui"]
+
+[dependencies]
+axum.workspace = true
+hornero-core.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui = { workspace = true, optional = true, features = ["vendored"] }
+
+[dev-dependencies]
+garde.workspace = true
+insta = { workspace = true, features = ["json"] }
+hornero = { workspace = true, features = ["swagger-ui"] }
+hornero-testing.workspace = true
+hornero-validation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

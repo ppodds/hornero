@@ -1,0 +1,23 @@
+error: `#[guards(...)]` must come after `#[controller(...)]`: put `#[controller]` first and the enhancers below it
+  --> tests/ui/misplaced_enhancer.rs:13:1
+   |
+13 | #[guards(AuthGuard)]
+   | ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `guards` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: `#[interceptors(...)]` goes below `#[controller(...)]` on a controller struct, or on a route method of an impl block marked `#[routes]`
+  --> tests/ui/misplaced_enhancer.rs:29:5
+   |
+29 |     #[interceptors(AuthGuard)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `interceptors` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: `#[meta(...)]` on a struct needs `#[controller(...)]` above it
+  --> tests/ui/misplaced_enhancer.rs:34:1
+   |
+34 | #[meta(1)]
+   | ^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `meta` (in Nightly builds, run with -Z macro-backtrace for more info)

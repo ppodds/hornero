@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] circular dependency
+    A (in App) -> B (in App) -> C (in App) -> A (in App)
+    hint: hornero has no forwardRef; extract the shared logic into a new provider, or decouple with events or channels.

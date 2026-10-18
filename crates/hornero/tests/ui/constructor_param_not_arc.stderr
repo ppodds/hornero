@@ -1,0 +1,5 @@
+error: constructor parameters must be `Arc<T>`; each `T` is resolved from the container
+ --> tests/ui/constructor_param_not_arc.rs:7:18
+  |
+7 |     fn new(name: String) -> Self {
+  |                  ^^^^^^

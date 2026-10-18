@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] scope violation
+    Hooked (in App) has lifecycle hooks but is request-scoped; hooks only run on singletons.
+    chain: Hooked -> AuditLog [request]

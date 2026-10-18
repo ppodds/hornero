@@ -1,0 +1,11 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] ambiguous dependency
+    re-export in FacadeModule requires `Database`, which is visible from several sources:
+      - Database (in DatabaseModule)
+      - Database (in OtherDatabaseModule)
+    hint: provide `Database` locally, or import only one of the modules that export it (a global module counts as imported everywhere).

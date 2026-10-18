@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] missing dependency
+    UserService (in UsersModule) requires `Database`, but no provider of it is visible there.
+    hint: `Database` is exported by DatabaseModule; add it to the imports of UsersModule.

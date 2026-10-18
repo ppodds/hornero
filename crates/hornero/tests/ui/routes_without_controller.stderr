@@ -1,0 +1,13 @@
+error[E0277]: `XController` is missing its controller attributes
+ --> tests/ui/routes_without_controller.rs:6:1
+  |
+6 | #[routes]
+  | ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `ControllerAttrs` is not implemented for `XController`
+ --> tests/ui/routes_without_controller.rs:4:1
+  |
+4 | struct XController;
+  | ^^^^^^^^^^^^^^^^^^
+  = note: add `#[controller("/path")]` to the struct definition
+  = note: this error originates in the attribute macro `routes` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,18 @@
+# Every key can be overridden with a TODO_-prefixed environment variable;
+# `__` separates nested keys, e.g. TODO_DATABASE__URL=sqlite::memory:
+
+[server]
+address = "127.0.0.1:3000"
+
+[database]
+url = "sqlite://todo.db?mode=rwc"
+max_connections = 5
+
+# Static bearer tokens keep the example self-contained; swap TokenStore for a JWT verifier.
+[auth.tokens.admin-token]
+user = "alice"
+roles = ["admin", "user"]
+
+[auth.tokens.user-token]
+user = "bob"
+roles = ["user"]

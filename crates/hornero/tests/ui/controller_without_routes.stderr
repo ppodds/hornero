@@ -1,0 +1,20 @@
+error[E0277]: `XController` is not a controller
+ --> tests/ui/controller_without_routes.rs:6:25
+  |
+6 | #[module(controllers = [XController])]
+  | ------------------------^^^^^^^^^^^---
+  | |                       |
+  | |                       unsatisfied trait bound
+  | required by a bound introduced by this call
+  |
+help: the trait `Controller` is not implemented for `XController`
+ --> tests/ui/controller_without_routes.rs:4:1
+  |
+4 | struct XController;
+  | ^^^^^^^^^^^^^^^^^^
+  = note: add `#[routes]` to an impl block of `XController` (with `#[controller]` on the struct), or implement `hornero::Controller` by hand
+note: required by a bound in `ModuleDef::controller`
+ --> $WORKSPACE/crates/hornero-core/src/di/module.rs
+  |
+  |     pub fn controller<C: Controller>(&mut self) -> &mut Self {
+  |                          ^^^^^^^^^^ required by this bound in `ModuleDef::controller`

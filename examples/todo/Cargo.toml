@@ -1,0 +1,26 @@
+[package]
+name = "todo"
+description = "A todo API showing every hornero concept: modules, DI, guards, interceptors, filters, request scope, OpenAPI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hornero = { workspace = true, features = ["swagger-ui"] }
+hornero-config.workspace = true
+hornero-sea-orm = { workspace = true, features = ["sqlite"] }
+hornero-validation.workspace = true
+garde.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+hornero-testing.workspace = true

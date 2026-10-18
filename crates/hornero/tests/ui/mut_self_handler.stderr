@@ -1,0 +1,5 @@
+error: route handlers take `&self`: one controller instance serves many requests concurrently
+ --> tests/ui/mut_self_handler.rs:9:21
+  |
+9 |     async fn handle(&mut self) -> &'static str {
+  |                     ^^^^^^^^^

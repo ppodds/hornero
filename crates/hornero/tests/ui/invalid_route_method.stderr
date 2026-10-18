@@ -1,0 +1,5 @@
+error: invalid HTTP method `GE T`: a method is a non-empty token of letters, digits and `!#$%&'*+-.^_`|~`
+ --> tests/ui/invalid_route_method.rs:8:13
+  |
+8 |     #[route("GE T", "/")]
+  |             ^^^^^^

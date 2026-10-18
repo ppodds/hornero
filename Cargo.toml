@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "examples/*", "docs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hornero = { path = "crates/hornero" }
+hornero-core = { path = "crates/hornero-core" }
+hornero-macros = { path = "crates/hornero-macros" }
+hornero-testing = { path = "crates/hornero-testing" }
+hornero-config = { path = "crates/hornero-config" }
+hornero-validation = { path = "crates/hornero-validation" }
+hornero-sea-orm = { path = "crates/hornero-sea-orm" }
+hornero-openapi = { path = "crates/hornero-openapi", default-features = false }
+
+axum = "0.8.9"
+bytes = "1.12"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+garde = { version = "0.23", features = ["derive", "full"] }
+http = "1.5"
+http-body-util = "0.1.5"
+insta = "1.49"
+proc-macro2 = "1.0"
+quote = "1.0"
+sea-orm = { version = "2.0.4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tokio-util = "0.7.20"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["catch-panic", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+trybuild = "1.0"
+utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order"] }
+utoipa-swagger-ui = { version = "10.0.1", default-features = false }

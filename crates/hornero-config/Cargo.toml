@@ -1,0 +1,17 @@
+[package]
+name = "hornero-config"
+description = "Typed configuration for hornero: a ConfigModule backed by figment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+figment.workspace = true
+hornero.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+hornero-testing.workspace = true
+tokio.workspace = true

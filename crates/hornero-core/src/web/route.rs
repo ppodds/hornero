@@ -1,0 +1,70 @@
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::http::Method;
+
+/// Typed route metadata, hornero's replacement for Nest's `SetMetadata` + `Reflector`.
+///
+/// Values are keyed by type, so a guard asks for `ctx.route.meta::<Roles>()` instead of a string key.
+#[derive(Clone, Default)]
+pub struct Metadata {
+    values: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl Metadata {
+    /// Stores `value`, replacing any previous value of the same type.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.values.insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// The value of type `T`, if any.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.values
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<T>())
+    }
+
+    /// Copies `other` over `self`; entries in `other` win.
+    pub(crate) fn extend(&mut self, other: &Metadata) {
+        for (key, value) in &other.values {
+            self.values.insert(*key, value.clone());
+        }
+    }
+}
+
+/// Static information about the route being handled, available to guards, interceptors and filters.
+pub struct RouteContext {
+    pub(crate) controller: String,
+    pub(crate) handler: &'static str,
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) meta: Metadata,
+}
+
+impl RouteContext {
+    /// Short type name of the controller.
+    pub fn controller(&self) -> &str {
+        &self.controller
+    }
+
+    /// Name of the handler method.
+    pub fn handler(&self) -> &'static str {
+        self.handler
+    }
+
+    /// The HTTP method.
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// The full route path pattern, e.g. `/todos/{id}`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Route metadata of type `T`; handler-level values take precedence over controller-level ones.
+    pub fn meta<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.meta.get::<T>()
+    }
+}

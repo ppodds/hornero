@@ -1,0 +1,7 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: report.to_string()
+---
+  AuditLog (in App): declared request-scoped
+  TodoService (in App): request-scoped via TodoService -> AuditLog [request]
+  TodoFacade (in App): request-scoped via TodoFacade -> TodoService -> AuditLog [request]
