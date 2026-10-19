@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::Route;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_util::sync::CancellationToken;
+use tower::util::MapResponse;
 use tower::{Layer, Service};
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -27,6 +29,7 @@ use crate::di::scope::{ErasedHandle, Handle, HandleInner};
 use crate::error::{BootError, HttpError, Problem, ShutdownError};
 use crate::lifecycle::{ErasedLifecycle, Hook, Shutdown};
 use crate::util::BoxError;
+use crate::web::cancel::{self, Cancellable};
 use crate::web::enhancer::{self, EnhancerKind, EnhancerRef};
 use crate::web::filter::ExceptionFilter;
 use crate::web::guard::Guard;
@@ -302,7 +305,11 @@ impl Hornero {
     /// Builds the application and serves it until SIGINT/SIGTERM or [`Shutdown::trigger`].
     ///
     /// If `addr` cannot be bound, the application is closed again, running its shutdown hooks,
-    /// before the error is returned.
+    /// before the error is returned. It is an [`std::io::Error`] of the bind error's kind; if a
+    /// hook failed as well, its [`source`](std::error::Error::source) is the [`ShutdownError`].
+    ///
+    /// Binding comes after `build` on purpose: an open port would pass TCP health checks while
+    /// the application is still starting.
     pub async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError> {
         let app = self.build().await?;
         let bound = async {
@@ -316,12 +323,41 @@ impl Hornero {
                 app.serve(listener).await
             }
             Err(err) => {
-                // `build` already ran the init hooks: undo them as a failed bootstrap would. A
-                // failing hook is logged; the bind error is the one the caller needs.
-                let _ = app.close().await;
-                Err(err.into())
+                // `build` already ran the init hooks: undo them as a failed bootstrap would.
+                match app.close().await {
+                    Ok(()) => Err(err.into()),
+                    Err(cleanup) => {
+                        let kind = err.kind();
+                        Err(std::io::Error::new(kind, BindFailed { bind: err, cleanup }).into())
+                    }
+                }
             }
         }
+    }
+}
+
+/// A bind failure after which closing the application failed too. `listen` wraps it in an
+/// `io::Error` of the bind error's kind, so callers matching on the kind still can.
+struct BindFailed {
+    bind: std::io::Error,
+    cleanup: ShutdownError,
+}
+
+impl fmt::Display for BindFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; then {}", self.bind, self.cleanup)
+    }
+}
+
+impl fmt::Debug for BindFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for BindFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cleanup)
     }
 }
 
@@ -395,13 +431,16 @@ impl App {
             }
         };
         // Dropping the server future would not stop its connections: axum spawns a task for each.
+        // Each connection gets a child of `cancel` instead, fired below when waiting runs out.
         let cancel = CancellationToken::new();
-        let server = axum::serve(
-            listener,
-            pipeline::cancel_on(self.router.clone(), cancel.clone())
+        let connections = cancel.clone();
+        let make_service = MapResponse::new(
+            self.router
+                .clone()
                 .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(signal);
+            move |service| Cancellable::new(service, connections.child_token()),
+        );
+        let server = axum::serve(listener, make_service).with_graceful_shutdown(signal);
         let mut server = std::pin::pin!(server.into_future());
 
         let timeout = self.shutdown_timeout;
@@ -410,10 +449,10 @@ impl App {
             tokio::select! {
                 _ = sleep_for(timeout) => tracing::warn!(
                     timeout = ?timeout,
-                    "graceful shutdown timed out; dropping the remaining connections"
+                    "graceful shutdown timed out; cancelling the remaining requests"
                 ),
                 _ = os_signal() => tracing::warn!(
-                    "second shutdown signal received; dropping the remaining connections"
+                    "second shutdown signal received; cancelling the remaining requests"
                 ),
             }
         };
@@ -640,6 +679,8 @@ fn assemble(
 ) -> Router {
     let root = graph.root;
     let mut app = Router::new();
+    // Routers mounted at `/`, whose fallbacks become the application's.
+    let mut root_mounts = Vec::new();
 
     // Global enhancers: the ones registered on `Hornero` (resolved in the root module), then the
     // ones modules declare with `AppGuard<G>` and friends (resolved where they are declared).
@@ -755,6 +796,7 @@ fn assemble(
             };
             let full = join_paths(&[prefix, &path]);
             router = if full == "/" {
+                root_mounts.push((*mounted).clone());
                 router.merge((*mounted).clone())
             } else {
                 router.nest(&full, (*mounted).clone())
@@ -779,14 +821,14 @@ fn assemble(
     let Some(rt) = rt else {
         return app;
     };
-    // A router mounted at `/` may bring its own fallback (an SPA's `index.html`, say), which
-    // `merge` kept. Unmatched requests go to the router as it is now, so they reach that fallback
-    // or axum's bare 404, and only the latter becomes problem+json.
-    let unmatched = pipeline::not_found_as_problem(app.clone());
-    app = app.fallback_service(unmatched);
+    // Not the fallback `merge` kept: that is the last module router's, wrapped in that module's
+    // layers, which would then run for every request no route matches.
+    app = app.fallback_service(pipeline::root_fallback(root_mounts));
     // Inside the global layers and middleware, so a panic's 500 still passes through them (CORS,
     // request ids, tracing), but outside routing and module layers so it covers the fallback too.
     app = app.layer(CatchPanicLayer::custom(panic_response));
+    // Likewise for the 503 of a request `serve` cancels at the shutdown timeout.
+    app = cancel::answer_cancelled(app);
     app = apply_layers(
         app,
         layers,

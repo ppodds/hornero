@@ -259,6 +259,16 @@ pub enum Problem {
         /// Every provider it could resolve to.
         candidates: Vec<String>,
     },
+    /// A module re-exports (`export_module`) several modules that export different providers of
+    /// one type.
+    AmbiguousReexport {
+        /// The re-exporting module.
+        module: String,
+        /// Short type name of the re-exported type.
+        dependency: String,
+        /// Every provider it could resolve to.
+        candidates: Vec<String>,
+    },
     /// A module registers the same type, under the same qualifier, twice.
     DuplicateProvider {
         /// Short type name of the provider, with its qualifier if any.
@@ -359,6 +369,7 @@ impl Problem {
         match self {
             Problem::MissingDependency { .. } => "missing dependency",
             Problem::AmbiguousDependency { .. } => "ambiguous dependency",
+            Problem::AmbiguousReexport { .. } => "ambiguous re-export",
             Problem::DuplicateProvider { .. } => "duplicate provider",
             Problem::CircularDependency { .. } => "circular dependency",
             Problem::CircularImport { .. } => "circular module import",
@@ -399,19 +410,35 @@ impl Problem {
                 for candidate in candidates {
                     writeln!(f, "{INDENT}  - {candidate}")?;
                 }
-                if candidates
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| candidates[..i].contains(c))
-                {
-                    writeln!(
-                        f,
-                        "{INDENT}hint: the sources have identical names, which usually means a dynamic module such as `for_root` is registered more than once; register it once, in the root module."
-                    )
+                if has_duplicates(candidates) {
+                    writeln!(f, "{INDENT}hint: {DUPLICATE_REGISTRATION_HINT}")
                 } else {
                     writeln!(
                         f,
                         "{INDENT}hint: provide `{dependency}` locally, or import only one of the modules that export it (a global module counts as imported everywhere)."
+                    )
+                }
+            }
+            Problem::AmbiguousReexport {
+                module,
+                dependency,
+                candidates,
+            } => {
+                writeln!(
+                    f,
+                    "{INDENT}{module} re-exports `{dependency}` from several sources that provide different instances:"
+                )?;
+                for candidate in candidates {
+                    writeln!(f, "{INDENT}  - {candidate}")?;
+                }
+                if has_duplicates(candidates) {
+                    writeln!(f, "{INDENT}hint: {DUPLICATE_REGISTRATION_HINT}")
+                } else {
+                    // A local provider only shadows re-exports when it is exported itself, and
+                    // `export_module` needs the import, so "import only one" does not apply here.
+                    writeln!(
+                        f,
+                        "{INDENT}hint: provide `{dependency}` in {module} and export it, which shadows the re-exported ones, or re-export it from only one of these sources."
                     )
                 }
             }
@@ -492,6 +519,16 @@ impl Problem {
         }
     }
 }
+
+/// Candidates with identical names: one dynamic module registered several times.
+fn has_duplicates(candidates: &[String]) -> bool {
+    candidates
+        .iter()
+        .enumerate()
+        .any(|(i, c)| candidates[..i].contains(c))
+}
+
+const DUPLICATE_REGISTRATION_HINT: &str = "the sources have identical names, which usually means a dynamic module such as `for_root` is registered more than once; register it once, in the root module.";
 
 /// Writes `"{headline}: N problem(s)"` followed by every problem, numbered.
 fn write_problems(f: &mut fmt::Formatter<'_>, headline: &str, problems: &[Problem]) -> fmt::Result {

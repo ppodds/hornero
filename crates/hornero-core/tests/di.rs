@@ -829,8 +829,60 @@ fn re_exported_modules_that_disagree_are_rejected() {
         m.import(Facade).provide::<Weather>();
     });
     let err = Hornero::new(App).validate().unwrap_err();
-    assert_eq!(err.problems().len(), 1, "{err}");
+    assert!(
+        matches!(err.problems(), [Problem::AmbiguousReexport { module, .. }] if module == "Facade"),
+        "{err}"
+    );
     insta::assert_snapshot!(err.to_string());
+}
+
+#[tokio::test]
+async fn an_exported_local_provider_settles_re_exports_that_disagree() {
+    module!(North, |m| {
+        m.provide_value(Region("north")).export::<Region>();
+    });
+    module!(South, |m| {
+        m.provide_value(Region("south")).export::<Region>();
+    });
+    // What the hint suggests: provide it in the re-exporting module and export it.
+    module!(Facade, |m| {
+        m.import(North)
+            .import(South)
+            .provide_value(Region("facade"))
+            .export::<Region>()
+            .export_module::<North>()
+            .export_module::<South>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Weather>().unwrap().0.0, "facade");
+}
+
+#[test]
+fn an_unexported_local_provider_does_not_settle_re_exports_that_disagree() {
+    module!(North, |m| {
+        m.provide_value(Region("north")).export::<Region>();
+    });
+    module!(South, |m| {
+        m.provide_value(Region("south")).export::<Region>();
+    });
+    module!(Facade, |m| {
+        m.import(North)
+            .import(South)
+            .provide_value(Region("facade"))
+            .export_module::<North>()
+            .export_module::<South>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::AmbiguousReexport { .. }]),
+        "{err}"
+    );
 }
 
 #[test]

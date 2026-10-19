@@ -476,8 +476,8 @@ impl Graph {
         // `exported` iterates in no particular order; report in node order to stay deterministic.
         conflicts.sort_by(|(_, a), (_, b)| a.cmp(b));
         for (key, candidates) in conflicts {
-            self.problems.push(Problem::AmbiguousDependency {
-                consumer: format!("re-export in {}", self.modules[module].name),
+            self.problems.push(Problem::AmbiguousReexport {
+                module: self.modules[module].name.clone(),
                 dependency: key.short_name(),
                 candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
             });

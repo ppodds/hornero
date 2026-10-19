@@ -44,7 +44,7 @@ pub struct Hornero { /* ... */ }
 | `fn routes(&self) -> Result<Routes, BootError>` | 列出所有 controller 路由（見 [`Routes`](#routesrouteinfo-與-enhancerinfo)），和 `validate` 一樣驗證依賴圖與路由、不建構任何東西；產生 API 文件用 |
 | `fn validate(&self) -> Result<ScopeReport, BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
 | `async fn build(self) -> Result<App, BootError>` | 驗證、建構所有 singleton、組出 router，再執行 `on_module_init` 與 `on_application_bootstrap`。建構之後任何一步失敗，都會觸發 `Shutdown` 並對已建構的有 hook 的 singleton 執行 `on_module_destroy` 與 `on_application_shutdown`（反向依賴順序），清理失敗接在原本的問題之後 |
-| `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook；位址無法綁定時，先執行關閉 hook 再回傳錯誤 |
+| `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook；位址無法綁定時，先執行關閉 hook 再回傳錯誤：一個與綁定錯誤同 `ErrorKind` 的 `io::Error`，關閉 hook 也失敗時它的 `source()` 是 `ShutdownError`。先 `build` 再綁定是刻意的：port 一開就會通過 TCP health check，應用卻還沒啟動完 |
 
 `layer` 的完整 bound 與 axum 的 `Router::layer` 相同：`L: Layer<Route> + Clone + Send + Sync + 'static`，且 `L::Service` 是回應為 `IntoResponse`、錯誤為 `Infallible` 的 `Service<Request>`。
 
@@ -136,10 +136,10 @@ pub struct ModuleDef { /* ... */ }
 | `fn controller<C: Controller>(&mut self)` | 註冊 controller |
 | `fn export<T: ?Sized>(&mut self)` | export 一個 provider：本模組提供的，或 import 進來的（轉出） |
 | `fn export_qualified<T: ?Sized, Q>(&mut self)` | 同上，export 以 qualifier `Q` 註冊的 `T` |
-| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports；與自己 export 的 local provider 同型別時 local 優先，與其他轉出來源指向不同 provider 時是歧義錯誤 |
+| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports；與自己 export 的 local provider 同型別時 local 優先，與其他轉出來源指向不同 provider 時是 `AmbiguousReexport` 啟動錯誤 |
 | `fn export_module_id(&mut self, id: ModuleId)` | 同上，以 `ModuleId` 指定（用於帶 discriminator 的模組） |
-| `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的 DI middleware |
-| `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的 tower layer |
+| `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的路由的 DI middleware；沒有路由符合的 request（包括交給掛在 `/` 的 router 的 fallback 的）不經過它 |
+| `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的路由的 tower layer；同樣不包住 fallback |
 | `fn mount_router(&mut self, path: impl Into<String>, router: Router)` | 掛進一個 axum `Router`（L0） |
 | `fn mount<Args, F>(&mut self, path: impl Into<String>, f: F)` | 掛進一個由 factory 產生的 `Router`；`F: FactoryFn<Args, Output = Router>` |
 
@@ -967,7 +967,8 @@ pub struct ShutdownError { /* ... */ }
 | 變體 | 欄位 | 意義 |
 |---|---|---|
 | `MissingDependency` | `consumer`、`dependency`、`hint` | 依賴在該模組不可見 |
-| `AmbiguousDependency` | `consumer`、`dependency`、`candidates` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及模組 re-export 的型別也適用 |
+| `AmbiguousDependency` | `consumer`、`dependency`、`candidates` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及 `export::<T>()` 轉出的型別也適用 |
+| `AmbiguousReexport` | `module`、`dependency`、`candidates` | `export_module` 轉出的幾個模組 export 了同一型別的不同 provider |
 | `DuplicateProvider` | `provider`、`module` | 同一模組重複註冊同一型別 |
 | `CircularDependency` | `path` | provider 之間的循環依賴 |
 | `CircularImport` | `path` | 模組之間的循環 import |

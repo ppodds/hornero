@@ -464,7 +464,7 @@ assert_eq!(app.client().get("/ping").await.header("x-powered-by"), Some("hornero
 # }
 ```
 
-- **模組 middleware**（`middlewares = [..]` 或 `m.middleware::<M>()`）只包住該模組的 controller 與 mount。
+- **模組 middleware**（`middlewares = [..]` 或 `m.middleware::<M>()`）只包住該模組的 controller 與 mount 的路由。沒有路由符合的 request 不經過任何模組的 middleware，即使它交給了該模組掛在 `/` 的 router 的 fallback。
 - **全域 middleware**（`Hornero::middleware::<M>()`）包住所有路由，包括 404 fallback。
 - middleware 在啟動時就要實例化，所以**必須是 singleton**。如果它依賴 request-scoped 的東西而被傳染，啟動會失敗。
 
