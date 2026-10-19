@@ -5,16 +5,21 @@
 //! that ends in the 405 fallback never reaches another route's guards, interceptors or filters.
 //! Everything compiles down to `axum::middleware::from_fn`; there is no separate execution model.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::Router;
-use axum::body::HttpBody;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::Request;
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
+use http_body::{Frame, SizeHint};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::filter::ErasedFilter;
 use super::guard::{ErasedGuard, GuardContext};
@@ -53,6 +58,85 @@ pub(crate) fn with_problem_405(route: MethodRouter) -> MethodRouter {
         )
         .into_response()
     }))
+}
+
+/// Renders axum's bare 404 as problem+json, like [`with_problem_405`] does for 405.
+///
+/// It wraps the application's fallback only, so a handler that answers a bare 404 keeps it, and
+/// a fallback that answers with a body (the `index.html` of a router mounted at `/`) keeps that.
+pub(crate) fn not_found_as_problem(router: Router) -> Router {
+    router.layer(from_fn(|req: Request, next: Next| async move {
+        let response = next.run(req).await;
+        let bare = response.status() == StatusCode::NOT_FOUND
+            && response.body().is_end_stream()
+            && !response.headers().contains_key(header::CONTENT_TYPE);
+        if !bare {
+            return response;
+        }
+        HttpError::not_found("no route matches the request").into_response()
+    }))
+}
+
+/// Ends every request still in flight once `cancel` fires: a handler that has not answered yet is
+/// dropped and the client gets a 503, and a response body that is still streaming is cut off.
+/// [`App::serve`](crate::App::serve) fires it when the graceful shutdown times out, so no request
+/// keeps using providers while their destroy hooks run.
+pub(crate) fn cancel_on(router: Router, cancel: CancellationToken) -> Router {
+    router.layer(from_fn(move |req: Request, next: Next| {
+        let cancel = cancel.clone();
+        async move {
+            tokio::select! {
+                response = next.run(req) => {
+                    response.map(|body| Body::new(CancellableBody::new(body, cancel.clone())))
+                }
+                () = cancel.cancelled() => HttpError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the server is shutting down",
+                )
+                .into_response(),
+            }
+        }
+    }))
+}
+
+/// A response body that fails once its token is cancelled, which makes hyper drop the connection.
+struct CancellableBody {
+    inner: Body,
+    cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl CancellableBody {
+    fn new(inner: Body, cancel: CancellationToken) -> Self {
+        Self {
+            inner,
+            cancelled: Box::pin(cancel.cancelled_owned()),
+        }
+    }
+}
+
+impl HttpBody for CancellableBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(axum::Error::new(
+                "the server shut down before the response body was sent",
+            ))));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 pub(crate) fn with_scope(

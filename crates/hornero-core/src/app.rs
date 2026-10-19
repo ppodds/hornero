@@ -12,6 +12,7 @@ use axum::http::Method;
 use axum::response::{IntoResponse, Response};
 use axum::routing::Route;
 use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -63,6 +64,10 @@ pub struct Hornero {
 /// How long [`App::serve`] waits for in-flight requests once shutdown starts.
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`App::serve`] waits, after cancelling the requests that outlived the shutdown
+/// timeout, for their connections to close before it runs the shutdown hooks.
+const CANCEL_GRACE: Duration = Duration::from_secs(1);
+
 impl Hornero {
     /// Starts configuring an application rooted at `root`.
     pub fn new(root: impl Module) -> Self {
@@ -78,8 +83,9 @@ impl Hornero {
 
     /// How long [`App::serve`] (and so [`listen`](Self::listen)) waits for in-flight requests
     /// after shutdown starts, 10 seconds by default. When it elapses, or a second SIGINT/SIGTERM
-    /// arrives, the remaining connections are dropped and the shutdown hooks run anyway.
-    /// `Duration::MAX` waits forever.
+    /// arrives, the requests still running are cancelled (a handler that has not answered is
+    /// dropped and the client gets a 503, a streaming body is cut off) and the shutdown hooks run
+    /// anyway. `Duration::MAX` waits forever.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
@@ -294,11 +300,28 @@ impl Hornero {
     }
 
     /// Builds the application and serves it until SIGINT/SIGTERM or [`Shutdown::trigger`].
+    ///
+    /// If `addr` cannot be bound, the application is closed again, running its shutdown hooks,
+    /// before the error is returned.
     pub async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError> {
         let app = self.build().await?;
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!(address = %listener.local_addr()?, "hornero is listening");
-        app.serve(listener).await
+        let bound = async {
+            let listener = TcpListener::bind(addr).await?;
+            let address = listener.local_addr()?;
+            Ok::<_, std::io::Error>((listener, address))
+        };
+        match bound.await {
+            Ok((listener, address)) => {
+                tracing::info!(%address, "hornero is listening");
+                app.serve(listener).await
+            }
+            Err(err) => {
+                // `build` already ran the init hooks: undo them as a failed bootstrap would. A
+                // failing hook is logged; the bind error is the one the caller needs.
+                let _ = app.close().await;
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -357,8 +380,8 @@ impl App {
     /// extract [`ConnectInfo<SocketAddr>`](axum::extract::ConnectInfo) for the peer address.
     ///
     /// Once shutdown starts, in-flight requests get [`Hornero::shutdown_timeout`] to finish; when it
-    /// elapses, or another SIGINT/SIGTERM arrives, the remaining connections are dropped and the
-    /// shutdown hooks run anyway.
+    /// elapses, or another SIGINT/SIGTERM arrives, the requests still running are cancelled (the
+    /// client gets a 503, or a cut-off body) and the shutdown hooks run anyway.
     pub async fn serve(self, listener: TcpListener) -> Result<(), BoxError> {
         let shutdown = self.shutdown.clone();
         let signal = {
@@ -371,10 +394,11 @@ impl App {
                 shutdown.trigger();
             }
         };
+        // Dropping the server future would not stop its connections: axum spawns a task for each.
+        let cancel = CancellationToken::new();
         let server = axum::serve(
             listener,
-            self.router
-                .clone()
+            pipeline::cancel_on(self.router.clone(), cancel.clone())
                 .into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(signal);
@@ -395,7 +419,19 @@ impl App {
         };
         let served = tokio::select! {
             result = &mut server => result,
-            _ = forced => Ok(()),
+            _ = forced => {
+                // No request may still be using a provider while its destroy hook runs.
+                cancel.cancel();
+                match tokio::time::timeout(CANCEL_GRACE, &mut server).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            "some connections did not close after their requests were cancelled"
+                        );
+                        Ok(())
+                    }
+                }
+            }
         };
         // The hooks run even when the server failed, so nothing started at boot is left running.
         let closed = self.close().await;
@@ -743,7 +779,11 @@ fn assemble(
     let Some(rt) = rt else {
         return app;
     };
-    app = app.fallback(|| async { HttpError::not_found("no route matches the request") });
+    // A router mounted at `/` may bring its own fallback (an SPA's `index.html`, say), which
+    // `merge` kept. Unmatched requests go to the router as it is now, so they reach that fallback
+    // or axum's bare 404, and only the latter becomes problem+json.
+    let unmatched = pipeline::not_found_as_problem(app.clone());
+    app = app.fallback_service(unmatched);
     // Inside the global layers and middleware, so a panic's 500 still passes through them (CORS,
     // request ids, tracing), but outside routing and module layers so it covers the fallback too.
     app = app.layer(CatchPanicLayer::custom(panic_response));
@@ -790,4 +830,38 @@ fn panic_response(panic: Box<dyn Any + Send + 'static>) -> Response {
             panic_message(panic.as_ref())
         ))
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_paths, panic_message, route_shape};
+
+    #[test]
+    fn paths_are_joined_with_single_slashes() {
+        assert_eq!(join_paths(&[]), "/");
+        assert_eq!(join_paths(&["", "/", ""]), "/");
+        assert_eq!(join_paths(&["/api/", "todos", "/{id}/"]), "/api/todos/{id}");
+        assert_eq!(join_paths(&["api", "", "/"]), "/api");
+        assert_eq!(join_paths(&["", "/todos"]), "/todos");
+    }
+
+    #[test]
+    fn route_shapes_ignore_parameter_names_only() {
+        assert_eq!(route_shape("/todos/{id}"), route_shape("/todos/{todo_id}"));
+        // axum rejects a parameter and a catch-all at one position as well.
+        assert_eq!(route_shape("/files/{id}"), route_shape("/files/{*rest}"));
+        assert_ne!(route_shape("/todos/{id}"), route_shape("/todos/{id}/done"));
+        assert_ne!(route_shape("/todos/new"), route_shape("/todos/{id}"));
+        assert_eq!(route_shape("/"), "/");
+    }
+
+    #[test]
+    fn panic_messages_are_read_from_both_payload_types() {
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("owned"));
+        let borrowed: Box<dyn std::any::Any + Send> = Box::new("borrowed");
+        let other: Box<dyn std::any::Any + Send> = Box::new(42);
+        assert_eq!(panic_message(owned.as_ref()), "owned");
+        assert_eq!(panic_message(borrowed.as_ref()), "borrowed");
+        assert_eq!(panic_message(other.as_ref()), "unknown panic");
+    }
 }

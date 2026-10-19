@@ -1,0 +1,11 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] ambiguous dependency
+    re-export in Facade requires `Region`, which is visible from several sources:
+      - Region (in North)
+      - Region (in South)
+    hint: provide `Region` locally, or import only one of the modules that export it (a global module counts as imported everywhere).

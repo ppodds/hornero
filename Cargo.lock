@@ -783,6 +783,7 @@ dependencies = [
  "axum",
  "bytes",
  "http",
+ "http-body",
  "insta",
  "serde",
  "serde_json",

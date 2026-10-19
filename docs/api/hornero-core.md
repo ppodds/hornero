@@ -29,7 +29,7 @@ pub struct Hornero { /* ... */ }
 |---|---|
 | `fn new(root: impl Module) -> Hornero` | 以根模組建立 builder |
 | `fn global_prefix(self, prefix: impl Into<String>) -> Self` | 所有 controller 路由與 mount 的路徑前綴，例如 `/api` |
-| `fn shutdown_timeout(self, timeout: Duration) -> Self` | `serve`（與 `listen`）在關機開始後等待進行中 request 的上限，預設 10 秒；逾時或收到第二次 SIGINT/SIGTERM 就放棄剩下的連線，仍會執行關閉 hook。`Duration::MAX` 表示無限等待 |
+| `fn shutdown_timeout(self, timeout: Duration) -> Self` | `serve`（與 `listen`）在關機開始後等待進行中 request 的上限，預設 10 秒；逾時或收到第二次 SIGINT/SIGTERM 就取消仍在執行的 request（client 收到 503，或串流 body 被切斷），仍會執行關閉 hook。`Duration::MAX` 表示無限等待 |
 | `fn guard<G: Guard + Injectable>(self) -> Self` | 全域 guard，在根模組解析；在模組宣告的 [`AppGuard`](#appguardappinterceptorappfilter) 以及 controller、handler 的 guard 之前執行 |
 | `fn interceptor<I: Interceptor + Injectable>(self) -> Self` | 全域 interceptor，包住模組宣告的 `AppInterceptor` 以及 controller、handler 的 interceptor |
 | `fn filter<F: ExceptionFilter + Injectable>(self) -> Self` | 全域 exception filter；在 handler 與 controller 層級的 filter 都沒有接住錯誤時才比對，比模組宣告的 `AppFilter` 先比對 |
@@ -44,7 +44,7 @@ pub struct Hornero { /* ... */ }
 | `fn routes(&self) -> Result<Routes, BootError>` | 列出所有 controller 路由（見 [`Routes`](#routesrouteinfo-與-enhancerinfo)），和 `validate` 一樣驗證依賴圖與路由、不建構任何東西；產生 API 文件用 |
 | `fn validate(&self) -> Result<ScopeReport, BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
 | `async fn build(self) -> Result<App, BootError>` | 驗證、建構所有 singleton、組出 router，再執行 `on_module_init` 與 `on_application_bootstrap`。建構之後任何一步失敗，都會觸發 `Shutdown` 並對已建構的有 hook 的 singleton 執行 `on_module_destroy` 與 `on_application_shutdown`（反向依賴順序），清理失敗接在原本的問題之後 |
-| `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook |
+| `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook；位址無法綁定時，先執行關閉 hook 再回傳錯誤 |
 
 `layer` 的完整 bound 與 axum 的 `Router::layer` 相同：`L: Layer<Route> + Clone + Send + Sync + 'static`，且 `L::Service` 是回應為 `IntoResponse`、錯誤為 `Infallible` 的 `Service<Request>`。
 
@@ -136,7 +136,7 @@ pub struct ModuleDef { /* ... */ }
 | `fn controller<C: Controller>(&mut self)` | 註冊 controller |
 | `fn export<T: ?Sized>(&mut self)` | export 一個 provider：本模組提供的，或 import 進來的（轉出） |
 | `fn export_qualified<T: ?Sized, Q>(&mut self)` | 同上，export 以 qualifier `Q` 註冊的 `T` |
-| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports |
+| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports；與自己 export 的 local provider 同型別時 local 優先，與其他轉出來源指向不同 provider 時是歧義錯誤 |
 | `fn export_module_id(&mut self, id: ModuleId)` | 同上，以 `ModuleId` 指定（用於帶 discriminator 的模組） |
 | `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的 DI middleware |
 | `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的 tower layer |

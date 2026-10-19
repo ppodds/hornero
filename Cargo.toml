@@ -23,6 +23,7 @@ bytes = "1.12"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 garde = { version = "0.23", features = ["derive", "full"] }
 http = "1.5"
+http-body = "1.0"
 http-body-util = "0.1.5"
 insta = "1.49"
 proc-macro2 = "1.0"

@@ -238,6 +238,25 @@ impl Module for WebModule {
 }
 ```
 
+掛在 `/` 的 router 可以帶自己的 fallback，例如單頁應用（SPA）：controller 路由照常運作，其餘路徑交給前端的 `index.html`。只有沒被任何 fallback 接手的請求，才會得到 hornero 的 problem+json 404。
+
+```rust
+use hornero::prelude::*;
+use hornero::axum::Router;
+use tower_http::services::{ServeDir, ServeFile};
+# struct WebModule;
+
+impl Module for WebModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.mount_router(
+            "/",
+            Router::new()
+                .fallback_service(ServeDir::new("dist").fallback(ServeFile::new("dist/index.html"))),
+        );
+    }
+}
+```
+
 ## 每個環境不同的設定
 
 `Source` 的後者覆寫前者，因此常見的分層是：程式內預設值 → `config.toml` → 環境變數。

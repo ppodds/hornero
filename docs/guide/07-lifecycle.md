@@ -113,9 +113,11 @@ assert_eq!(
 
 1. 啟動並開始接受 request。
 2. 收到 SIGINT（Ctrl-C）或 SIGTERM，或有人呼叫 `Shutdown::trigger()`。
-3. 停止接受新連線，等待進行中的 request 完成（axum graceful shutdown）。最多等 `Hornero::shutdown_timeout`（預設 10 秒）；逾時，或再收到一次 SIGINT/SIGTERM，就放棄剩下的連線（會記一筆 warning）並繼續下一步。
+3. 停止接受新連線，等待進行中的 request 完成（axum graceful shutdown）。最多等 `Hornero::shutdown_timeout`（預設 10 秒）；逾時，或再收到一次 SIGINT/SIGTERM，就取消仍在執行的 request（會記一筆 warning）：還沒回應的 handler 被 drop，client 收到 503；仍在串流的 body（例如 SSE）被切斷。這些連線關閉後（最多再等 1 秒）繼續下一步，所以下一步的 hook 執行時，沒有 request 還在使用 provider。
 4. 依反向依賴順序執行 `on_module_destroy`，再執行 `on_application_shutdown`。
 5. `listen` 回傳。
+
+位址無法綁定時（例如 port 已被占用），`listen` 會先執行第 4 步再回傳錯誤，`on_application_bootstrap` 啟動的背景任務不會遺留。
 
 handler 可以用 `ConnectInfo<SocketAddr>` 取得 client 位址；`serve` 與 `listen` 都會提供。
 

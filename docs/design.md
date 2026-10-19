@@ -188,7 +188,8 @@ failed to bootstrap application: 1 problem
 - `App::close()` 把 destroy / shutdown hook 的失敗收集成 `ShutdownError`，與啟動失敗的 `BootError` 分開。`serve` 為 handler 提供 `ConnectInfo<SocketAddr>`；`hornero-testing` 的 request 帶有 loopback 的 peer 位址（`TestRequest::peer_addr` 可改）。
 - `Drop` 不能 await，需要 I/O 的清理放在 hook 裡；內建可注入的 `Arc<Shutdown>`（包 `CancellationToken`）供背景任務監聽。
 - `App::serve` 處理 SIGINT/SIGTERM 與 `Shutdown::trigger()`：graceful shutdown 後執行 destroy hooks；即使某個 hook 失敗也會跑完其他 hook。
-- 等待進行中 request 有上限（`Hornero::shutdown_timeout`，預設 10 秒）：逾時或收到第二次 SIGINT/SIGTERM 就放棄剩下的連線並照常執行 destroy hooks。tokio 的訊號處理會取代預設的 Ctrl-C 終止行為，沒有這個機制時，一個卡住的 SSE 或慢 request 會讓第二次 Ctrl-C 也無效。
+- 等待進行中 request 有上限（`Hornero::shutdown_timeout`，預設 10 秒）：逾時或收到第二次 SIGINT/SIGTERM 就取消仍在執行的 request（還沒回應的 handler 被 drop、client 收到 503，仍在串流的 body 被切斷），等這些連線關閉（最多 1 秒）後照常執行 destroy hooks，所以 destroy hook 執行時沒有 request 還在使用 provider。axum 為每條連線 spawn 獨立的 task，只 drop serve 的 future 停不了它們，所以取消是在每個 request 外面包一層完成的。tokio 的訊號處理會取代預設的 Ctrl-C 終止行為，沒有這個機制時，一個卡住的 SSE 或慢 request 會讓第二次 Ctrl-C 也無效。
+- `listen` 在 `build` 之後才綁定位址；綁定失敗（例如 port 已被占用）時會先 `close`，執行關閉 hook，再回傳錯誤，init hook 啟動的東西不會遺留。
 
 ## 9. 測試
 

@@ -2002,6 +2002,399 @@ async fn serve_gives_up_on_stuck_requests_after_the_shutdown_timeout() {
 }
 
 #[tokio::test]
+async fn requests_still_running_at_the_shutdown_timeout_are_cancelled_before_the_hooks() {
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static IN_FLIGHT_AT_DESTROY: Mutex<Option<usize>> = Mutex::new(None);
+
+    /// Counts a request as in flight until the future or body holding it is dropped.
+    struct InFlight;
+    impl InFlight {
+        fn start() -> Self {
+            IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+            InFlight
+        }
+    }
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A streaming body that never produces a frame, like an idle server-sent events stream.
+    struct Endless(#[allow(dead_code)] InFlight);
+    impl http_body::Body for Endless {
+        type Data = axum::body::Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Infallible>>> {
+            Poll::Pending
+        }
+    }
+
+    struct Pool;
+    impl Injectable for Pool {
+        const LIFECYCLE: Option<LifecycleFn<Self>> = hooks::<Self>();
+        fn dependencies() -> Vec<Key> {
+            Vec::new()
+        }
+        async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+            Ok(Pool)
+        }
+    }
+    impl Lifecycle for Pool {
+        async fn on_module_destroy(&self) -> Result<(), BoxError> {
+            *IN_FLIGHT_AT_DESTROY.lock().unwrap() = Some(IN_FLIGHT.load(Ordering::SeqCst));
+            Ok(())
+        }
+    }
+
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Pool>().mount_router(
+                "/",
+                Router::new()
+                    .route(
+                        "/hang",
+                        axum_get(|| async {
+                            let _in_flight = InFlight::start();
+                            std::future::pending::<&'static str>().await
+                        }),
+                    )
+                    .route(
+                        "/events",
+                        axum_get(|| async { Body::new(Endless(InFlight::start())) }),
+                    ),
+            );
+        }
+    }
+    let app = Hornero::new(App)
+        .shutdown_timeout(std::time::Duration::from_millis(100))
+        .build()
+        .await
+        .unwrap();
+    let shutdown = app.shutdown_handle();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let mut clients = Vec::new();
+    for path in ["/hang", "/events"] {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nhost: test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        clients.push(stream);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while IN_FLIGHT.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both requests reach their handlers");
+
+    shutdown.trigger();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("serve returns despite the stuck requests")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *IN_FLIGHT_AT_DESTROY.lock().unwrap(),
+        Some(0),
+        "no request outlives the shutdown timeout into the destroy hooks"
+    );
+
+    // The connections are closed: the handler's client got a 503, the stream was cut off.
+    let mut responses = Vec::new();
+    for mut stream in clients {
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut bytes),
+        )
+        .await
+        .expect("the connection was closed")
+        .ok();
+        responses.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    assert!(responses[0].starts_with("HTTP/1.1 503"), "{}", responses[0]);
+    assert!(
+        !responses[1].contains("503"),
+        "the stream had already answered 200: {}",
+        responses[1]
+    );
+}
+
+probe!(early);
+
+#[tokio::test]
+async fn serving_an_application_that_is_already_shutting_down_returns_at_once() {
+    use early::*;
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Pool>();
+        }
+    }
+    let app = Hornero::new(App).build().await.unwrap();
+    app.shutdown_handle().trigger();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), app.serve(listener))
+        .await
+        .expect("serve does not wait for the default shutdown timeout")
+        .unwrap();
+    assert!(flag(&DESTROYED) && flag(&SHUT_DOWN));
+}
+
+probe!(bind);
+
+#[tokio::test]
+async fn listen_closes_the_application_when_the_address_is_taken() {
+    use bind::*;
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Pool>();
+        }
+    }
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = Hornero::new(App)
+        .listen(taken.local_addr().unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AddrInUse),
+        "{err}"
+    );
+    // The application had started, so it is shut down again like a failed bootstrap.
+    assert!(flag(&INIT));
+    assert!(flag(&DESTROYED) && flag(&SHUT_DOWN));
+    assert!(shutdown_triggered());
+}
+
+// --- fallbacks and method routing ----------------------------------------------------------
+
+#[tokio::test]
+async fn a_router_mounted_at_the_root_keeps_its_fallback() {
+    struct Spa;
+    impl Module for Spa {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(TodoModule).mount_router(
+                "/",
+                Router::new()
+                    .route("/health", axum_get(|| async { "ok" }))
+                    .fallback(|| async { "index.html" }),
+            );
+        }
+    }
+    let router = Hornero::new(Spa).build().await.unwrap().router();
+    // A single-page app: client-side routes get the page, everything else is unchanged.
+    assert_eq!(get(&router, "/settings/profile").await.body, "index.html");
+    assert_eq!(get(&router, "/health").await.body, "ok");
+    assert_eq!(get(&router, "/todos/1").await.status, StatusCode::OK);
+    assert_eq!(
+        get(&router, "/todos/9").await.json()["detail"],
+        "todo 9 not found"
+    );
+}
+
+#[tokio::test]
+async fn only_unmatched_requests_become_the_problem_json_404() {
+    unit_injectable!(Lookup);
+    impl Controller for Lookup {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.get("/lookup", "lookup", |_: Arc<Self>| async {
+                StatusCode::NOT_FOUND
+            });
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<Lookup>()
+                .mount_router(
+                    "/",
+                    Router::new().route("/health", axum_get(|| async { "ok" })),
+                )
+                .mount_router(
+                    "/static",
+                    Router::new().route("/ping", axum_get(|| async { "pong" })),
+                );
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+
+    // A handler's own bare 404 is its answer, not a missing route.
+    let res = get(&router, "/lookup").await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.is_empty() && res.headers.get("content-type").is_none());
+
+    // Mounts without a fallback of their own fall through to hornero's.
+    for path in ["/missing", "/static/missing"] {
+        let res = get(&router, path).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            res.json()["detail"],
+            "no route matches the request",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_path_can_be_served_by_several_modules() {
+    unit_injectable!(Reader, Writer);
+    impl Controller for Reader {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.get("/items", "list", |_: Arc<Self>| async { "list" });
+        }
+    }
+    impl Controller for Writer {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.post("/items", "create", |_: Arc<Self>| async { "create" })
+                .guard::<DenyGuard>();
+        }
+    }
+    struct ReadModule;
+    impl Module for ReadModule {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<Reader>();
+        }
+    }
+    struct WriteModule;
+    impl Module for WriteModule {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<Writer>();
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(ReadModule).import(WriteModule);
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+    assert_eq!(get(&router, "/items").await.body, "list");
+    let post = send(
+        &router,
+        Request::post("/items").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        post.status,
+        StatusCode::FORBIDDEN,
+        "the POST route keeps its guard"
+    );
+    let put = send(&router, Request::put("/items").body(Body::empty()).unwrap()).await;
+    assert_eq!(put.status, StatusCode::METHOD_NOT_ALLOWED);
+    let allow = put.headers["allow"].to_str().unwrap();
+    assert!(allow.contains("GET") && allow.contains("POST"), "{allow}");
+}
+
+#[tokio::test]
+async fn head_requests_run_the_guards_of_the_get_route() {
+    unit_injectable!(Secret);
+    impl Controller for Secret {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.get("/secret", "secret", |_: Arc<Self>| async { "classified" })
+                .guard::<DenyGuard>();
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<Secret>();
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+    let res = send(
+        &router,
+        Request::head("/secret").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    assert!(res.body.is_empty());
+}
+
+// --- scope and override diagnostics ---------------------------------------------------------
+
+#[test]
+fn mounts_cannot_be_request_scoped() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.mount("/whoami", |_: Arc<RequestContext>| async {
+                Ok::<_, BoxError>(Router::new())
+            });
+        }
+    }
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("mount /whoami (in App) cannot be request-scoped"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unused_enhancer_overrides_name_the_enhancer() {
+    let err = Hornero::new(TodoModule)
+        .override_guard::<DenyGuard>(AllowAll)
+        .override_interceptor::<AppHeader>(AppHeader)
+        .override_filter::<GlobalFilter>(GlobalFilter)
+        .validate()
+        .unwrap_err();
+    insta::assert_snapshot!(err.to_string());
+}
+
+#[tokio::test]
+async fn transient_providers_are_fresh_within_one_request() {
+    service!(Nonce; scope = Scope::Transient);
+    service!(Shared; scope = Scope::Request);
+    service!(First: Nonce, Shared; scope = Scope::Request);
+    service!(Second: Nonce, Shared; scope = Scope::Request);
+    service!(Pairing: First, Second);
+    impl Controller for Pairing {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.get("/pairing", "pairing", |this: Arc<Self>| async move {
+                format!(
+                    "nonce shared: {}, scoped shared: {}",
+                    Arc::ptr_eq(&this.0.0, &this.1.0),
+                    Arc::ptr_eq(&this.0.1, &this.1.1)
+                )
+            });
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Nonce>()
+                .provide::<Shared>()
+                .provide::<First>()
+                .provide::<Second>()
+                .controller::<Pairing>();
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+    assert_eq!(
+        get(&router, "/pairing").await.body,
+        "nonce shared: false, scoped shared: true"
+    );
+}
+
+#[tokio::test]
 async fn an_unbounded_shutdown_timeout_does_not_overflow() {
     let app = Hornero::new(TodoModule)
         .shutdown_timeout(std::time::Duration::MAX)

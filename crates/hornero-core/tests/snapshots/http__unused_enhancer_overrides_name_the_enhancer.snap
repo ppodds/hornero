@@ -1,0 +1,14 @@
+---
+source: crates/hornero-core/tests/http.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 3 problems
+
+[1] unused override
+    an override was registered for `DenyGuard`, but no module provides or uses it.
+
+[2] unused override
+    an override was registered for `AppHeader`, but no module provides or uses it.
+
+[3] unused override
+    an override was registered for `GlobalFilter`, but no module provides or uses it.

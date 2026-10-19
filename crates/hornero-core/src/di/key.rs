@@ -48,6 +48,13 @@ impl Key {
         self
     }
 
+    /// The same key, named after `T` in diagnostics. Identity still comes from the keyed type, so
+    /// an internal key such as an enhancer slot can be reported as the type the user wrote.
+    pub(crate) fn displayed_as<T: ?Sized + 'static>(mut self) -> Self {
+        self.name = type_name::<T>();
+        self
+    }
+
     /// Marks a dependency as optional: when nothing provides it, the consumer receives `None`
     /// instead of failing validation.
     pub fn optional(mut self) -> Self {
@@ -174,6 +181,20 @@ mod tests {
         assert_ne!(primary, Key::of::<Pg>());
         assert_ne!(primary, Key::of::<Pg>().qualified::<Replica>());
         assert_eq!(primary.short_name(), "Pg@Primary");
+    }
+
+    #[test]
+    fn display_names_do_not_change_identity() {
+        let slot = Key::of::<Pg>().displayed_as::<dyn Repo>();
+        assert_eq!(slot, Key::of::<Pg>());
+        assert_eq!(slot.short_name(), "dyn Repo");
+        assert_eq!(
+            Key::of::<Pg>()
+                .qualified::<u8>()
+                .displayed_as::<dyn Repo>()
+                .short_name(),
+            "dyn Repo@u8"
+        );
     }
 
     #[test]
