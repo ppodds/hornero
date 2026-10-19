@@ -1,0 +1,9 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] module imported more than once
+    UndeclaredCache carries data and is imported more than once: by SessionsModule, by TokensModule.
+    hint: say how its imports relate in `Module::identity`: `Identity::Instance` makes each import a module of its own (Nest's `forRoot`), `Identity::key(..)` merges imports with equal keys, and `Identity::Type` keeps the first import only.

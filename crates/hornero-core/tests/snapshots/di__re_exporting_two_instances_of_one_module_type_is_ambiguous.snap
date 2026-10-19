@@ -6,6 +6,6 @@ failed to bootstrap application: 1 problem
 
 [1] ambiguous dependency
     re-export in StorageModule requires `Ttl`, which is visible from several sources:
-      - Ttl (in CacheModule)
-      - Ttl (in CacheModule)
-    hint: the sources have identical names, which usually means a dynamic module such as `for_root` is registered more than once; register it once, in the root module.
+      - Ttl (in CacheModule#1, imported by StorageModule)
+      - Ttl (in CacheModule#2, imported by StorageModule)
+    hint: the sources are separate instances of CacheModule: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.

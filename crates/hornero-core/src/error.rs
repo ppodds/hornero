@@ -258,6 +258,9 @@ pub enum Problem {
         dependency: String,
         /// Every provider it could resolve to.
         candidates: Vec<String>,
+        /// How to settle it: import one source only, or, for instances of one module type, share
+        /// one instance or give each instance's providers a type of its own.
+        hint: String,
     },
     /// A module registers the same type, under the same qualifier, twice.
     DuplicateProvider {
@@ -282,6 +285,31 @@ pub enum Problem {
         module: String,
         /// Short type name of the export.
         export: String,
+    },
+    /// A module re-exports a module it does not import.
+    InvalidModuleExport {
+        /// The exporting module.
+        module: String,
+        /// Short type name of the re-exported module.
+        export: String,
+    },
+    /// A module that carries data is imported more than once without declaring its
+    /// [`Identity`](crate::Identity), so hornero cannot tell whether the imports are one module.
+    UndeclaredModuleIdentity {
+        /// The module.
+        module: String,
+        /// The module performing each import, `None` for the application root.
+        imported_by: Vec<Option<String>>,
+    },
+    /// Several instances of one module type declare the same global enhancer, which would run
+    /// once per instance on every route.
+    DuplicateGlobalEnhancer {
+        /// The registration, such as `AppGuard<AuthGuard>`.
+        enhancer: String,
+        /// The module type.
+        module: String,
+        /// The instances declaring it.
+        instances: Vec<String>,
     },
     /// A component ends up in a scope it cannot have: middleware, mounts or providers with hooks
     /// that are not singletons, or a pinned provider pulled into request scope.
@@ -362,7 +390,9 @@ impl Problem {
             Problem::DuplicateProvider { .. } => "duplicate provider",
             Problem::CircularDependency { .. } => "circular dependency",
             Problem::CircularImport { .. } => "circular module import",
-            Problem::InvalidExport { .. } => "invalid export",
+            Problem::InvalidExport { .. } | Problem::InvalidModuleExport { .. } => "invalid export",
+            Problem::UndeclaredModuleIdentity { .. } => "module imported more than once",
+            Problem::DuplicateGlobalEnhancer { .. } => "duplicate global enhancer",
             Problem::ScopeViolation { .. } => "scope violation",
             Problem::UnusedOverride { .. } => "unused override",
             Problem::InvalidProvider { .. } => "invalid provider",
@@ -391,6 +421,7 @@ impl Problem {
                 consumer,
                 dependency,
                 candidates,
+                hint,
             } => {
                 writeln!(
                     f,
@@ -399,21 +430,7 @@ impl Problem {
                 for candidate in candidates {
                     writeln!(f, "{INDENT}  - {candidate}")?;
                 }
-                if candidates
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| candidates[..i].contains(c))
-                {
-                    writeln!(
-                        f,
-                        "{INDENT}hint: the sources have identical names, which usually means a dynamic module such as `for_root` is registered more than once; register it once, in the root module."
-                    )
-                } else {
-                    writeln!(
-                        f,
-                        "{INDENT}hint: provide `{dependency}` locally, or import only one of the modules that export it (a global module counts as imported everywhere)."
-                    )
-                }
+                writeln!(f, "{INDENT}hint: {hint}")
             }
             Problem::DuplicateProvider { provider, module } => {
                 writeln!(
@@ -447,6 +464,51 @@ impl Problem {
                 writeln!(
                     f,
                     "{INDENT}hint: register it in `providers`, or import the module that exports it."
+                )
+            }
+            Problem::InvalidModuleExport { module, export } => {
+                writeln!(
+                    f,
+                    "{INDENT}{module} re-exports the module `{export}`, but does not import it."
+                )?;
+                writeln!(f, "{INDENT}hint: import `{export}` in {module}.")
+            }
+            Problem::UndeclaredModuleIdentity {
+                module,
+                imported_by,
+            } => {
+                let imports: Vec<String> = imported_by
+                    .iter()
+                    .map(|importer| match importer {
+                        Some(importer) => format!("by {importer}"),
+                        None => "as the application root".into(),
+                    })
+                    .collect();
+                writeln!(
+                    f,
+                    "{INDENT}{module} carries data and is imported more than once: {}.",
+                    imports.join(", ")
+                )?;
+                writeln!(
+                    f,
+                    "{INDENT}hint: say how its imports relate in `Module::identity`: `Identity::Instance` makes each import a module of its own (Nest's `forRoot`), `Identity::key(..)` merges imports with equal keys, and `Identity::Type` keeps the first import only."
+                )
+            }
+            Problem::DuplicateGlobalEnhancer {
+                enhancer,
+                module,
+                instances,
+            } => {
+                writeln!(
+                    f,
+                    "{INDENT}`{enhancer}` is declared by several instances of {module}, so it would run once per instance on every route:"
+                )?;
+                for instance in instances {
+                    writeln!(f, "{INDENT}  - {instance}")?;
+                }
+                writeln!(
+                    f,
+                    "{INDENT}hint: declare it in a module imported once, such as the root module, or merge the instances with `Module::identity`."
                 )
             }
             Problem::ScopeViolation {

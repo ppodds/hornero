@@ -22,14 +22,12 @@
 #![warn(missing_docs)]
 
 use std::any::TypeId;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::{Figment, Metadata, Profile, Provider};
-use hornero::{BoxError, Module, ModuleDef};
+use hornero::{BoxError, Identity, Module, ModuleDef};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -239,25 +237,19 @@ impl Module for ConfigModule {
         }
     }
 
-    /// Identical features are one module; different ones, and every root, are modules of their own.
-    fn dedup_key(&self) -> Option<u64> {
+    /// Every root is a module of its own; identical features are one module.
+    fn identity(&self) -> Identity {
         if self.loaded.is_some() {
-            return None;
+            return Identity::Instance;
         }
         // Sorted, so the order of `load`/`section` calls does not matter.
-        let mut hashes: Vec<u64> = self
+        let mut entries: Vec<(TypeId, Option<String>)> = self
             .entries
             .iter()
-            .map(|entry| {
-                let mut hasher = DefaultHasher::new();
-                (entry.type_id, &entry.key).hash(&mut hasher);
-                hasher.finish()
-            })
+            .map(|entry| (entry.type_id, entry.key.clone()))
             .collect();
-        hashes.sort_unstable();
-        let mut hasher = DefaultHasher::new();
-        hashes.hash(&mut hasher);
-        Some(hasher.finish())
+        entries.sort();
+        Identity::key(entries)
     }
 }
 

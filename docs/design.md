@@ -89,9 +89,12 @@ pub struct TodoModule;
 ```
 
 - 動態模組（Nest 的 `forRoot`）就是帶設定的 struct 值；`Module::define(&self)` 只描述模組，I/O 放在 provider factory 裡（`validate()` 與 `build()` 都會呼叫 `define`）。
-- 模組身分由框架決定，作者不需要維護：沒有欄位的模組（ZST）以型別為身分，重複 import 會 dedup 成同一實例（ZST 只有一個值，型別身分就是值身分）；帶欄位的模組每次 import 都是獨立實例（同 NestJS v11 起以物件參照判斷身分），所以兩個 `for_root(..)` 是兩個模組，同時註冊兩個，下游就會得到歧義錯誤，而不是悄悄丟掉其中一份設定。需要依內容合併的模組（`ConfigModule::for_feature`）實作 `Module::dedup_key`，以 (型別, key) 為身分。
-- `export_module::<M>()` 依型別比對，轉出所有型別為 `M` 的 import；其中有兩個實例 export 同一個 key 時是歧義錯誤。
-- 循環 import 依型別偵測：帶欄位的模組互相 import 時每一層都是新實例，身分永遠不會重複，所以 import stack 上出現同一個型別就回報 `CircularImport`。
+- 模組身分由 `Module::identity()` 宣告，作者不需要維護 id 或計數器。預設 `Identity::Auto`：零大小的模組（ZST）以型別為身分，重複 import 會 dedup 成同一實例（只有一個值，合併不會丟東西），對應 Nest 的靜態模組；帶資料的模組 import 一次沒問題，被 import 第二次而沒有宣告則是 `UndeclaredModuleIdentity` 啟動錯誤。不默默合併（會丟掉第二份設定），也不默默拆開（會複製 singleton、連線與 global enhancer），身分是否共用不取決於 struct 剛好是不是零大小。
+- 動態模組宣告 `Identity::Instance`：每次 import 都是獨立實例，同 Nest v11 起以物件參照判斷 `forRoot()` 的身分；`SeaOrmModule`、`OpenApiModule`、`ConfigModule::for_root` 都是。依內容合併的模組（`ConfigModule::for_feature`）宣告 `Identity::key(..)`，以 (型別, key) 為身分，key 以 `==` 比較，不用 hash。
+- `export_module::<M>()` 依型別比對，轉出所有型別為 `M` 的 import（同 Nest 以 class 比對 re-export）；其中有兩個實例 export 同一個 key 時是歧義錯誤。模組自己 `export` 的 key 優先，與模組內 local 優先於 import 的規則一致。
+- 循環 import 依身分偵測：`Type`、`Key` 身分在 import stack 上重複時回報 `CircularImport`，所以 key 不同的同型別模組可以巢狀；`Instance` 身分永遠不會重複，改以型別偵測，避免無限遞迴。
+- 同一型別有多個實例時，診斷訊息、scope report 與 route table 以 `CacheModule#2, imported by StorageModule` 區分它們。
+- global enhancer（`AppGuard<G>` 等）在每個宣告它的模組各執行一次。同一模組型別的多個實例宣告同一個 enhancer 是 `DuplicateGlobalEnhancer` 啟動錯誤：重複來自 import 端，宣告處看不出來。
 - 可見性規則見 ADR-0003。
 
 ### 4.3 Enhancer 也是 provider

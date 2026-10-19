@@ -4,7 +4,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
-use hornero_core::{BoxError, Module, ModuleDef, Routes};
+use hornero_core::{BoxError, Identity, Module, ModuleDef, Routes};
 
 use crate::config::OpenApiConfig;
 use crate::document::document;
@@ -44,6 +44,10 @@ impl Module for OpenApiModule {
             let router = router(&routes, &config);
             async move { router }
         });
+    }
+
+    fn identity(&self) -> Identity {
+        Identity::Instance
     }
 }
 

@@ -1,11 +1,12 @@
 mod common;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hornero_core::{
-    BoxError, Hornero, Injectable, Key, Lifecycle, LifecycleFn, Module, ModuleDef, ProviderDef,
-    Qualified, Resolver, Scope, bind, hooks,
+    BoxError, Hornero, Identity, Injectable, Key, Lifecycle, LifecycleFn, Module, ModuleDef,
+    ProviderDef, Qualified, Resolver, Scope, bind, hooks,
 };
 
 // --- missing dependencies ------------------------------------------------------------------
@@ -193,21 +194,89 @@ fn circular_imports_report_the_path() {
 }
 
 #[test]
-fn modules_with_fields_importing_each_other_report_the_path() {
+fn instances_importing_each_other_report_the_path() {
     struct Ping(u32);
     struct Pong(u32);
     impl Module for Ping {
         fn define(&self, m: &mut ModuleDef) {
             m.import(Pong(self.0));
         }
+
+        fn identity(&self) -> Identity {
+            Identity::Instance
+        }
     }
     impl Module for Pong {
         fn define(&self, m: &mut ModuleDef) {
             m.import(Ping(self.0));
         }
+
+        fn identity(&self) -> Identity {
+            Identity::Instance
+        }
     }
     let err = Hornero::new(Ping(1)).validate().unwrap_err();
     insta::assert_snapshot!(err.to_string());
+}
+
+#[test]
+fn a_cycle_ends_with_the_module_being_imported() {
+    struct Named(u32);
+    impl Module for Named {
+        fn define(&self, m: &mut ModuleDef) {
+            if self.0 == 0 {
+                m.import(Named(1));
+            }
+        }
+
+        fn identity(&self) -> Identity {
+            Identity::Instance
+        }
+
+        fn name(&self) -> String {
+            format!("Named{}", self.0)
+        }
+    }
+    let err = Hornero::new(Named(0)).validate().unwrap_err();
+    assert!(err.to_string().contains("Named0 -> Named1"), "{err}");
+}
+
+/// A stack of modules of one type, told apart by their keys.
+struct Layered {
+    base: bool,
+}
+
+impl Module for Layered {
+    fn define(&self, m: &mut ModuleDef) {
+        if !self.base {
+            m.import(Layered { base: true });
+        }
+    }
+
+    fn identity(&self) -> Identity {
+        Identity::key(self.base)
+    }
+}
+
+#[test]
+fn keyed_modules_of_one_type_can_nest() {
+    Hornero::new(Layered { base: false }).validate().unwrap();
+}
+
+#[test]
+fn a_keyed_module_importing_its_own_key_is_a_cycle() {
+    struct Looping(u32);
+    impl Module for Looping {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Looping(self.0));
+        }
+
+        fn identity(&self) -> Identity {
+            Identity::key(self.0)
+        }
+    }
+    let err = Hornero::new(Looping(1)).validate().unwrap_err();
+    assert!(err.to_string().contains("Looping -> Looping"), "{err}");
 }
 
 // --- construction --------------------------------------------------------------------------
@@ -250,7 +319,7 @@ async fn modules_imported_twice_are_instantiated_once() {
 
 pub struct Ttl(u64);
 
-/// A dynamic module: configuration in a struct, and no identity of its own.
+/// A dynamic module: every import is a module of its own, like Nest's `forRoot`.
 struct CacheModule {
     ttl: u64,
 }
@@ -259,13 +328,17 @@ impl Module for CacheModule {
     fn define(&self, m: &mut ModuleDef) {
         m.provide_value(Ttl(self.ttl)).export::<Ttl>();
     }
+
+    fn identity(&self) -> Identity {
+        Identity::Instance
+    }
 }
 
 service!(Sessions: Ttl);
 service!(Tokens: Ttl);
 
 #[tokio::test]
-async fn modules_with_fields_are_one_instance_per_import() {
+async fn instance_modules_are_one_module_per_import() {
     module!(SessionsModule, |m| {
         m.import(CacheModule { ttl: 1 })
             .provide::<Sessions>()
@@ -284,19 +357,39 @@ async fn modules_with_fields_are_one_instance_per_import() {
     assert_eq!(app.get::<Tokens>().unwrap().0.0, 60);
 }
 
-/// Imports with equal keys are one module.
-struct PoolModule {
-    key: u64,
+/// Carries data without declaring an identity.
+struct UndeclaredCache {
+    ttl: u64,
 }
 
-impl Module for PoolModule {
+impl Module for UndeclaredCache {
     fn define(&self, m: &mut ModuleDef) {
-        m.provide::<Database>().export::<Database>();
+        m.provide_value(Ttl(self.ttl)).export::<Ttl>();
     }
+}
 
-    fn dedup_key(&self) -> Option<u64> {
-        Some(self.key)
-    }
+#[test]
+fn modules_with_data_imported_twice_must_declare_their_identity() {
+    module!(SessionsModule, |m| {
+        m.import(UndeclaredCache { ttl: 1 }).provide::<Sessions>();
+    });
+    module!(TokensModule, |m| {
+        m.import(UndeclaredCache { ttl: 60 }).provide::<Tokens>();
+    });
+    module!(App, |m| {
+        m.import(SessionsModule).import(TokensModule);
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert_eq!(err.problems().len(), 1, "{err}");
+    insta::assert_snapshot!(err.to_string());
+}
+
+#[test]
+fn a_module_with_data_imported_once_needs_no_identity() {
+    module!(App, |m| {
+        m.import(UndeclaredCache { ttl: 1 }).provide::<Sessions>();
+    });
+    Hornero::new(App).validate().unwrap();
 }
 
 service!(Reports: Database);
@@ -304,19 +397,60 @@ service!(Billing: Database);
 service!(Audit: Database);
 
 #[tokio::test]
-async fn modules_with_equal_dedup_keys_are_one_instance() {
+async fn zero_sized_modules_are_shared_even_with_phantom_data() {
+    struct Tagged<T>(PhantomData<fn() -> T>);
+    impl<T: 'static> Module for Tagged<T> {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Database>().export::<Database>();
+        }
+    }
     module!(ReportsModule, |m| {
-        m.import(PoolModule { key: 1 })
+        m.import(Tagged::<u8>(PhantomData))
             .provide::<Reports>()
             .export::<Reports>();
     });
     module!(BillingModule, |m| {
-        m.import(PoolModule { key: 1 })
+        m.import(Tagged::<u8>(PhantomData))
+            .provide::<Billing>()
+            .export::<Billing>();
+    });
+    module!(App, |m| {
+        m.import(ReportsModule).import(BillingModule);
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    let reports = app.get::<Reports>().unwrap();
+    assert!(Arc::ptr_eq(&reports.0, &app.get::<Billing>().unwrap().0));
+}
+
+/// Imports with equal keys are one module.
+struct PoolModule {
+    name: &'static str,
+}
+
+impl Module for PoolModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.provide::<Database>().export::<Database>();
+    }
+
+    fn identity(&self) -> Identity {
+        Identity::key(self.name)
+    }
+}
+
+#[tokio::test]
+async fn modules_with_equal_keys_are_one_module() {
+    module!(ReportsModule, |m| {
+        m.import(PoolModule { name: "main" })
+            .provide::<Reports>()
+            .export::<Reports>();
+    });
+    module!(BillingModule, |m| {
+        m.import(PoolModule { name: "main" })
             .provide::<Billing>()
             .export::<Billing>();
     });
     module!(AuditModule, |m| {
-        m.import(PoolModule { key: 2 })
+        m.import(PoolModule { name: "audit" })
             .provide::<Audit>()
             .export::<Audit>();
     });
@@ -332,7 +466,7 @@ async fn modules_with_equal_dedup_keys_are_one_instance() {
 }
 
 #[test]
-fn modules_with_fields_are_re_exported_by_type() {
+fn instance_modules_are_re_exported_by_type() {
     module!(StorageModule, |m| {
         m.import(CacheModule { ttl: 5 })
             .export_module::<CacheModule>();
@@ -359,15 +493,51 @@ fn re_exporting_two_instances_of_one_module_type_is_ambiguous() {
 }
 
 #[test]
-fn re_exporting_a_module_that_is_not_imported_names_it() {
+fn an_ambiguous_key_exported_both_ways_is_reported_once() {
+    module!(StorageModule, |m| {
+        m.import(CacheModule { ttl: 1 })
+            .import(CacheModule { ttl: 60 })
+            .export::<Ttl>()
+            .export_module::<CacheModule>();
+    });
+    module!(App, |m| {
+        m.import(StorageModule);
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert_eq!(err.problems().len(), 1, "{err}");
+}
+
+#[tokio::test]
+async fn explicit_exports_win_over_module_re_exports() {
+    struct Name(&'static str);
+    service!(Greeter: Name);
+    module!(Library, |m| {
+        m.provide_value(Name("imported")).export::<Name>();
+    });
+    module!(Mid, |m| {
+        m.import(Library)
+            .provide_value(Name("local"))
+            .export::<Name>()
+            .export_module::<Library>();
+    });
+    module!(App, |m| {
+        m.import(Mid).provide::<Greeter>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Greeter>().unwrap().0.0, "local");
+}
+
+#[test]
+fn re_exporting_a_module_that_is_not_imported_says_to_import_it() {
     module!(App, |m| {
         m.export_module::<CacheModule>();
     });
-    let err = Hornero::new(App).validate().unwrap_err();
+    let err = Hornero::new(App).validate().unwrap_err().to_string();
     assert!(
-        err.to_string().contains("App exports `CacheModule`"),
+        err.contains("App re-exports the module `CacheModule`, but does not import it"),
         "{err}"
     );
+    assert!(err.contains("hint: import `CacheModule` in App."), "{err}");
 }
 
 #[tokio::test]

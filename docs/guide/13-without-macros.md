@@ -452,5 +452,6 @@ app.close().await.unwrap();
 - **基礎設施模組預設 global**，並提供 `.local()` 讓使用者關閉。
 - **只 export 使用者需要的型別**，內部 helper 保持私有。
 - **清理用 `Lifecycle`**，並以 `.with_hooks::<T>()` 啟用。
-- **允許多個實例**：帶欄位的模組每次 import 本來就是獨立實例，不需要自己產生 id。讓 provider 帶泛型 tag（`Db<Tag>`、`SeaOrmModule<Tag>`），多個實例才不會 export 同一個型別而造成歧義。內容相同的 import 應該合併時，實作 `fn dedup_key()`。
+- **宣告模組的身分**：`for_root` 這類每次呼叫都該是獨立模組的，在 `fn identity()` 回傳 `Identity::Instance`（不需要自己產生 id）；內容相同的 import 應該合併時，回傳 `Identity::key(..)`。帶資料卻沒宣告的模組被 import 兩次會是 bootstrap 錯誤。
+- **允許多個實例**：讓 provider 帶泛型 tag（`Db<Tag>`、`SeaOrmModule<Tag>`），多個實例才不會 export 同一個型別而造成歧義。
 - **用 `hornero-testing` 測試**你的模組：`TestApp::new(MyModule::for_root(...))`。

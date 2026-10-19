@@ -416,6 +416,9 @@ match &err.problems()[0] {
 | `CircularDependency` | provider 互相依賴 | 抽出共用的 provider，或用 channel / 事件解耦 |
 | `CircularImport` | 模組互相 import | 把共用部分移到第三個模組 |
 | `InvalidExport` | export 了自己沒有、也沒 import 的型別 | 註冊它，或 import export 它的模組 |
+| `InvalidModuleExport` | 轉出（`export_module`）了沒有 import 的模組 | import 那個模組 |
+| `UndeclaredModuleIdentity` | 帶資料的模組被 import 了不只一次，卻沒有宣告身分 | 在 `fn identity()` 回傳 `Identity::Instance`、`Identity::key(..)` 或 `Identity::Type`，見 [模組的身分](03-modules.md#動態模組) |
+| `DuplicateGlobalEnhancer` | 同一模組型別的多個實例宣告了同一個全域 enhancer | 改在只 import 一次的模組（例如根模組）宣告 |
 | `ScopeViolation` | middleware / mount / 有 hook 的 provider 變成 request-scoped，或 pinned 的 provider 被傳染 | 見 [Scope](06-scopes.md#傳染的限制) |
 | `UnusedOverride` | override 了沒有任何模組提供的型別 | 修正型別，或移除 override |
 | `InvalidRoute` | 舊的 `:id` 語法、axum 不支援的 method、axum 拒絕的路由 | 改用 `{id}`；調整路徑 |

@@ -5,7 +5,7 @@
 | 分類 | 項目 |
 |---|---|
 | [應用程式](#應用程式) | `Hornero`、`App` |
-| [模組](#模組) | `Module`、`ModuleDef`、`Provide` |
+| [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
 | [Request scope](#request-scope) | `RequestContext`、`ScopeReport`、`ScopeEntry` |
 | [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
@@ -101,7 +101,7 @@ pub struct App { /* ... */ }
 ```rust,ignore
 pub trait Module: Any + Send + Sync {
     fn define(&self, m: &mut ModuleDef);
-    fn dedup_key(&self) -> Option<u64> { None }
+    fn identity(&self) -> Identity { Identity::Auto }
     fn name(&self) -> String { /* 型別名稱 */ }
 }
 ```
@@ -111,7 +111,7 @@ pub trait Module: Any + Send + Sync {
 | 方法 | 說明 |
 |---|---|
 | `define` | 用 `ModuleDef` 描述模組內容。可能被呼叫多次（`validate` 與 `build`），所以不要做 I/O |
-| `dedup_key` | 同型別、key 相同的 import 合併成一個模組。預設 `None`：沒有欄位的模組以型別為身分（import 幾次都是同一個實例），帶欄位的模組每次 import 都是獨立實例 |
+| `identity` | 同一型別的多次 import 是否為同一個模組，見 [`Identity`](#identity)。預設 `Identity::Auto` |
 | `name` | 錯誤訊息與 scope report 中的名稱，預設是不含路徑的型別名稱 |
 
 見 [模組](../guide/03-modules.md)。
@@ -176,6 +176,32 @@ impl<F: ExceptionFilter + Injectable> Provide for AppFilter<F> { /* ... */ }
 ```
 
 `ModuleDef::provide::<T>()` 與 `#[module(providers = [T])]` 接受的型別。一般的 `Injectable` 型別註冊成 class provider；[`Qualified<T, Q>`](#qualified) 把 `T` 註冊在 qualifier `Q` 之下；[`AppGuard<G>`、`AppInterceptor<I>`、`AppFilter<F>`](#appguardappinterceptorappfilter) 則註冊全域 enhancer。型別沒有實作 `Injectable` 時，編譯錯誤是「`` `T` is not injectable ``」。
+
+### `Identity`
+
+```rust,ignore
+pub enum Identity {
+    Auto,
+    Type,
+    Instance,
+    Key(ModuleKey),
+}
+```
+
+`Module::identity` 的回傳值：同一型別的多次 import 中，哪些是同一個模組（只定義一次）。
+
+| 變體 | 說明 |
+|---|---|
+| `Auto` | 預設。零大小的模組（沒有欄位，或只有 `PhantomData`）以型別為身分；帶資料的模組只能 import 一次，第二次是 `Problem::UndeclaredModuleIdentity` |
+| `Type` | 同型別的 import 都是同一個模組，以第一個為準 |
+| `Instance` | 每次 import 都是獨立的模組，同 Nest 的 `forRoot()`。不能直接或間接再 import 自己的型別（回報為 `CircularImport`） |
+| `Key(ModuleKey)` | 同型別、key 相等的 import 是同一個模組，以第一個為準。以 `Identity::key` 建立 |
+
+| 方法 | 說明 |
+|---|---|
+| `fn key<K: Eq + Send + Sync + 'static>(key: K) -> Identity` | `Identity::Key`：以 `==` 比較 key。key 要涵蓋所有會讓兩次 import 不同的欄位 |
+
+`ModuleKey` 是型別抹除後的 key，實作了 `PartialEq`。
 
 ---
 
@@ -676,7 +702,7 @@ pub struct AppFilter<F>(/* ... */);
 |---|---|
 | 解析 | `G` 在宣告它的模組裡解析，可以依賴該模組沒有 export 的 provider；依賴看不到時，啟動時報 `MissingDependency` |
 | 順序 | 先執行 `Hornero::guard` 等 builder 上註冊的，再執行模組宣告的；被 import 的模組先於 import 它的模組，同一模組依宣告順序 |
-| 重複 | 同一模組宣告兩次 `AppGuard<G>` 是 `DuplicateProvider`；不同模組各自宣告會各執行一次 |
+| 重複 | 同一模組宣告兩次 `AppGuard<G>` 是 `DuplicateProvider`；不同模組型別各自宣告會各執行一次；同一模組型別的多個實例（`Identity::Instance` 或不同 key）宣告同一個是 `DuplicateGlobalEnhancer` |
 | 替換 | `override_guard::<G>`（`override_interceptor`、`override_filter` 同理）同樣會替換這些全域 enhancer |
 
 Rust 沒有 Nest 的 multi-provider，同一個 key 只能註冊一次。每個 `AppGuard<X>` 都是不同的型別，所以一個模組可以註冊任意多個全域 guard。
@@ -951,11 +977,14 @@ pub struct ShutdownError { /* ... */ }
 | 變體 | 欄位 | 意義 |
 |---|---|---|
 | `MissingDependency` | `consumer`、`dependency`、`hint` | 依賴在該模組不可見 |
-| `AmbiguousDependency` | `consumer`、`dependency`、`candidates` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及模組 re-export 的型別也適用 |
+| `AmbiguousDependency` | `consumer`、`dependency`、`candidates`、`hint` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及模組 re-export 的型別也適用 |
 | `DuplicateProvider` | `provider`、`module` | 同一模組重複註冊同一型別 |
 | `CircularDependency` | `path` | provider 之間的循環依賴 |
 | `CircularImport` | `path` | 模組之間的循環 import |
 | `InvalidExport` | `module`、`export` | export 了既沒提供、也沒 import 的型別 |
+| `InvalidModuleExport` | `module`、`export` | `export_module` 了沒有 import 的模組 |
+| `UndeclaredModuleIdentity` | `module`、`imported_by` | 帶資料、沒有宣告 `Identity` 的模組被 import 了不只一次 |
+| `DuplicateGlobalEnhancer` | `enhancer`、`module`、`instances` | 同一模組型別的多個實例宣告了同一個全域 enhancer |
 | `ScopeViolation` | `item`、`reason`、`chain` | middleware 或 mount 變成 request-scoped、有 hook 的 provider 不是 singleton，或 pinned 的 provider 被傳染 |
 | `UnusedOverride` | `provider` | override 了沒有任何模組提供的型別 |
 | `InvalidProvider` | `provider`、`reason` | provider 的註冊本身有誤，例如 `with_hooks::<T>()` 的 `T` 不是這個 provider 的型別 |

@@ -6,6 +6,6 @@ failed to bootstrap application: 1 problem
 
 [1] ambiguous dependency
     Probe (in ProbeModule) requires `Db`, which is visible from several sources:
-      - Db (in SeaOrmModule)
-      - Db (in SeaOrmModule)
-    hint: the sources have identical names, which usually means a dynamic module such as `for_root` is registered more than once; register it once, in the root module.
+      - Db (in SeaOrmModule#1, imported by App)
+      - Db (in SeaOrmModule#2, imported by App)
+    hint: the sources are separate instances of SeaOrmModule: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.

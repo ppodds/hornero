@@ -81,9 +81,9 @@ pub mod prelude {
 
     pub use crate::{
         App, AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ExceptionFilter, Guard,
-        GuardContext, Hornero, HttpError, Injectable, Interceptor, Lifecycle, Middleware, Module,
-        ModuleDef, Qualified, RequestContext, RouteContext, Scope, Shutdown, api_body, api_exclude,
-        api_response, api_tags, bind, controller, filters, guards, injectable, interceptors, meta,
-        module, routes,
+        GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor, Lifecycle, Middleware,
+        Module, ModuleDef, Qualified, RequestContext, RouteContext, Scope, Shutdown, api_body,
+        api_exclude, api_response, api_tags, bind, controller, filters, guards, injectable,
+        interceptors, meta, module, routes,
     };
 }

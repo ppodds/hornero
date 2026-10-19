@@ -31,7 +31,8 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hornero::{
-    BoxError, BoxFuture, FactoryFn, Key, Lifecycle, Module, ModuleDef, ProviderDef, Resolver,
+    BoxError, BoxFuture, FactoryFn, Identity, Key, Lifecycle, Module, ModuleDef, ProviderDef,
+    Resolver,
 };
 pub use sea_orm;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -168,5 +169,9 @@ impl<Tag: Send + Sync + 'static> Module for SeaOrmModule<Tag> {
             .with_hooks::<Db<Tag>>(),
         )
         .export::<Db<Tag>>();
+    }
+
+    fn identity(&self) -> Identity {
+        Identity::Instance
     }
 }
