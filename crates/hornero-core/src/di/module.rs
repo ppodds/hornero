@@ -1,4 +1,4 @@
-use std::any::{TypeId, type_name};
+use std::any::{Any, TypeId, type_name};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -20,29 +20,6 @@ use crate::web::guard::Guard;
 use crate::web::interceptor::Interceptor;
 use crate::web::middleware::Middleware;
 
-/// Identifies a module for de-duplication. Importing the same module twice yields one instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ModuleId {
-    type_id: TypeId,
-    discriminator: u64,
-}
-
-impl ModuleId {
-    /// The identity of the module type `M`.
-    pub fn of<M: ?Sized + 'static>() -> Self {
-        Self {
-            type_id: TypeId::of::<M>(),
-            discriminator: 0,
-        }
-    }
-
-    /// Distinguishes several instances of the same dynamic module type.
-    pub fn with_discriminator(mut self, discriminator: u64) -> Self {
-        self.discriminator = discriminator;
-        self
-    }
-}
-
 /// A unit of encapsulation. Providers are private to their module unless exported.
 ///
 /// Usually written with `#[module(...)]`. Implementing it by hand is the L1 API:
@@ -63,14 +40,21 @@ impl ModuleId {
 /// Dynamic modules (Nest's `forRoot`) are ordinary structs carrying configuration.
 /// `define` may be called more than once (`validate()` and `build()` both call it), so it must
 /// only describe the module; do I/O inside provider factories.
-pub trait Module: Send + Sync + 'static {
+///
+/// The framework decides which imports are the same module, so a dynamic module needs no id of
+/// its own: a module without fields is identified by its type, so importing it twice yields one
+/// instance, and every other module value is an instance of its own, so two `for_root(..)` calls
+/// are two modules (Nest's identity by reference). To share one instance of a dynamic module,
+/// import it once and re-export it with [`ModuleDef::export_module`], or implement
+/// [`dedup_key`](Module::dedup_key).
+pub trait Module: Any + Send + Sync {
     /// Describes the module's imports, providers, controllers and exports.
     fn define(&self, m: &mut ModuleDef);
 
-    /// Identity used for de-duplication; the type by default. Override it, with
-    /// [`ModuleId::with_discriminator`], when one type stands for several modules.
-    fn id(&self) -> ModuleId {
-        ModuleId::of::<Self>()
+    /// Merges the imports of this module type that return equal keys into one module, defined
+    /// once. `None`, the default, leaves the identity to the framework (see [`Module`]).
+    fn dedup_key(&self) -> Option<u64> {
+        None
     }
 
     /// Name used in diagnostics and the scope report; the short type name by default.
@@ -96,7 +80,8 @@ pub struct ModuleDef {
     pub(crate) providers: Vec<ProviderDef>,
     pub(crate) controllers: Vec<ControllerEntry>,
     pub(crate) exports: Vec<Key>,
-    pub(crate) export_modules: Vec<ModuleId>,
+    /// Type and type name of each re-exported module.
+    pub(crate) export_modules: Vec<(TypeId, &'static str)>,
     pub(crate) middlewares: Vec<EnhancerRef>,
     pub(crate) layers: Vec<LayerFn>,
     pub(crate) mounts: Vec<MountEntry>,
@@ -209,14 +194,11 @@ impl ModuleDef {
         self
     }
 
-    /// Re-exports everything an imported module exports.
+    /// Re-exports everything the imported modules of type `M` export, whichever values they are,
+    /// so `export_module::<SeaOrmModule>()` matches `SeaOrmModule::for_root(..)`.
     pub fn export_module<M: Module>(&mut self) -> &mut Self {
-        self.export_module_id(ModuleId::of::<M>())
-    }
-
-    /// Like [`export_module`](Self::export_module), for a module identified by [`ModuleId`].
-    pub fn export_module_id(&mut self, id: ModuleId) -> &mut Self {
-        self.export_modules.push(id);
+        self.export_modules
+            .push((TypeId::of::<M>(), type_name::<M>()));
         self
     }
 

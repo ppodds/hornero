@@ -47,7 +47,7 @@ impl Module for ConfigModule { /* ... */ }
 
 | 方法 | 說明 |
 |---|---|
-| `fn for_root(source: Source) -> ConfigModule` | 設定的根，從 `source` 讀取；在根模組註冊一次。每次呼叫都是獨立的模組（唯一的 `ModuleId`），註冊兩個會被回報為 ambiguous，不會悄悄丟掉其中一個 |
+| `fn for_root(source: Source) -> ConfigModule` | 設定的根，從 `source` 讀取；在根模組註冊一次。每次呼叫都是獨立的模組，註冊兩個會被回報為 ambiguous，不會悄悄丟掉其中一個 |
 | `fn for_feature() -> ConfigModule` | feature 模組自己的型別化設定，從 `for_root` 的 source 讀取；非 global，只有 import 它的模組看得到。沒有註冊 `for_root` 時，啟動錯誤會指出缺少 `RegisterConfigModuleForRootInTheRootModule` |
 | `fn load<T: DeserializeOwned + Send + Sync + 'static>(self) -> Self` | 提供 `Arc<T>`，從整份設定反序列化 |
 | `fn section<T: DeserializeOwned + Send + Sync + 'static>(self, key: impl Into<String>) -> Self` | 提供 `Arc<T>`，從 `key` 底下的區段反序列化；可以用 `"database.pool"` 這種點分路徑 |

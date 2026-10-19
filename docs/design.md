@@ -89,7 +89,9 @@ pub struct TodoModule;
 ```
 
 - 動態模組（Nest 的 `forRoot`）就是帶設定的 struct 值；`Module::define(&self)` 只描述模組，I/O 放在 provider factory 裡（`validate()` 與 `build()` 都會呼叫 `define`）。
-- 模組身分預設為 `TypeId`，可覆寫 `id()`（`ModuleId::with_discriminator`）；重複 import 會 dedup 成同一實例。需要「每次呼叫都是獨立實例」的動態模組（`ConfigModule::for_root`、`SeaOrmModule::for_root`）每個實例有唯一的 id，不會被 dedup；同時註冊兩個，下游就會得到歧義錯誤。
+- 模組身分由框架決定，作者不需要維護：沒有欄位的模組（ZST）以型別為身分，重複 import 會 dedup 成同一實例（ZST 只有一個值，型別身分就是值身分）；帶欄位的模組每次 import 都是獨立實例（同 NestJS v11 起以物件參照判斷身分），所以兩個 `for_root(..)` 是兩個模組，同時註冊兩個，下游就會得到歧義錯誤，而不是悄悄丟掉其中一份設定。需要依內容合併的模組（`ConfigModule::for_feature`）實作 `Module::dedup_key`，以 (型別, key) 為身分。
+- `export_module::<M>()` 依型別比對，轉出所有型別為 `M` 的 import；其中有兩個實例 export 同一個 key 時是歧義錯誤。
+- 循環 import 依型別偵測：帶欄位的模組互相 import 時每一層都是新實例，身分永遠不會重複，所以 import stack 上出現同一個型別就回報 `CircularImport`。
 - 可見性規則見 ADR-0003。
 
 ### 4.3 Enhancer 也是 provider

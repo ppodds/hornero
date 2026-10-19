@@ -29,11 +29,9 @@ use std::any::type_name;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hornero::{
-    BoxError, BoxFuture, FactoryFn, Key, Lifecycle, Module, ModuleDef, ModuleId, ProviderDef,
-    Resolver,
+    BoxError, BoxFuture, FactoryFn, Key, Lifecycle, Module, ModuleDef, ProviderDef, Resolver,
 };
 pub use sea_orm;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -97,17 +95,9 @@ struct Options {
 /// modules just inject `Arc<Db>`. Every instance has its own identity, so two roots for the same
 /// tag make `Db<Tag>` ambiguous instead of silently dropping one of them.
 pub struct SeaOrmModule<Tag = Primary> {
-    instance: u64,
     options: Options,
     global: bool,
     _tag: PhantomData<fn() -> Tag>,
-}
-
-/// Source of the per-instance module identity.
-static INSTANCES: AtomicU64 = AtomicU64::new(1);
-
-fn next_instance() -> u64 {
-    INSTANCES.fetch_add(1, Ordering::Relaxed)
 }
 
 impl SeaOrmModule {
@@ -115,7 +105,6 @@ impl SeaOrmModule {
     pub fn for_root(options: impl Into<ConnectOptions>) -> Self {
         let options: ConnectOptions = options.into();
         Self {
-            instance: next_instance(),
             options: Options {
                 deps: Vec::new(),
                 factory: Arc::new(move |_| {
@@ -135,7 +124,6 @@ impl SeaOrmModule {
     {
         let factory = Arc::new(factory);
         Self {
-            instance: next_instance(),
             options: Options {
                 deps: F::dependencies(),
                 factory: Arc::new(move |resolver| factory.call(resolver)),
@@ -150,7 +138,6 @@ impl<Tag> SeaOrmModule<Tag> {
     /// Re-tags the connection: `SeaOrmModule::for_root(url).tag::<Replica>()` provides `Db<Replica>`.
     pub fn tag<Other>(self) -> SeaOrmModule<Other> {
         SeaOrmModule {
-            instance: self.instance,
             options: self.options,
             global: self.global,
             _tag: PhantomData,
@@ -165,10 +152,6 @@ impl<Tag> SeaOrmModule<Tag> {
 }
 
 impl<Tag: Send + Sync + 'static> Module for SeaOrmModule<Tag> {
-    fn id(&self) -> ModuleId {
-        ModuleId::of::<Self>().with_discriminator(self.instance)
-    }
-
     fn define(&self, m: &mut ModuleDef) {
         if self.global {
             m.global();

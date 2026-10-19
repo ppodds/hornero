@@ -31,7 +31,7 @@ pub struct SeaOrmModule<Tag = Primary> { /* ... */ }
 impl<Tag: Send + Sync + 'static> Module for SeaOrmModule<Tag> { /* ... */ }
 ```
 
-在根模組註冊一次 `for_root`（同 Nest 的 `TypeOrmModule.forRoot`），其他模組直接注入 `Arc<Db>`。每個 `SeaOrmModule` 實例有自己的 `ModuleId`，同一個 tag 註冊兩次會得到 `Problem::AmbiguousDependency`，不會被當成同一個模組去重。
+在根模組註冊一次 `for_root`（同 Nest 的 `TypeOrmModule.forRoot`），其他模組直接注入 `Arc<Db>`。每個 `SeaOrmModule` 值都是獨立的模組，同一個 tag 註冊兩次會得到 `Problem::AmbiguousDependency`，不會被當成同一個模組去重。
 
 | 方法 | 說明 |
 |---|---|
@@ -44,7 +44,7 @@ impl<Tag: Send + Sync + 'static> Module for SeaOrmModule<Tag> { /* ... */ }
 - 連線在啟動時建立，連不上資料庫是 bootstrap 錯誤（`Problem::Construction`）。
 - 連線在 `on_application_shutdown` 關閉，晚於所有 `on_module_destroy`，所以其他 provider 在 `on_module_destroy` 裡仍可使用資料庫。
 - 沒有 `forFeature([Entity])`：SeaORM 沒有每個 entity 一個 repository 的概念，feature 模組直接注入 `Arc<Db>`，再使用 `Entity::find()`。
-- 每個 tag 只能有一個 `SeaOrmModule`；模組依型別（含 tag）去重。
+- 每個 tag 只能有一個 `SeaOrmModule`。非 global 的連線可以用 `exports = [module(SeaOrmModule)]` 轉出。
 
 ---
 

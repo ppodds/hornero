@@ -264,7 +264,7 @@ assert_eq!(app.get::<Cache>().unwrap().capacity(), 1024);
 撰寫動態模組時要注意：
 
 - **`define` 只負責描述**。`validate()` 與 `build()` 都會呼叫它，所以不要在裡面做 I/O。連線、讀檔這類工作請放進 factory（`m.factory(...)`），失敗時會變成 bootstrap 錯誤。
-- **模組依型別去重**。同一個模組型別在整棵樹裡只會定義一次，以**第一個遇到的**為準，之後的 `CacheModule::new(2)` 會被忽略。若同一型別的模組需要多個實例，請覆寫 `fn id()`，並讓每個實例提供不同的型別（例如泛型 tag），否則使用方會遇到歧義：
+- **模組的身分由框架決定**，不需要自己維護 id。沒有欄位的模組（`struct UsersModule;`）以型別為身分，import 幾次都是同一個實例；帶欄位的模組每次 import 都是獨立的實例（同 NestJS v11 起以物件參照判斷身分），所以兩個 `CacheModule` 各自提供自己的 `Cache`，設定不會被悄悄丟掉：
 
 ```rust
 use hornero::prelude::*;
@@ -279,15 +279,35 @@ impl Module for CacheModule {
     }
 }
 
-#[module(imports = [CacheModule(1), CacheModule(2)])] // 第二個被去重掉了
+#[derive(Injectable)]
+struct Sessions {
+    cache: Arc<Cache>,
+}
+
+#[derive(Injectable)]
+struct Tokens {
+    cache: Arc<Cache>,
+}
+
+#[module(imports = [CacheModule(1)], providers = [Sessions], exports = [Sessions])]
+struct SessionsModule;
+
+#[module(imports = [CacheModule(60)], providers = [Tokens], exports = [Tokens])]
+struct TokensModule;
+
+#[module(imports = [SessionsModule, TokensModule])]
 struct AppModule;
 
 # #[tokio::main(flavor = "current_thread")]
 # async fn main() {
 let app = Hornero::new(AppModule).build().await.unwrap();
-assert_eq!(app.get::<Cache>().unwrap().0, 1);
+assert_eq!(app.get::<Sessions>().unwrap().cache.0, 1);
+assert_eq!(app.get::<Tokens>().unwrap().cache.0, 60);
 # }
 ```
+
+- **同一個模組看得到兩個實例**，而兩者 export 同一個型別時，使用方會遇到歧義。要同時存在，就讓 provider 帶不同的型別（例如泛型 tag，`Db<Tag>`）。
+- **要共用同一個實例**，就在一個模組裡 import 一次，再以 `exports = [module(CacheModule)]`（`m.export_module::<CacheModule>()`）轉出。`export_module` 依型別比對，`CacheModule::new(..)` 這類值也轉得出去。若要讓內容相同的 import 自動合併，實作 `fn dedup_key()`：同型別、key 相同的 import 是同一個模組（`ConfigModule::for_feature` 就是這樣讓相同的 feature 去重）。
 
 - **`fn name()`** 決定錯誤訊息與 scope report 中的模組名稱，預設是型別名稱。
 

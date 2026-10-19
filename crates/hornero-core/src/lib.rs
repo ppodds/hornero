@@ -17,7 +17,7 @@ pub use di::dependency::{Dependency, Qualified};
 pub use di::graph::{ScopeEntry, ScopeReport};
 pub use di::injectable::{Injectable, LifecycleFn, Scope, hooks};
 pub use di::key::Key;
-pub use di::module::{Module, ModuleDef, ModuleId, Provide};
+pub use di::module::{Module, ModuleDef, Provide};
 pub use di::provider::{FactoryFn, ProviderDef};
 pub use di::resolver::Resolver;
 pub use di::scope::RequestContext;

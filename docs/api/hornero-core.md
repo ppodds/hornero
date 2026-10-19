@@ -5,7 +5,7 @@
 | 分類 | 項目 |
 |---|---|
 | [應用程式](#應用程式) | `Hornero`、`App` |
-| [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`ModuleId` |
+| [模組](#模組) | `Module`、`ModuleDef`、`Provide` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
 | [Request scope](#request-scope) | `RequestContext`、`ScopeReport`、`ScopeEntry` |
 | [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
@@ -99,9 +99,9 @@ pub struct App { /* ... */ }
 ### `trait Module`
 
 ```rust,ignore
-pub trait Module: Send + Sync + 'static {
+pub trait Module: Any + Send + Sync {
     fn define(&self, m: &mut ModuleDef);
-    fn id(&self) -> ModuleId { ModuleId::of::<Self>() }
+    fn dedup_key(&self) -> Option<u64> { None }
     fn name(&self) -> String { /* 型別名稱 */ }
 }
 ```
@@ -111,7 +111,7 @@ pub trait Module: Send + Sync + 'static {
 | 方法 | 說明 |
 |---|---|
 | `define` | 用 `ModuleDef` 描述模組內容。可能被呼叫多次（`validate` 與 `build`），所以不要做 I/O |
-| `id` | 去重用的身分，預設是型別；同一型別要多個實例時覆寫，並使用 `ModuleId::with_discriminator` |
+| `dedup_key` | 同型別、key 相同的 import 合併成一個模組。預設 `None`：沒有欄位的模組以型別為身分（import 幾次都是同一個實例），帶欄位的模組每次 import 都是獨立實例 |
 | `name` | 錯誤訊息與 scope report 中的名稱，預設是不含路徑的型別名稱 |
 
 見 [模組](../guide/03-modules.md)。
@@ -136,8 +136,7 @@ pub struct ModuleDef { /* ... */ }
 | `fn controller<C: Controller>(&mut self)` | 註冊 controller |
 | `fn export<T: ?Sized>(&mut self)` | export 一個 provider：本模組提供的，或 import 進來的（轉出） |
 | `fn export_qualified<T: ?Sized, Q>(&mut self)` | 同上，export 以 qualifier `Q` 註冊的 `T` |
-| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports |
-| `fn export_module_id(&mut self, id: ModuleId)` | 同上，以 `ModuleId` 指定（用於帶 discriminator 的模組） |
+| `fn export_module<M: Module>(&mut self)` | 轉出型別為 `M` 的 import 的所有 exports，不論是哪個值（`for_root(..)` 也可以）；兩個實例 export 同一個型別時是歧義錯誤 |
 | `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的 DI middleware |
 | `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的 tower layer |
 | `fn mount_router(&mut self, path: impl Into<String>, router: Router)` | 掛進一個 axum `Router`（L0） |
@@ -177,21 +176,6 @@ impl<F: ExceptionFilter + Injectable> Provide for AppFilter<F> { /* ... */ }
 ```
 
 `ModuleDef::provide::<T>()` 與 `#[module(providers = [T])]` 接受的型別。一般的 `Injectable` 型別註冊成 class provider；[`Qualified<T, Q>`](#qualified) 把 `T` 註冊在 qualifier `Q` 之下；[`AppGuard<G>`、`AppInterceptor<I>`、`AppFilter<F>`](#appguardappinterceptorappfilter) 則註冊全域 enhancer。型別沒有實作 `Injectable` 時，編譯錯誤是「`` `T` is not injectable ``」。
-
-### `ModuleId`
-
-```rust,ignore
-pub struct ModuleId { /* ... */ }
-```
-
-模組的身分。同一個 `ModuleId` 在模組樹中只會定義一次。
-
-| 方法 | 說明 |
-|---|---|
-| `fn of<M: ?Sized + 'static>() -> ModuleId` | 以型別作為身分 |
-| `fn with_discriminator(self, discriminator: u64) -> ModuleId` | 區分同一型別的多個實例 |
-
-實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。
 
 ---
 

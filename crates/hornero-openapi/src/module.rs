@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
-use hornero_core::{BoxError, Module, ModuleDef, ModuleId, Routes};
+use hornero_core::{BoxError, Module, ModuleDef, Routes};
 
 use crate::config::OpenApiConfig;
 use crate::document::document;
@@ -26,7 +25,6 @@ use crate::document::document;
 /// so it lists every controller route of the application, whichever module it is in.
 pub struct OpenApiModule {
     config: OpenApiConfig,
-    id: u64,
 }
 
 impl OpenApiModule {
@@ -35,11 +33,7 @@ impl OpenApiModule {
     /// Every call makes a distinct module, so two of them with different paths and
     /// [`filter`](OpenApiConfig::filter)s can serve two documents.
     pub fn for_root(config: OpenApiConfig) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Self {
-            config,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        }
+        Self { config }
     }
 }
 
@@ -50,10 +44,6 @@ impl Module for OpenApiModule {
             let router = router(&routes, &config);
             async move { router }
         });
-    }
-
-    fn id(&self) -> ModuleId {
-        ModuleId::of::<Self>().with_discriminator(self.id)
     }
 }
 

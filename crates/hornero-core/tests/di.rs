@@ -192,6 +192,24 @@ fn circular_imports_report_the_path() {
     insta::assert_snapshot!(err.to_string());
 }
 
+#[test]
+fn modules_with_fields_importing_each_other_report_the_path() {
+    struct Ping(u32);
+    struct Pong(u32);
+    impl Module for Ping {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Pong(self.0));
+        }
+    }
+    impl Module for Pong {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Ping(self.0));
+        }
+    }
+    let err = Hornero::new(Ping(1)).validate().unwrap_err();
+    insta::assert_snapshot!(err.to_string());
+}
+
 // --- construction --------------------------------------------------------------------------
 
 static COUNTED_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -226,6 +244,130 @@ async fn modules_imported_twice_are_instantiated_once() {
     let before = COUNTED_BUILDS.load(Ordering::SeqCst);
     Hornero::new(App).build().await.unwrap();
     assert_eq!(COUNTED_BUILDS.load(Ordering::SeqCst) - before, 1);
+}
+
+// --- module identity -----------------------------------------------------------------------
+
+pub struct Ttl(u64);
+
+/// A dynamic module: configuration in a struct, and no identity of its own.
+struct CacheModule {
+    ttl: u64,
+}
+
+impl Module for CacheModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.provide_value(Ttl(self.ttl)).export::<Ttl>();
+    }
+}
+
+service!(Sessions: Ttl);
+service!(Tokens: Ttl);
+
+#[tokio::test]
+async fn modules_with_fields_are_one_instance_per_import() {
+    module!(SessionsModule, |m| {
+        m.import(CacheModule { ttl: 1 })
+            .provide::<Sessions>()
+            .export::<Sessions>();
+    });
+    module!(TokensModule, |m| {
+        m.import(CacheModule { ttl: 60 })
+            .provide::<Tokens>()
+            .export::<Tokens>();
+    });
+    module!(App, |m| {
+        m.import(SessionsModule).import(TokensModule);
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Sessions>().unwrap().0.0, 1);
+    assert_eq!(app.get::<Tokens>().unwrap().0.0, 60);
+}
+
+/// Imports with equal keys are one module.
+struct PoolModule {
+    key: u64,
+}
+
+impl Module for PoolModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.provide::<Database>().export::<Database>();
+    }
+
+    fn dedup_key(&self) -> Option<u64> {
+        Some(self.key)
+    }
+}
+
+service!(Reports: Database);
+service!(Billing: Database);
+service!(Audit: Database);
+
+#[tokio::test]
+async fn modules_with_equal_dedup_keys_are_one_instance() {
+    module!(ReportsModule, |m| {
+        m.import(PoolModule { key: 1 })
+            .provide::<Reports>()
+            .export::<Reports>();
+    });
+    module!(BillingModule, |m| {
+        m.import(PoolModule { key: 1 })
+            .provide::<Billing>()
+            .export::<Billing>();
+    });
+    module!(AuditModule, |m| {
+        m.import(PoolModule { key: 2 })
+            .provide::<Audit>()
+            .export::<Audit>();
+    });
+    module!(App, |m| {
+        m.import(ReportsModule)
+            .import(BillingModule)
+            .import(AuditModule);
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    let reports = app.get::<Reports>().unwrap();
+    assert!(Arc::ptr_eq(&reports.0, &app.get::<Billing>().unwrap().0));
+    assert!(!Arc::ptr_eq(&reports.0, &app.get::<Audit>().unwrap().0));
+}
+
+#[test]
+fn modules_with_fields_are_re_exported_by_type() {
+    module!(StorageModule, |m| {
+        m.import(CacheModule { ttl: 5 })
+            .export_module::<CacheModule>();
+    });
+    module!(App, |m| {
+        m.import(StorageModule).provide::<Sessions>();
+    });
+    Hornero::new(App).validate().unwrap();
+}
+
+#[test]
+fn re_exporting_two_instances_of_one_module_type_is_ambiguous() {
+    module!(StorageModule, |m| {
+        m.import(CacheModule { ttl: 1 })
+            .import(CacheModule { ttl: 60 })
+            .export_module::<CacheModule>();
+    });
+    module!(App, |m| {
+        m.import(StorageModule);
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert_eq!(err.problems().len(), 1, "{err}");
+    insta::assert_snapshot!(err.to_string());
+}
+
+#[test]
+fn re_exporting_a_module_that_is_not_imported_names_it() {
+    module!(App, |m| {
+        m.export_module::<CacheModule>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        err.to_string().contains("App exports `CacheModule`"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
