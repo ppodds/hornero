@@ -240,7 +240,7 @@ impl Module for WebModule {
 
 掛在 `/` 的 router 可以帶自己的 fallback，例如單頁應用（SPA）：controller 路由照常運作，其餘路徑交給前端的 `index.html`。只有沒被任何 fallback 接手的請求，才會得到 hornero 的 problem+json 404。
 
-這個 fallback 和 404 一樣只經過全域 middleware 與 layer，不經過模組的 `m.middleware` / `m.layer`（它們只包住模組的路由）。fallback 需要的 layer（例如快取 header）請直接加在掛進去的 `Router` 上。
+這個 fallback 和 404 一樣只經過全域 middleware 與 layer，不經過模組的 `m.middleware` / `m.layer`（它們只包住模組的路由；掛在其他前綴的 router，例如上面的 `/assets`，自己的 fallback 也算模組的路由）。fallback 需要的 layer（例如快取 header 或驗證）請直接加在掛進去的 `Router` 上，或改用全域 middleware：模組的驗證 middleware 擋不到它。
 
 ```rust
 use hornero::prelude::*;

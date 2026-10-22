@@ -140,7 +140,7 @@ request
   → handler（&self + extractors）
 ```
 
-全部編譯成 `axum::middleware::from_fn` 或 tower layer，沒有另一套執行模型。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。fallback 只由全域 middleware 與 layer 包住，不經過任何模組的 middleware 或 layer：axum `merge` 留下的 fallback 是最後合併的模組的，帶著該模組的 layer，所以 hornero 另外組 fallback。掛在 `/` 的 router 自己的 fallback（例如 SPA 的 `index.html`）會被使用，只有 axum 空的 404 才換成 problem+json；這些 router 的路由在 fallback 裡一律回 404，免得全域 layer 在路由之後改寫路徑，繞過模組的 middleware 打到它們。
+全部編譯成 `axum::middleware::from_fn` 或 tower layer，沒有另一套執行模型。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。應用的 fallback 只由全域 middleware 與 layer 包住，不經過任何模組的 middleware 或 layer：axum `merge` 留下的 fallback 是最後合併的模組的，帶著該模組的 layer，所以 hornero 另外組 fallback。掛在 `/` 的 router 自己的 fallback（例如 SPA 的 `index.html`）會被使用，只有 axum 空的 404 才換成 problem+json；這些 router 的路由在 fallback 裡一律回 404，免得全域 layer 在路由之後改寫路徑，繞過模組的 middleware 打到它們。mount 在非 `/` 前綴的 router 自己的 fallback 不在此列：axum `nest` 把它收在該前綴下，跟其他路由一樣經過模組的 middleware 與 layer。
 
 route 層（scope、filter、guard、interceptor）以 `route_layer` 掛載，只對該 route 註冊的 HTTP method 執行：同一路徑上其他 method 的請求得到 405 時，不會執行任何 guard、interceptor 或 filter。405 同樣以 problem+json 回應，並保留 axum 設定的 `Allow` header。
 

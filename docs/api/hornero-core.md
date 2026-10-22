@@ -138,8 +138,8 @@ pub struct ModuleDef { /* ... */ }
 | `fn export_qualified<T: ?Sized, Q>(&mut self)` | 同上，export 以 qualifier `Q` 註冊的 `T` |
 | `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports；與自己 export 的 local provider 同型別時 local 優先，與其他轉出來源指向不同 provider 時是 `AmbiguousReexport` 啟動錯誤 |
 | `fn export_module_id(&mut self, id: ModuleId)` | 同上，以 `ModuleId` 指定（用於帶 discriminator 的模組） |
-| `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的路由的 DI middleware；沒有路由符合的 request（包括交給掛在 `/` 的 router 的 fallback 的）不經過它 |
-| `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的路由的 tower layer；同樣不包住 fallback |
+| `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的路由的 DI middleware，包括 mount 在非 `/` 前綴的 router 自己的 fallback；交給應用 fallback 的 request（包括掛在 `/` 的 router 的 fallback）不經過它 |
+| `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的路由的 tower layer；fallback 的範圍同上 |
 | `fn mount_router(&mut self, path: impl Into<String>, router: Router)` | 掛進一個 axum `Router`（L0） |
 | `fn mount<Args, F>(&mut self, path: impl Into<String>, f: F)` | 掛進一個由 factory 產生的 `Router`；`F: FactoryFn<Args, Output = Router>` |
 

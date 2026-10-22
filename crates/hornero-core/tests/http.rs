@@ -2675,6 +2675,49 @@ async fn a_root_fallback_runs_inside_the_global_layers_only() {
 }
 
 #[tokio::test]
+async fn a_fallback_mounted_under_a_prefix_runs_inside_its_module() {
+    struct Tagged;
+    impl Module for Tagged {
+        fn define(&self, m: &mut ModuleDef) {
+            m.layer(tag!("tagged")).mount_router(
+                "/tagged",
+                Router::new()
+                    .route("/ping", axum_get(|| async { "pong" }))
+                    .fallback(|| async { "tagged fallback" }),
+            );
+        }
+    }
+    struct Vault;
+    impl Module for Vault {
+        fn define(&self, m: &mut ModuleDef) {
+            m.middleware::<Locked>()
+                .mount_router("/vault", Router::new().fallback(|| async { "classified" }));
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Tagged).import(Vault);
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+
+    // Under its prefix, a mount's own fallback answers inside its module's layers and middleware.
+    let res = get(&router, "/tagged/missing").await;
+    assert_eq!(res.body, "tagged fallback");
+    assert_eq!(res.headers["x-tagged"], "wrapped");
+    assert_eq!(
+        get(&router, "/vault/missing").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Elsewhere it is the application's fallback, outside both.
+    let res = get(&router, "/missing").await;
+    assert_eq!(res.json()["detail"], "no route matches the request");
+    assert!(res.headers.get("x-tagged").is_none());
+}
+
+#[tokio::test]
 async fn a_path_rewritten_after_routing_cannot_reach_a_mounted_route_around_its_module() {
     struct Vault;
     impl Module for Vault {
