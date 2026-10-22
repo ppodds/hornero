@@ -110,3 +110,51 @@ impl Shutdown {
         self.token.child_token()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Hook, Shutdown};
+
+    #[tokio::test]
+    async fn clones_and_child_tokens_follow_the_trigger() {
+        let shutdown = Shutdown::new();
+        let clone = shutdown.clone();
+        let token = shutdown.token();
+        assert!(!shutdown.is_triggered() && !token.is_cancelled());
+
+        clone.trigger();
+        clone.trigger();
+        assert!(shutdown.is_triggered());
+        assert!(token.is_cancelled());
+        // Waiting after the fact resolves at once, and late tokens start out cancelled.
+        shutdown.cancelled().await;
+        assert!(shutdown.token().is_cancelled());
+    }
+
+    #[test]
+    fn cancelling_a_child_token_does_not_shut_the_application_down() {
+        let shutdown = Shutdown::new();
+        shutdown.token().cancel();
+        assert!(!shutdown.is_triggered());
+    }
+
+    #[test]
+    fn hooks_are_named_after_their_methods() {
+        let names = [
+            Hook::ModuleInit,
+            Hook::ApplicationBootstrap,
+            Hook::ModuleDestroy,
+            Hook::ApplicationShutdown,
+        ]
+        .map(|hook| hook.to_string());
+        assert_eq!(
+            names,
+            [
+                "on_module_init",
+                "on_application_bootstrap",
+                "on_module_destroy",
+                "on_application_shutdown"
+            ]
+        );
+    }
+}

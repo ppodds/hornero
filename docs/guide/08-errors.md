@@ -412,6 +412,7 @@ match &err.problems()[0] {
 |---|---|---|
 | `MissingDependency` | 依賴在該模組不可見 | 照 hint 註冊、export 或 import |
 | `AmbiguousDependency` | 同一層有多個來源 | 在本地提供，或只 import 其中一個 |
+| `AmbiguousReexport` | `export_module` 轉出的模組提供了同一型別的不同實例 | 在轉出的模組提供並 export 它（會遮蔽轉出的），或只從其中一個來源轉出 |
 | `DuplicateProvider` | 同一模組註冊了兩次同型別（且 qualifier 相同） | 給每個實例不同的 qualifier（`.qualified::<Q>()`），或用 newtype |
 | `CircularDependency` | provider 互相依賴 | 抽出共用的 provider，或用 channel / 事件解耦 |
 | `CircularImport` | 模組互相 import | 把共用部分移到第三個模組 |

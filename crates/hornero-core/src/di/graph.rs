@@ -441,20 +441,46 @@ impl Graph {
                 }),
             }
         }
+        // Keys re-exported from several sources that disagree, with every candidate.
+        let mut conflicts: Vec<(Key, Vec<usize>)> = Vec::new();
         for id in self.modules[module].export_modules.clone() {
             match imports
                 .iter()
                 .find(|&&import| self.modules[import].id == id)
             {
                 Some(&import) => {
-                    let reexported = self.modules[import].exported.clone();
-                    exported.extend(reexported);
+                    for (key, node) in self.modules[import].exported.clone() {
+                        let Some(&existing) = exported.get(&key) else {
+                            exported.insert(key, node);
+                            continue;
+                        };
+                        // An exported local provider shadows the re-export, as it does for lookups.
+                        if existing == node
+                            || self.modules[module].local.get(&key) == Some(&existing)
+                        {
+                            continue;
+                        }
+                        match conflicts.iter_mut().find(|(k, _)| *k == key) {
+                            Some((_, candidates)) if candidates.contains(&node) => {}
+                            Some((_, candidates)) => candidates.push(node),
+                            None => conflicts.push((key, vec![existing, node])),
+                        }
+                    }
                 }
                 None => self.problems.push(Problem::InvalidExport {
                     module: self.modules[module].name.clone(),
                     export: "a module it does not import".into(),
                 }),
             }
+        }
+        // `exported` iterates in no particular order; report in node order to stay deterministic.
+        conflicts.sort_by(|(_, a), (_, b)| a.cmp(b));
+        for (key, candidates) in conflicts {
+            self.problems.push(Problem::AmbiguousReexport {
+                module: self.modules[module].name.clone(),
+                dependency: key.short_name(),
+                candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
+            });
         }
         self.modules[module].exported = exported;
         state[module] = 2;

@@ -66,6 +66,12 @@ pub(crate) struct InterceptorSlot<I>(PhantomData<fn() -> I>);
 pub(crate) struct FilterSlot<F>(PhantomData<fn() -> F>);
 pub(crate) struct MiddlewareSlot<M>(PhantomData<fn() -> M>);
 
+/// The key of the slot `S` for the enhancer `E`, named after `E` in diagnostics (an unused
+/// `override_guard::<E>()` reports `E`, not the slot type).
+fn slot_key<S: 'static, E: 'static>() -> Key {
+    Key::of::<S>().displayed_as::<E>()
+}
+
 /// A reference to an enhancer type, resolved into a slot node during bootstrap.
 #[derive(Clone)]
 pub(crate) struct EnhancerRef {
@@ -103,14 +109,14 @@ impl EnhancerRef {
             kind: EnhancerKind::Guard,
             name: short_type_name(type_name::<G>()),
             token: "AppGuard",
-            slot_key: Key::of::<GuardSlot<G>>(),
+            slot_key: slot_key::<GuardSlot<G>, G>(),
             target_key: Key::of::<G>(),
             make_slot: || {
                 ProviderDef::from_fn::<dyn ErasedGuard, _, _>(vec![Key::of::<G>()], |r| {
                     let guard = r.get::<G>();
                     async move { Ok(guard? as Arc<dyn ErasedGuard>) }
                 })
-                .with_key(Key::of::<GuardSlot<G>>())
+                .with_key(slot_key::<GuardSlot<G>, G>())
             },
             make_target: ProviderDef::injectable::<G>,
             describe: <G as Injectable>::describe,
@@ -122,14 +128,14 @@ impl EnhancerRef {
             kind: EnhancerKind::Interceptor,
             name: short_type_name(type_name::<I>()),
             token: "AppInterceptor",
-            slot_key: Key::of::<InterceptorSlot<I>>(),
+            slot_key: slot_key::<InterceptorSlot<I>, I>(),
             target_key: Key::of::<I>(),
             make_slot: || {
                 ProviderDef::from_fn::<dyn ErasedInterceptor, _, _>(vec![Key::of::<I>()], |r| {
                     let interceptor = r.get::<I>();
                     async move { Ok(interceptor? as Arc<dyn ErasedInterceptor>) }
                 })
-                .with_key(Key::of::<InterceptorSlot<I>>())
+                .with_key(slot_key::<InterceptorSlot<I>, I>())
             },
             make_target: ProviderDef::injectable::<I>,
             describe: <I as Injectable>::describe,
@@ -141,14 +147,14 @@ impl EnhancerRef {
             kind: EnhancerKind::Filter,
             name: short_type_name(type_name::<F>()),
             token: "AppFilter",
-            slot_key: Key::of::<FilterSlot<F>>(),
+            slot_key: slot_key::<FilterSlot<F>, F>(),
             target_key: Key::of::<F>(),
             make_slot: || {
                 ProviderDef::from_fn::<dyn ErasedFilter, _, _>(vec![Key::of::<F>()], |r| {
                     let filter = r.get::<F>();
                     async move { Ok(filter? as Arc<dyn ErasedFilter>) }
                 })
-                .with_key(Key::of::<FilterSlot<F>>())
+                .with_key(slot_key::<FilterSlot<F>, F>())
             },
             make_target: ProviderDef::injectable::<F>,
             describe: <F as Injectable>::describe,
@@ -160,14 +166,14 @@ impl EnhancerRef {
             kind: EnhancerKind::Middleware,
             name: short_type_name(type_name::<M>()),
             token: "Middleware",
-            slot_key: Key::of::<MiddlewareSlot<M>>(),
+            slot_key: slot_key::<MiddlewareSlot<M>, M>(),
             target_key: Key::of::<M>(),
             make_slot: || {
                 ProviderDef::from_fn::<dyn ErasedMiddleware, _, _>(vec![Key::of::<M>()], |r| {
                     let middleware = r.get::<M>();
                     async move { Ok(middleware? as Arc<dyn ErasedMiddleware>) }
                 })
-                .with_key(Key::of::<MiddlewareSlot<M>>())
+                .with_key(slot_key::<MiddlewareSlot<M>, M>())
             },
             make_target: ProviderDef::injectable::<M>,
             describe: <M as Injectable>::describe,
@@ -177,7 +183,7 @@ impl EnhancerRef {
 
 /// A replacement for an enhancer slot, registered through `Hornero::override_guard` and friends.
 pub(crate) fn guard_override<G: 'static>(guard: impl Guard) -> (Key, ProviderDef) {
-    let key = Key::of::<GuardSlot<G>>();
+    let key = slot_key::<GuardSlot<G>, G>();
     let erased: Arc<dyn ErasedGuard> = Arc::new(guard);
     (key, ProviderDef::from_arc(erased).with_key(key))
 }
@@ -185,13 +191,13 @@ pub(crate) fn guard_override<G: 'static>(guard: impl Guard) -> (Key, ProviderDef
 pub(crate) fn interceptor_override<I: 'static>(
     interceptor: impl Interceptor,
 ) -> (Key, ProviderDef) {
-    let key = Key::of::<InterceptorSlot<I>>();
+    let key = slot_key::<InterceptorSlot<I>, I>();
     let erased: Arc<dyn ErasedInterceptor> = Arc::new(interceptor);
     (key, ProviderDef::from_arc(erased).with_key(key))
 }
 
 pub(crate) fn filter_override<F: 'static>(filter: impl ExceptionFilter) -> (Key, ProviderDef) {
-    let key = Key::of::<FilterSlot<F>>();
+    let key = slot_key::<FilterSlot<F>, F>();
     let erased: Arc<dyn ErasedFilter> = Arc::new(filter);
     (key, ProviderDef::from_arc(erased).with_key(key))
 }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hornero_core::{
-    BoxError, Hornero, Injectable, Key, Lifecycle, LifecycleFn, Module, ModuleDef, ProviderDef,
-    Qualified, Resolver, Scope, bind, hooks,
+    BoxError, Hornero, Injectable, Key, Lifecycle, LifecycleFn, Module, ModuleDef, ModuleId,
+    Problem, ProviderDef, Qualified, Resolver, Scope, Shutdown, bind, hooks,
 };
 
 // --- missing dependencies ------------------------------------------------------------------
@@ -785,4 +785,454 @@ fn with_hooks_on_the_wrong_type_is_a_bootstrap_error() {
     let err = Hornero::new(App).validate().unwrap_err();
     assert_eq!(err.problems().len(), 1, "{err}");
     insta::assert_snapshot!(err.to_string());
+}
+
+// --- re-exported modules -------------------------------------------------------------------
+
+pub struct Region(&'static str);
+service!(Weather: Region);
+
+#[tokio::test]
+async fn an_exported_local_provider_shadows_a_re_exported_module() {
+    module!(Library, |m| {
+        m.provide_value(Region("imported")).export::<Region>();
+    });
+    module!(Facade, |m| {
+        m.import(Library)
+            .provide_value(Region("local"))
+            .export::<Region>()
+            .export_module::<Library>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    // Importers see the provider Facade itself uses, as with any other local provider.
+    assert_eq!(app.get::<Weather>().unwrap().0.0, "local");
+}
+
+#[test]
+fn re_exported_modules_that_disagree_are_rejected() {
+    module!(North, |m| {
+        m.provide_value(Region("north")).export::<Region>();
+    });
+    module!(South, |m| {
+        m.provide_value(Region("south")).export::<Region>();
+    });
+    module!(Facade, |m| {
+        m.import(North)
+            .import(South)
+            .export_module::<North>()
+            .export_module::<South>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::AmbiguousReexport { module, .. }] if module == "Facade"),
+        "{err}"
+    );
+    insta::assert_snapshot!(err.to_string());
+}
+
+#[tokio::test]
+async fn an_exported_local_provider_settles_re_exports_that_disagree() {
+    module!(North, |m| {
+        m.provide_value(Region("north")).export::<Region>();
+    });
+    module!(South, |m| {
+        m.provide_value(Region("south")).export::<Region>();
+    });
+    // What the hint suggests: provide it in the re-exporting module and export it.
+    module!(Facade, |m| {
+        m.import(North)
+            .import(South)
+            .provide_value(Region("facade"))
+            .export::<Region>()
+            .export_module::<North>()
+            .export_module::<South>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Weather>().unwrap().0.0, "facade");
+}
+
+#[test]
+fn an_unexported_local_provider_does_not_settle_re_exports_that_disagree() {
+    module!(North, |m| {
+        m.provide_value(Region("north")).export::<Region>();
+    });
+    module!(South, |m| {
+        m.provide_value(Region("south")).export::<Region>();
+    });
+    module!(Facade, |m| {
+        m.import(North)
+            .import(South)
+            .provide_value(Region("facade"))
+            .export_module::<North>()
+            .export_module::<South>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::AmbiguousReexport { .. }]),
+        "{err}"
+    );
+}
+
+#[test]
+fn one_provider_re_exported_along_several_paths_is_not_ambiguous() {
+    module!(Library, |m| {
+        m.provide_value(Region("library")).export::<Region>();
+    });
+    module!(Wrapper, |m| {
+        m.import(Library).export_module::<Library>();
+    });
+    module!(Facade, |m| {
+        m.import(Library)
+            .import(Wrapper)
+            .export_module::<Library>()
+            .export_module::<Wrapper>();
+    });
+    module!(App, |m| {
+        m.import(Facade).provide::<Weather>();
+    });
+    Hornero::new(App).validate().unwrap();
+}
+
+#[test]
+fn re_exporting_a_module_that_is_not_imported_is_rejected() {
+    module!(Library, |m| {
+        m.provide_value(Region("library")).export::<Region>();
+    });
+    module!(App, |m| {
+        m.export_module::<Library>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::InvalidExport { module, .. }] if module == "App"),
+        "{err}"
+    );
+}
+
+// --- global and dynamic modules ------------------------------------------------------------
+
+#[test]
+fn global_modules_must_still_be_registered_once() {
+    module!(GlobalDatabaseModule, |m| {
+        m.global().provide::<Database>().export::<Database>();
+    });
+    module!(UsersModule, |m| {
+        m.provide::<UserService>();
+    });
+    module!(Unregistered, |m| {
+        m.import(UsersModule);
+    });
+    module!(Registered, |m| {
+        m.import(GlobalDatabaseModule).import(UsersModule);
+    });
+    let err = Hornero::new(Unregistered).validate().unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::MissingDependency { .. }]),
+        "{err}"
+    );
+    Hornero::new(Registered).validate().unwrap();
+}
+
+#[test]
+fn several_global_modules_exporting_one_type_are_ambiguous() {
+    module!(LeftGlobal, |m| {
+        m.global().provide::<Database>().export::<Database>();
+    });
+    module!(RightGlobal, |m| {
+        m.global().provide_value(Database()).export::<Database>();
+    });
+    module!(UsersModule, |m| {
+        m.provide::<UserService>();
+    });
+    module!(App, |m| {
+        m.import(LeftGlobal).import(RightGlobal).import(UsersModule);
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "UserService (in UsersModule) requires `Database`, which is visible from several sources"
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn imports_take_precedence_over_global_modules() {
+    module!(Everywhere, |m| {
+        m.global()
+            .provide_value(Region("global"))
+            .export::<Region>();
+    });
+    module!(Local, |m| {
+        m.provide_value(Region("imported")).export::<Region>();
+    });
+    module!(Forecasts, |m| {
+        m.import(Local).provide::<Weather>().export::<Weather>();
+    });
+    module!(App, |m| {
+        m.import(Everywhere).import(Forecasts);
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Weather>().unwrap().0.0, "imported");
+}
+
+struct Tenant(&'static str);
+
+/// A dynamic module (Nest's `forRoot`): one type, configured per instance.
+#[derive(Clone, Copy)]
+struct TenantModule {
+    tenant: &'static str,
+    discriminator: u64,
+}
+
+impl Module for TenantModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.provide_value(Tenant(self.tenant)).export::<Tenant>();
+    }
+
+    fn id(&self) -> ModuleId {
+        ModuleId::of::<Self>().with_discriminator(self.discriminator)
+    }
+}
+
+struct LeftTenant(Arc<Tenant>);
+struct RightTenant(Arc<Tenant>);
+
+/// Two sibling modules, each importing its own `TenantModule` and injecting the `Tenant`.
+fn tenant_app(left: TenantModule, right: TenantModule) -> Hornero {
+    struct Left(TenantModule);
+    impl Module for Left {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(self.0)
+                .factory(|t: Arc<Tenant>| async move { Ok::<_, BoxError>(LeftTenant(t)) });
+        }
+    }
+    struct Right(TenantModule);
+    impl Module for Right {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(self.0)
+                .factory(|t: Arc<Tenant>| async move { Ok::<_, BoxError>(RightTenant(t)) });
+        }
+    }
+    struct App(TenantModule, TenantModule);
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Left(self.0)).import(Right(self.1));
+        }
+    }
+    Hornero::new(App(left, right))
+}
+
+#[tokio::test]
+async fn dynamic_modules_are_told_apart_by_their_discriminator() {
+    let app = tenant_app(
+        TenantModule {
+            tenant: "acme",
+            discriminator: 1,
+        },
+        TenantModule {
+            tenant: "globex",
+            discriminator: 2,
+        },
+    )
+    .build()
+    .await
+    .unwrap();
+    assert_eq!(app.get::<LeftTenant>().unwrap().0.0, "acme");
+    assert_eq!(app.get::<RightTenant>().unwrap().0.0, "globex");
+    assert!(
+        app.get::<Tenant>().is_none(),
+        "two tenants, neither visible from the root"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_modules_with_one_id_are_registered_once_and_the_first_wins() {
+    let app = tenant_app(
+        TenantModule {
+            tenant: "acme",
+            discriminator: 7,
+        },
+        TenantModule {
+            tenant: "globex",
+            discriminator: 7,
+        },
+    )
+    .build()
+    .await
+    .unwrap();
+    let (left, right) = (
+        app.get::<LeftTenant>().unwrap(),
+        app.get::<RightTenant>().unwrap(),
+    );
+    assert!(Arc::ptr_eq(&left.0, &right.0));
+    assert_eq!(left.0.0, "acme");
+}
+
+#[test]
+fn importing_one_dynamic_module_twice_suggests_registering_it_once() {
+    module!(App, |m| {
+        m.import(TenantModule {
+            tenant: "acme",
+            discriminator: 1,
+        })
+        .import(TenantModule {
+            tenant: "acme",
+            discriminator: 2,
+        })
+        .factory(|t: Arc<Tenant>| async move { Ok::<_, BoxError>(LeftTenant(t)) });
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a dynamic module such as `for_root` is registered more than once"),
+        "{err}"
+    );
+}
+
+// --- graph edge cases ----------------------------------------------------------------------
+
+#[test]
+fn a_provider_depending_on_itself_is_a_cycle() {
+    service!(Ouroboros: Ouroboros);
+    module!(App, |m| {
+        m.provide::<Ouroboros>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    match err.problems() {
+        [Problem::CircularDependency { path }] => {
+            assert_eq!(path, &["Ouroboros (in App)", "Ouroboros (in App)"])
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_dependency_declared_twice_is_one_instance() {
+    struct Pair(Arc<Database>, Arc<Database>);
+    module!(App, |m| {
+        m.provide::<Database>()
+            .factory(
+                |a: Arc<Database>, b: Arc<Database>| async move { Ok::<_, BoxError>(Pair(a, b)) },
+            );
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    let pair = app.get::<Pair>().unwrap();
+    assert!(Arc::ptr_eq(&pair.0, &pair.1));
+}
+
+#[tokio::test]
+async fn optional_dependencies_follow_visibility() {
+    module!(PrivateMetrics, |m| {
+        m.provide_value(Metrics("private"));
+    });
+    module!(App, |m| {
+        m.import(PrivateMetrics).provide::<Instrumented>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert!(
+        app.get::<Instrumented>().unwrap().0.is_none(),
+        "a provider another module keeps private is not injected"
+    );
+}
+
+#[test]
+fn transient_providers_cannot_have_hooks() {
+    struct Ephemeral;
+    impl Injectable for Ephemeral {
+        const SCOPE: Scope = Scope::Transient;
+        const LIFECYCLE: Option<LifecycleFn<Self>> = hooks::<Self>();
+        fn dependencies() -> Vec<Key> {
+            Vec::new()
+        }
+        async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+            Ok(Ephemeral)
+        }
+    }
+    impl Lifecycle for Ephemeral {}
+    module!(App, |m| {
+        m.provide::<Ephemeral>();
+    });
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Ephemeral (in App) has lifecycle hooks but is transient"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn validate_constructs_nothing() {
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+    struct Unreachable;
+    module!(App, |m| {
+        m.factory(|| async {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Err::<Unreachable, _>("database is down")
+        });
+    });
+    // A graph test passes without the infrastructure; `build` is what meets it.
+    Hornero::new(App).validate().unwrap();
+    assert_eq!(BUILDS.load(Ordering::SeqCst), 0);
+    assert!(Hornero::new(App).build().await.is_err());
+    assert_eq!(BUILDS.load(Ordering::SeqCst), 1);
+}
+
+// --- App::get --------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn app_get_only_returns_singletons() {
+    module!(App, |m| {
+        m.provide::<Database>()
+            .provide::<AuditLog>()
+            .provide::<TodoService>();
+    });
+    let app = Hornero::new(App).build().await.unwrap();
+    assert!(app.get::<Database>().is_some());
+    assert!(app.get::<AuditLog>().is_none(), "declared request-scoped");
+    assert!(
+        app.get::<TodoService>().is_none(),
+        "bubbled into request scope"
+    );
+    assert!(
+        app.get::<Shutdown>().is_some(),
+        "built-ins are singletons too"
+    );
+}
+
+#[tokio::test]
+async fn app_get_prefers_the_provider_visible_from_the_root() {
+    module!(Hidden, |m| {
+        m.provide_value(Region("hidden"));
+    });
+    module!(AlsoHidden, |m| {
+        m.provide_value(Region("also hidden"));
+    });
+    module!(Exported, |m| {
+        m.provide_value(Region("exported")).export::<Region>();
+    });
+    module!(Visible, |m| {
+        m.import(Hidden).import(Exported);
+    });
+    module!(Invisible, |m| {
+        m.import(Hidden).import(AlsoHidden);
+    });
+    let app = Hornero::new(Visible).build().await.unwrap();
+    assert_eq!(app.get::<Region>().unwrap().0, "exported");
+    let app = Hornero::new(Invisible).build().await.unwrap();
+    assert!(
+        app.get::<Region>().is_none(),
+        "several private providers and none visible from the root: nothing to prefer"
+    );
 }

@@ -68,3 +68,36 @@ impl RouteContext {
         self.meta.get::<T>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Metadata;
+
+    #[derive(Debug, PartialEq)]
+    struct Roles(&'static [&'static str]);
+    struct Public;
+
+    #[test]
+    fn values_are_keyed_by_type_and_replaced_by_the_same_type() {
+        let mut meta = Metadata::default();
+        assert!(meta.get::<Roles>().is_none());
+        meta.insert(Roles(&["user"]));
+        meta.insert(Roles(&["admin"]));
+        assert_eq!(meta.get::<Roles>(), Some(&Roles(&["admin"])));
+        assert!(meta.get::<Public>().is_none());
+    }
+
+    #[test]
+    fn extending_overrides_shared_types_and_keeps_the_rest() {
+        let mut controller = Metadata::default();
+        controller.insert(Roles(&["user"]));
+        controller.insert(Public);
+        let mut handler = Metadata::default();
+        handler.insert(Roles(&["admin"]));
+
+        controller.extend(&handler);
+        assert_eq!(controller.get::<Roles>(), Some(&Roles(&["admin"])));
+        assert!(controller.get::<Public>().is_some());
+        assert!(handler.get::<Public>().is_none(), "the source is unchanged");
+    }
+}

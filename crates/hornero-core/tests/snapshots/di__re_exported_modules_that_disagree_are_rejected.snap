@@ -1,0 +1,11 @@
+---
+source: crates/hornero-core/tests/di.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] ambiguous re-export
+    Facade re-exports `Region` from several sources that provide different instances:
+      - Region (in North)
+      - Region (in South)
+    hint: provide `Region` in Facade and export it, which shadows the re-exported ones, or re-export it from only one of these sources.

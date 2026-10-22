@@ -99,7 +99,7 @@ pub struct TodoModule;
 1. 若 `AuthGuard` 在該模組可見（例如 `AuthModule` export 了它），使用該實例，其依賴在 `AuthModule` 內解析；
 2. 否則在該模組建立一個私有的隱式 provider（Nest 對 `@UseGuards(X)` 的行為相同）。
 
-兩個可見來源都滿足 `AuthGuard` 時（例如同時 import 了兩個都 export 它的模組），和一般依賴一樣是 `AmbiguousDependency` 啟動錯誤，不會任選一個；模組 `exports` 轉出的型別有多個來源時也是。
+兩個可見來源都滿足 `AuthGuard` 時（例如同時 import 了兩個都 export 它的模組），和一般依賴一樣是 `AmbiguousDependency` 啟動錯誤，不會任選一個；模組 `exports` 轉出的型別有多個來源時也是，`export_module` 轉出的幾個模組提供不同實例時則是 `AmbiguousReexport`。
 
 slot 以 `Arc<dyn ErasedGuard>` 儲存，因此 `override_guard::<AuthGuard>(AllowAll)` 可以換成任何 `Guard` 實作，且原本 guard 的依賴不再需要。
 
@@ -140,7 +140,7 @@ request
   → handler（&self + extractors）
 ```
 
-全部編譯成 `axum::middleware::from_fn` 或 tower layer，沒有另一套執行模型。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。
+全部編譯成 `axum::middleware::from_fn` 或 tower layer，沒有另一套執行模型。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。應用的 fallback 只由全域 middleware 與 layer 包住，不經過任何模組的 middleware 或 layer：axum `merge` 留下的 fallback 是最後合併的模組的，帶著該模組的 layer，所以 hornero 另外組 fallback。掛在 `/` 的 router 自己的 fallback（例如 SPA 的 `index.html`）會被使用，只有 axum 空的 404 才換成 problem+json；這些 router 的路由在 fallback 裡一律回 404，免得全域 layer 在路由之後改寫路徑，繞過模組的 middleware 打到它們。mount 在非 `/` 前綴的 router 自己的 fallback 不在此列：axum `nest` 把它收在該前綴下，跟其他路由一樣經過模組的 middleware 與 layer。
 
 route 層（scope、filter、guard、interceptor）以 `route_layer` 掛載，只對該 route 註冊的 HTTP method 執行：同一路徑上其他 method 的請求得到 405 時，不會執行任何 guard、interceptor 或 filter。405 同樣以 problem+json 回應，並保留 axum 設定的 `Allow` header。
 
@@ -188,7 +188,8 @@ failed to bootstrap application: 1 problem
 - `App::close()` 把 destroy / shutdown hook 的失敗收集成 `ShutdownError`，與啟動失敗的 `BootError` 分開。`serve` 為 handler 提供 `ConnectInfo<SocketAddr>`；`hornero-testing` 的 request 帶有 loopback 的 peer 位址（`TestRequest::peer_addr` 可改）。
 - `Drop` 不能 await，需要 I/O 的清理放在 hook 裡；內建可注入的 `Arc<Shutdown>`（包 `CancellationToken`）供背景任務監聽。
 - `App::serve` 處理 SIGINT/SIGTERM 與 `Shutdown::trigger()`：graceful shutdown 後執行 destroy hooks；即使某個 hook 失敗也會跑完其他 hook。
-- 等待進行中 request 有上限（`Hornero::shutdown_timeout`，預設 10 秒）：逾時或收到第二次 SIGINT/SIGTERM 就放棄剩下的連線並照常執行 destroy hooks。tokio 的訊號處理會取代預設的 Ctrl-C 終止行為，沒有這個機制時，一個卡住的 SSE 或慢 request 會讓第二次 Ctrl-C 也無效。
+- 等待進行中 request 有上限（`Hornero::shutdown_timeout`，預設 10 秒）：逾時或收到第二次 SIGINT/SIGTERM 就取消仍在執行的 request（還沒回應的 handler 被 drop、client 收到 503，仍在串流的 body 被切斷），等這些連線關閉（最多 1 秒）後照常執行 destroy hooks。axum 為每條連線 spawn 獨立的 task，只 drop serve 的 future 停不了它們，所以 `serve` 給每條連線一個共同 token 的 child token：request 只等自己連線的 token，不同連線的 request 不會搶同一把鎖。503 在全域 middleware 與 layer 的內側產生，所以和其他錯誤一樣帶著 CORS header、以 problem+json 回應、被 5xx log 記錄；卡在 `next` 之前的全域 middleware 由連線層再取消一次。限制：handler 自己 spawn 的 task（包括 upgrade 之後的 WebSocket 連線）不是 request，要自己監聽 `Shutdown`；不讀回應的 client 會讓 hyper 停止 poll body，這種連線在 1 秒後仍會留著，destroy hooks 照常執行。tokio 的訊號處理會取代預設的 Ctrl-C 終止行為，沒有這個機制時，一個卡住的 SSE 或慢 request 會讓第二次 Ctrl-C 也無效。
+- `listen` 在 `build` 之後才綁定位址，因為 port 一開就會通過 TCP health check。綁定失敗（例如 port 已被占用）時會先 `close`，執行關閉 hook，再回傳錯誤，init hook 啟動的東西不會遺留；關閉 hook 也失敗時，錯誤的 `source()` 是 `ShutdownError`。
 
 ## 9. 測試
 
