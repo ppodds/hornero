@@ -113,9 +113,13 @@ assert_eq!(
 
 1. 啟動並開始接受 request。
 2. 收到 SIGINT（Ctrl-C）或 SIGTERM，或有人呼叫 `Shutdown::trigger()`。
-3. 停止接受新連線，等待進行中的 request 完成（axum graceful shutdown）。最多等 `Hornero::shutdown_timeout`（預設 10 秒）；逾時，或再收到一次 SIGINT/SIGTERM，就放棄剩下的連線（會記一筆 warning）並繼續下一步。
+3. 停止接受新連線，等待進行中的 request 完成（axum graceful shutdown）。最多等 `Hornero::shutdown_timeout`（預設 10 秒）；逾時，或再收到一次 SIGINT/SIGTERM，就取消仍在執行的 request（會記一筆 warning）：還沒回應的 handler 被 drop，client 收到 problem+json 的 503（會經過全域 middleware 與 layer，例如帶上 CORS header）；仍在串流的 body（例如 SSE）被切斷。這些連線關閉後（最多再等 1 秒）繼續下一步。
 4. 依反向依賴順序執行 `on_module_destroy`，再執行 `on_application_shutdown`。
 5. `listen` 回傳。
+
+第 3 步只取消 request。handler 自己 spawn 的 task（包括 upgrade 之後的 WebSocket 連線）不在其中，請讓它們監聽 `Shutdown`（見下方的背景工作寫法），並在 `on_module_destroy` 等它們停下來。不讀回應的 client 也可能讓連線撐過那 1 秒，第 4 步照常執行。
+
+位址無法綁定時（例如 port 已被占用），`listen` 會先執行第 4 步再回傳錯誤，`on_application_bootstrap` 啟動的背景任務不會遺留。回傳的仍是綁定的 `io::Error`（`kind()` 不變）；第 4 步的 hook 也失敗時，它的 `source()` 是 `ShutdownError`。
 
 handler 可以用 `ConnectInfo<SocketAddr>` 取得 client 位址；`serve` 與 `listen` 都會提供。
 

@@ -4,8 +4,8 @@ expression: err.to_string()
 ---
 failed to bootstrap application: 1 problem
 
-[1] ambiguous dependency
-    re-export in StorageModule requires `Ttl`, which is visible from several sources:
+[1] ambiguous re-export
+    StorageModule re-exports `Ttl` from several sources that provide different instances:
       - Ttl (in CacheModule#1, imported by StorageModule)
       - Ttl (in CacheModule#2, imported by StorageModule)
     hint: the sources are separate instances of CacheModule: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.

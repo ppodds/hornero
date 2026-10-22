@@ -120,3 +120,34 @@ impl<T: ?Sized + fmt::Debug, Q> fmt::Debug for Qualified<T, Q> {
         self.value.fmt(f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Primary;
+
+    #[test]
+    fn qualified_shares_one_instance() {
+        let url: Qualified<str, Primary> = Qualified::new(Arc::from("postgres://primary"));
+        assert!(url.starts_with("postgres"), "derefs to the value");
+        assert_eq!(format!("{url:?}"), r#""postgres://primary""#);
+
+        let copy = url.clone();
+        let shared: Arc<str> = copy.into();
+        assert!(Arc::ptr_eq(&shared, &url.into_inner()));
+    }
+
+    #[test]
+    fn dependency_keys_carry_the_qualifier_and_optionality() {
+        assert_eq!(<Arc<u8>>::key(), Key::of::<u8>());
+        assert!(!<Arc<u8>>::key().is_optional());
+        assert_eq!(
+            <Qualified<u8, Primary>>::key(),
+            Key::of::<u8>().qualified::<Primary>()
+        );
+        let optional = <Option<Qualified<u8, Primary>>>::key();
+        assert!(optional.is_optional());
+        assert_eq!(optional, Key::of::<u8>().qualified::<Primary>());
+    }
+}

@@ -31,6 +31,15 @@ fn scope_of(req: &Request) -> Option<Arc<RequestScope>> {
         .map(|cell| cell.0.clone())
 }
 
+/// Whether `response` is axum's own answer with `status`: no body, no content type and no
+/// [`HttpError`] behind it. A handler or fallback that answers with a body or an error keeps it.
+fn is_bare(response: &Response, status: StatusCode) -> bool {
+    response.status() == status
+        && response.body().is_end_stream()
+        && !response.headers().contains_key(header::CONTENT_TYPE)
+        && response.extensions().get::<ErrorExtension>().is_none()
+}
+
 /// Renders axum's bare 405 as problem+json.
 ///
 /// axum adds the `Allow` header itself, after the layers, to whatever the fallback returns, so it
@@ -39,12 +48,7 @@ fn scope_of(req: &Request) -> Option<Arc<RequestScope>> {
 pub(crate) fn with_problem_405(route: MethodRouter) -> MethodRouter {
     route.layer(from_fn(|req: Request, next: Next| async move {
         let response = next.run(req).await;
-        // Only the bare fallback: a handler that answers 405 with a body or an error keeps it.
-        let bare = response.status() == StatusCode::METHOD_NOT_ALLOWED
-            && response.body().is_end_stream()
-            && !response.headers().contains_key(header::CONTENT_TYPE)
-            && response.extensions().get::<ErrorExtension>().is_none();
-        if !bare {
+        if !is_bare(&response, StatusCode::METHOD_NOT_ALLOWED) {
             return response;
         }
         HttpError::new(
@@ -52,6 +56,30 @@ pub(crate) fn with_problem_405(route: MethodRouter) -> MethodRouter {
             "method not allowed for this route",
         )
         .into_response()
+    }))
+}
+
+/// The application's fallback, for requests no route matches: the fallback of a router mounted at
+/// `/` (an SPA's `index.html`, say), else hornero's problem+json 404.
+///
+/// It runs outside every module's layers and middleware, which only wrap that module's routes.
+/// The mounted routers' routes are already in the application, inside their module's layers; here
+/// they answer a bare 404, so a request that a global layer rewrote after routing cannot reach one
+/// around those layers.
+pub(crate) fn root_fallback(root_mounts: Vec<Router>) -> Router {
+    let mut fallback = root_mounts.into_iter().fold(Router::new(), Router::merge);
+    // `route_layer` panics on a router without routes, such as a mount that is only a fallback.
+    if fallback.has_routes() {
+        fallback = fallback.route_layer(from_fn(|_: Request, _: Next| async {
+            StatusCode::NOT_FOUND.into_response()
+        }));
+    }
+    fallback.layer(from_fn(|req: Request, next: Next| async move {
+        let response = next.run(req).await;
+        if !is_bare(&response, StatusCode::NOT_FOUND) {
+            return response;
+        }
+        HttpError::not_found("no route matches the request").into_response()
     }))
 }
 

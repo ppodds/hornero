@@ -120,7 +120,7 @@ assert_eq!(
 因此：
 
 - **local 會遮蔽 import**：模組自己提供的 `Clock` 優先於 import 進來的 `Clock`。
-- **同一層有多個來源是錯誤**：兩個 import 的模組都 export 了 `Database`，hornero 不會隨便挑一個，而是回報 `ambiguous dependency`，並列出所有候選。guard、interceptor、filter 的目標，以及 `exports` 轉出的型別也一樣。
+- **同一層有多個來源是錯誤**：兩個 import 的模組都 export 了 `Database`，hornero 不會隨便挑一個，而是回報 `ambiguous dependency`，並列出所有候選。guard、interceptor、filter 的目標，以及 `exports` 轉出的型別也一樣；`export_module` 轉出的幾個模組提供了不同實例時則是 `ambiguous re-export`，要在轉出的模組自己提供並 export 它，或只轉出其中一個。
 - **export 一個自己沒有的東西是錯誤**：`exports` 只能列出自己提供的 provider，或 import 進來的 provider（也就是轉出）。
 
 ```rust

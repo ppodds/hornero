@@ -618,7 +618,13 @@ impl Graph {
         reexported.sort_by_cached_key(|(key, _)| format!("{key:?}"));
         for (key, nodes) in reexported {
             let candidates = distinct(nodes.into_iter());
-            self.export_resolved(module, key, &candidates, &mut exported);
+            if candidates.len() > 1 {
+                let problem = self.ambiguous_reexport(module, key, &candidates);
+                self.problems.push(problem);
+            }
+            // Exported even when ambiguous, so importers do not report a missing dependency on
+            // top of the ambiguity.
+            exported.insert(key, candidates[0]);
         }
         self.modules[module].exported = exported;
         state[module] = 2;
@@ -648,28 +654,52 @@ impl Graph {
     /// The problem of `consumer` seeing `key` from several `candidates`.
     fn ambiguous(&self, consumer: String, key: Key, candidates: &[usize]) -> Problem {
         let dependency = key.short_name();
-        let modules = distinct(candidates.iter().map(|&n| self.nodes[n].module));
-        let first = &self.modules[modules[0]];
-        let hint = if modules.len() > 1
-            && modules
-                .iter()
-                .all(|&m| self.modules[m].type_id == first.type_id)
-        {
-            format!(
-                "the sources are separate instances of {}: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.",
-                first.base_name
-            )
-        } else {
+        let hint = self.instances_hint(candidates).unwrap_or_else(|| {
             format!(
                 "provide `{dependency}` locally, or import only one of the modules that export it (a global module counts as imported everywhere)."
             )
-        };
+        });
         Problem::AmbiguousDependency {
             consumer,
             dependency,
             candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
             hint,
         }
+    }
+
+    /// The problem of `module` re-exporting `key` from several `candidates` with `export_module`.
+    fn ambiguous_reexport(&self, module: usize, key: Key, candidates: &[usize]) -> Problem {
+        let module = self.modules[module].name.clone();
+        let dependency = key.short_name();
+        // A local provider only shadows re-exports when it is exported itself, and `export_module`
+        // needs the import, so "import only one" does not apply here.
+        let hint = self.instances_hint(candidates).unwrap_or_else(|| {
+            format!(
+                "provide `{dependency}` in {module} and export it, which shadows the re-exported ones, or re-export it from only one of these sources."
+            )
+        });
+        Problem::AmbiguousReexport {
+            module,
+            dependency,
+            candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
+            hint,
+        }
+    }
+
+    /// The hint for `candidates` that come from separate instances of one module type.
+    fn instances_hint(&self, candidates: &[usize]) -> Option<String> {
+        let modules = distinct(candidates.iter().map(|&n| self.nodes[n].module));
+        let first = &self.modules[modules[0]];
+        let instances = modules.len() > 1
+            && modules
+                .iter()
+                .all(|&m| self.modules[m].type_id == first.type_id);
+        instances.then(|| {
+            format!(
+                "the sources are separate instances of {}: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.",
+                first.base_name
+            )
+        })
     }
 
     /// Resolves `key` as seen from `module`: local providers, then imported exports, then globals.

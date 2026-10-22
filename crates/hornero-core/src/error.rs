@@ -262,6 +262,20 @@ pub enum Problem {
         /// one instance or give each instance's providers a type of its own.
         hint: String,
     },
+    /// A module re-exports (`export_module`) several modules that export different providers of
+    /// one type.
+    AmbiguousReexport {
+        /// The re-exporting module.
+        module: String,
+        /// Short type name of the re-exported type.
+        dependency: String,
+        /// Every provider it could resolve to.
+        candidates: Vec<String>,
+        /// How to settle it: provide and export the type in the re-exporting module, or re-export
+        /// one source only; for instances of one module type, share one instance or give each
+        /// instance's providers a type of its own.
+        hint: String,
+    },
     /// A module registers the same type, under the same qualifier, twice.
     DuplicateProvider {
         /// Short type name of the provider, with its qualifier if any.
@@ -321,9 +335,9 @@ pub enum Problem {
         /// The dependency chain that made it request-scoped, when bubbling caused the problem.
         chain: Vec<String>,
     },
-    /// An override replaces a type that no module provides.
+    /// An override replaces a type that no module provides, or an enhancer nothing uses.
     UnusedOverride {
-        /// Short type name of the overridden type.
+        /// Short type name of the overridden type or enhancer.
         provider: String,
     },
     /// A provider registration that is itself malformed, such as `with_hooks::<T>()` on a provider
@@ -387,6 +401,7 @@ impl Problem {
         match self {
             Problem::MissingDependency { .. } => "missing dependency",
             Problem::AmbiguousDependency { .. } => "ambiguous dependency",
+            Problem::AmbiguousReexport { .. } => "ambiguous re-export",
             Problem::DuplicateProvider { .. } => "duplicate provider",
             Problem::CircularDependency { .. } => "circular dependency",
             Problem::CircularImport { .. } => "circular module import",
@@ -426,6 +441,21 @@ impl Problem {
                 writeln!(
                     f,
                     "{INDENT}{consumer} requires `{dependency}`, which is visible from several sources:"
+                )?;
+                for candidate in candidates {
+                    writeln!(f, "{INDENT}  - {candidate}")?;
+                }
+                writeln!(f, "{INDENT}hint: {hint}")
+            }
+            Problem::AmbiguousReexport {
+                module,
+                dependency,
+                candidates,
+                hint,
+            } => {
+                writeln!(
+                    f,
+                    "{INDENT}{module} re-exports `{dependency}` from several sources that provide different instances:"
                 )?;
                 for candidate in candidates {
                     writeln!(f, "{INDENT}  - {candidate}")?;
@@ -525,7 +555,7 @@ impl Problem {
             Problem::UnusedOverride { provider } => {
                 writeln!(
                     f,
-                    "{INDENT}an override was registered for `{provider}`, but no module provides it."
+                    "{INDENT}an override was registered for `{provider}`, but no module provides or uses it."
                 )
             }
             Problem::InvalidProvider { provider, reason } => {
@@ -616,3 +646,125 @@ impl fmt::Debug for ShutdownError {
 }
 
 impl std::error::Error for ShutdownError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct DiskFull;
+
+    impl fmt::Display for DiskFull {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("disk full on /var")
+        }
+    }
+
+    impl std::error::Error for DiskFull {}
+
+    #[test]
+    fn std_errors_become_500s_that_keep_their_source_private() {
+        let err: HttpError = DiskFull.into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message(), "internal server error");
+        assert!(err.is::<DiskFull>());
+        assert!(!err.is::<std::io::Error>());
+        assert_eq!(err.source().unwrap().to_string(), "disk full on /var");
+        assert!(!err.to_problem().to_string().contains("/var"));
+    }
+
+    #[test]
+    fn errors_without_a_source_downcast_to_nothing() {
+        let err = HttpError::not_found("gone");
+        assert!(err.source().is_none());
+        assert!(err.downcast_ref::<DiskFull>().is_none());
+    }
+
+    #[test]
+    fn problems_carry_details_under_errors() {
+        let err = HttpError::unprocessable("invalid body")
+            .with_details(json!([{ "field": "title", "code": "length" }]));
+        assert_eq!(
+            err.to_problem(),
+            json!({
+                "type": "about:blank",
+                "title": "Unprocessable Entity",
+                "status": 422,
+                "detail": "invalid body",
+                "errors": [{ "field": "title", "code": "length" }],
+            })
+        );
+    }
+
+    #[test]
+    fn statuses_without_a_canonical_reason_get_a_generic_title() {
+        let status = StatusCode::from_u16(599).unwrap();
+        let problem = HttpError::new(status, "upstream melted").to_problem();
+        assert_eq!(problem["title"], "Error");
+        assert_eq!(problem["status"], 599);
+    }
+
+    #[test]
+    fn only_into_response_attaches_the_error_for_filters() {
+        let rendered = HttpError::conflict("taken")
+            .with_header(header::RETRY_AFTER, HeaderValue::from_static("5"))
+            .render();
+        assert_eq!(rendered.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            rendered.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        assert_eq!(rendered.headers()[header::RETRY_AFTER], "5");
+        assert!(rendered.extensions().get::<ErrorExtension>().is_none());
+
+        let response = HttpError::conflict("taken").into_response();
+        let attached = response.extensions().get::<ErrorExtension>().unwrap();
+        assert_eq!(attached.0.message(), "taken");
+    }
+
+    #[test]
+    fn display_shows_the_status_and_the_client_message() {
+        let err = HttpError::not_found("todo 9 not found").with_source(DiskFull);
+        assert_eq!(err.to_string(), "404 Not Found: todo 9 not found");
+    }
+
+    #[test]
+    fn boot_errors_count_and_number_their_problems() {
+        let one = BootError::new(vec![Problem::UnusedOverride {
+            provider: "Mailer".into(),
+        }]);
+        assert!(
+            one.to_string()
+                .starts_with("failed to bootstrap application: 1 problem\n"),
+            "{one}"
+        );
+
+        let two = BootError::new(vec![
+            Problem::UnusedOverride {
+                provider: "Mailer".into(),
+            },
+            Problem::Hook {
+                item: "Pool (in App)".into(),
+                hook: Hook::ModuleInit,
+                source: "connection refused".into(),
+            },
+        ]);
+        let text = two.to_string();
+        assert!(
+            text.starts_with("failed to bootstrap application: 2 problems\n"),
+            "{text}"
+        );
+        assert!(text.contains("[1] unused override"), "{text}");
+        assert!(
+            text.contains(
+                "[2] lifecycle hook failed\n    Pool (in App) failed in on_module_init: connection refused"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            format!("{two:?}"),
+            text,
+            "Debug reads like Display for `main`"
+        );
+    }
+}
