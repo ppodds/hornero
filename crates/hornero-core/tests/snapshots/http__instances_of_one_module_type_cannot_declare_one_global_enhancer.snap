@@ -1,0 +1,11 @@
+---
+source: crates/hornero-core/tests/http.rs
+expression: err.to_string()
+---
+failed to bootstrap application: 1 problem
+
+[1] duplicate global enhancer
+    `AppGuard<RootGuard>` is declared by several instances of Realm, so it would run once per instance on every route:
+      - Realm#1, imported by App
+      - Realm#2, imported by App
+    hint: declare it in a module imported once, such as the root module, or merge the instances with `Module::identity`.

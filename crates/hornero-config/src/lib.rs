@@ -22,15 +22,12 @@
 #![warn(missing_docs)]
 
 use std::any::TypeId;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::{Figment, Metadata, Profile, Provider};
-use hornero::{BoxError, Module, ModuleDef, ModuleId};
+use hornero::{BoxError, Identity, Module, ModuleDef};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -156,13 +153,6 @@ impl Entry {
     }
 }
 
-/// Bit set on a `for_feature` module's discriminator so it can never equal a `for_root` counter value.
-const FEATURE_DISCRIMINATOR: u64 = 1 << 63;
-
-/// Source of the unique ids of `for_root` instances. Stored in the module so `validate()` and
-/// `build()` (which both call [`Module::id`]) agree.
-static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Provides and exports one `Arc<T>` per configuration type, like Nest's `ConfigModule`.
 ///
 /// [`for_root`](Self::for_root) is registered once in the application's root module and owns the
@@ -173,8 +163,6 @@ pub struct ConfigModule {
     loaded: Option<Arc<Loaded>>,
     entries: Vec<Entry>,
     global: bool,
-    /// Distinguishes `for_root` instances; unused (derived from the entries) for features.
-    root_id: u64,
 }
 
 impl ConfigModule {
@@ -191,7 +179,6 @@ impl ConfigModule {
             })),
             entries: Vec::new(),
             global: true,
-            root_id: NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -203,7 +190,6 @@ impl ConfigModule {
             loaded: None,
             entries: Vec::new(),
             global: false,
-            root_id: 0,
         }
     }
 
@@ -251,27 +237,19 @@ impl Module for ConfigModule {
         }
     }
 
-    fn id(&self) -> ModuleId {
-        let discriminator = if self.loaded.is_some() {
-            self.root_id
-        } else {
-            // Identical features de-duplicate; different ones are distinct modules. Sorted, so the
-            // order of `load`/`section` calls does not matter.
-            let mut hashes: Vec<u64> = self
-                .entries
-                .iter()
-                .map(|entry| {
-                    let mut hasher = DefaultHasher::new();
-                    (entry.type_id, &entry.key).hash(&mut hasher);
-                    hasher.finish()
-                })
-                .collect();
-            hashes.sort_unstable();
-            let mut hasher = DefaultHasher::new();
-            hashes.hash(&mut hasher);
-            hasher.finish() | FEATURE_DISCRIMINATOR
-        };
-        ModuleId::of::<Self>().with_discriminator(discriminator)
+    /// Every root is a module of its own; identical features are one module.
+    fn identity(&self) -> Identity {
+        if self.loaded.is_some() {
+            return Identity::Instance;
+        }
+        // Sorted, so the order of `load`/`section` calls does not matter.
+        let mut entries: Vec<(TypeId, Option<String>)> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.type_id, entry.key.clone()))
+            .collect();
+        entries.sort();
+        Identity::key(entries)
     }
 }
 

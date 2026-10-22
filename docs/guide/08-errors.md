@@ -412,11 +412,14 @@ match &err.problems()[0] {
 |---|---|---|
 | `MissingDependency` | 依賴在該模組不可見 | 照 hint 註冊、export 或 import |
 | `AmbiguousDependency` | 同一層有多個來源 | 在本地提供，或只 import 其中一個 |
-| `AmbiguousReexport` | `export_module` 轉出的模組提供了同一型別的不同實例 | 在轉出的模組提供並 export 它（會遮蔽轉出的），或只從其中一個來源轉出 |
+| `AmbiguousReexport` | `export_module` 轉出的模組提供了同一型別的不同實例 | 在轉出的模組提供並 export 它（會遮蔽轉出的），或只從其中一個來源轉出；來源是同一模組型別的幾個實例時，只 import 一次並共用，或讓各實例的 provider 有自己的型別（例如泛型 tag） |
 | `DuplicateProvider` | 同一模組註冊了兩次同型別（且 qualifier 相同） | 給每個實例不同的 qualifier（`.qualified::<Q>()`），或用 newtype |
 | `CircularDependency` | provider 互相依賴 | 抽出共用的 provider，或用 channel / 事件解耦 |
 | `CircularImport` | 模組互相 import | 把共用部分移到第三個模組 |
 | `InvalidExport` | export 了自己沒有、也沒 import 的型別 | 註冊它，或 import export 它的模組 |
+| `InvalidModuleExport` | 轉出（`export_module`）了沒有 import 的模組 | import 那個模組 |
+| `UndeclaredModuleIdentity` | 帶資料的模組被 import 了不只一次，卻沒有宣告身分 | 在 `fn identity()` 回傳 `Identity::Instance`、`Identity::key(..)` 或 `Identity::Type`，見 [模組的身分](03-modules.md#動態模組) |
+| `DuplicateGlobalEnhancer` | 同一模組型別的多個實例宣告了同一個全域 enhancer | 改在只 import 一次的模組（例如根模組）宣告 |
 | `ScopeViolation` | middleware / mount / 有 hook 的 provider 變成 request-scoped，或 pinned 的 provider 被傳染 | 見 [Scope](06-scopes.md#傳染的限制) |
 | `UnusedOverride` | override 了沒有任何模組提供的型別 | 修正型別，或移除 override |
 | `InvalidRoute` | 舊的 `:id` 語法、axum 不支援的 method、axum 拒絕的路由 | 改用 `{id}`；調整路徑 |

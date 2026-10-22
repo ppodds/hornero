@@ -420,6 +420,11 @@ impl Module for MailerModule {
         )
         .export::<Mailer>();
     }
+
+    // 每次 for_root_with 都是獨立的模組（Nest 的 forRoot）
+    fn identity(&self) -> Identity {
+        Identity::Instance
+    }
 }
 
 // ---- 使用者的應用 ----
@@ -452,5 +457,6 @@ app.close().await.unwrap();
 - **基礎設施模組預設 global**，並提供 `.local()` 讓使用者關閉。
 - **只 export 使用者需要的型別**，內部 helper 保持私有。
 - **清理用 `Lifecycle`**，並以 `.with_hooks::<T>()` 啟用。
-- **允許多個實例**：讓模組與 provider 帶泛型 tag（`Db<Tag>`、`SeaOrmModule<Tag>`），每個 tag 就是不同的模組型別與 provider 型別。同一型別真的需要多個實例時，覆寫 `fn id()` 並加上 `ModuleId::with_discriminator`。
+- **宣告模組的身分**：`for_root` 這類每次呼叫都該是獨立模組的，在 `fn identity()` 回傳 `Identity::Instance`（不需要自己產生 id）；內容相同的 import 應該合併時，回傳 `Identity::key(..)`。帶資料卻沒宣告的模組被 import 兩次會是 bootstrap 錯誤。
+- **允許多個實例**：讓 provider 帶泛型 tag（`Db<Tag>`、`SeaOrmModule<Tag>`），多個實例才不會 export 同一個型別而造成歧義。
 - **用 `hornero-testing` 測試**你的模組：`TestApp::new(MyModule::for_root(...))`。

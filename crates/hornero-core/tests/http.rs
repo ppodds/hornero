@@ -15,9 +15,9 @@ use common::domain::DomainApp;
 use common::{get, send};
 use hornero_core::{
     AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ControllerDef, ExceptionFilter,
-    Guard, GuardContext, Hornero, HttpError, Injectable, Interceptor, Key, Lifecycle, LifecycleFn,
-    Middleware, Module, ModuleDef, Problem, RequestContext, Resolver, RouteContext, Scope,
-    Shutdown, hooks,
+    Guard, GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor, Key, Lifecycle,
+    LifecycleFn, Middleware, Module, ModuleDef, Problem, RequestContext, Resolver, RouteContext,
+    Scope, Shutdown, hooks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1175,6 +1175,45 @@ fn module_declared_global_enhancers_are_validated_where_they_are_declared() {
         matches!(&err.problems()[0], Problem::MissingDependency { dependency, .. } if dependency == "TokenStore"),
         "{err}"
     );
+}
+
+#[test]
+fn instances_of_one_module_type_cannot_declare_one_global_enhancer() {
+    /// Configured with its realm's name.
+    struct Realm(&'static str);
+    impl Module for Realm {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide_value(self.0).provide::<AppGuard<RootGuard>>();
+        }
+
+        fn identity(&self) -> Identity {
+            Identity::Instance
+        }
+    }
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Realm("staff")).import(Realm("customers"));
+        }
+    }
+    let err = Hornero::new(App).validate().unwrap_err();
+    assert_eq!(err.problems().len(), 1, "{err}");
+    insta::assert_snapshot!(err.to_string());
+
+    // Distinct module types declaring it each run it, as before.
+    struct Other;
+    impl Module for Other {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<AppGuard<RootGuard>>();
+        }
+    }
+    struct Mixed;
+    impl Module for Mixed {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(Realm("staff")).import(Other);
+        }
+    }
+    Hornero::new(Mixed).validate().unwrap();
 }
 
 // --- middleware, layers and mounts ---------------------------------------------------------

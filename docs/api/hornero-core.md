@@ -5,7 +5,7 @@
 | 分類 | 項目 |
 |---|---|
 | [應用程式](#應用程式) | `Hornero`、`App` |
-| [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`ModuleId` |
+| [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
 | [Request scope](#request-scope) | `RequestContext`、`ScopeReport`、`ScopeEntry` |
 | [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
@@ -99,9 +99,9 @@ pub struct App { /* ... */ }
 ### `trait Module`
 
 ```rust,ignore
-pub trait Module: Send + Sync + 'static {
+pub trait Module: Any + Send + Sync {
     fn define(&self, m: &mut ModuleDef);
-    fn id(&self) -> ModuleId { ModuleId::of::<Self>() }
+    fn identity(&self) -> Identity { Identity::Auto }
     fn name(&self) -> String { /* 型別名稱 */ }
 }
 ```
@@ -111,7 +111,7 @@ pub trait Module: Send + Sync + 'static {
 | 方法 | 說明 |
 |---|---|
 | `define` | 用 `ModuleDef` 描述模組內容。可能被呼叫多次（`validate` 與 `build`），所以不要做 I/O |
-| `id` | 去重用的身分，預設是型別；同一型別要多個實例時覆寫，並使用 `ModuleId::with_discriminator` |
+| `identity` | 同一型別的多次 import 是否為同一個模組，見 [`Identity`](#identity)。預設 `Identity::Auto` |
 | `name` | 錯誤訊息與 scope report 中的名稱，預設是不含路徑的型別名稱 |
 
 見 [模組](../guide/03-modules.md)。
@@ -136,8 +136,7 @@ pub struct ModuleDef { /* ... */ }
 | `fn controller<C: Controller>(&mut self)` | 註冊 controller |
 | `fn export<T: ?Sized>(&mut self)` | export 一個 provider：本模組提供的，或 import 進來的（轉出） |
 | `fn export_qualified<T: ?Sized, Q>(&mut self)` | 同上，export 以 qualifier `Q` 註冊的 `T` |
-| `fn export_module<M: Module>(&mut self)` | 轉出一個 import 進來的模組的所有 exports；與自己 export 的 local provider 同型別時 local 優先，與其他轉出來源指向不同 provider 時是 `AmbiguousReexport` 啟動錯誤 |
-| `fn export_module_id(&mut self, id: ModuleId)` | 同上，以 `ModuleId` 指定（用於帶 discriminator 的模組） |
+| `fn export_module<M: Module>(&mut self)` | 轉出型別為 `M` 的 import 的所有 exports，不論是哪個值（`for_root(..)` 也可以）；與自己 export 的 local provider 同型別時 local 優先，幾個轉出來源（包括同一模組型別的幾個實例）指向不同 provider 時是 `AmbiguousReexport` 啟動錯誤 |
 | `fn middleware<M: Middleware + Injectable>(&mut self)` | 只包住本模組 controller 與 mount 的路由的 DI middleware，包括 mount 在非 `/` 前綴的 router 自己的 fallback；交給應用 fallback 的 request（包括掛在 `/` 的 router 的 fallback）不經過它 |
 | `fn layer<L>(&mut self, layer: L)` | 只包住本模組 controller 與 mount 的路由的 tower layer；fallback 的範圍同上 |
 | `fn mount_router(&mut self, path: impl Into<String>, router: Router)` | 掛進一個 axum `Router`（L0） |
@@ -178,20 +177,31 @@ impl<F: ExceptionFilter + Injectable> Provide for AppFilter<F> { /* ... */ }
 
 `ModuleDef::provide::<T>()` 與 `#[module(providers = [T])]` 接受的型別。一般的 `Injectable` 型別註冊成 class provider；[`Qualified<T, Q>`](#qualified) 把 `T` 註冊在 qualifier `Q` 之下；[`AppGuard<G>`、`AppInterceptor<I>`、`AppFilter<F>`](#appguardappinterceptorappfilter) 則註冊全域 enhancer。型別沒有實作 `Injectable` 時，編譯錯誤是「`` `T` is not injectable ``」。
 
-### `ModuleId`
+### `Identity`
 
 ```rust,ignore
-pub struct ModuleId { /* ... */ }
+pub enum Identity {
+    Auto,
+    Type,
+    Instance,
+    Key(ModuleKey),
+}
 ```
 
-模組的身分。同一個 `ModuleId` 在模組樹中只會定義一次。
+`Module::identity` 的回傳值：同一型別的多次 import 中，哪些是同一個模組（只定義一次）。
+
+| 變體 | 說明 |
+|---|---|
+| `Auto` | 預設。零大小的模組（沒有欄位，或只有 `PhantomData`）以型別為身分；帶資料的模組只能 import 一次，第二次是 `Problem::UndeclaredModuleIdentity` |
+| `Type` | 同型別的 import 都是同一個模組，以第一個為準 |
+| `Instance` | 每次 import 都是獨立的模組，同 Nest 的 `forRoot()`。不能直接或間接再 import 自己的型別（回報為 `CircularImport`） |
+| `Key(ModuleKey)` | 同型別、key 相等的 import 是同一個模組，以第一個為準。以 `Identity::key` 建立 |
 
 | 方法 | 說明 |
 |---|---|
-| `fn of<M: ?Sized + 'static>() -> ModuleId` | 以型別作為身分 |
-| `fn with_discriminator(self, discriminator: u64) -> ModuleId` | 區分同一型別的多個實例 |
+| `fn key<K: Eq + Send + Sync + 'static>(key: K) -> Identity` | `Identity::Key`：以 `==` 比較 key。key 要涵蓋所有會讓兩次 import 不同的欄位 |
 
-實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。
+`ModuleKey` 是型別抹除後的 key，實作了 `PartialEq`。
 
 ---
 
@@ -692,7 +702,7 @@ pub struct AppFilter<F>(/* ... */);
 |---|---|
 | 解析 | `G` 在宣告它的模組裡解析，可以依賴該模組沒有 export 的 provider；依賴看不到時，啟動時報 `MissingDependency` |
 | 順序 | 先執行 `Hornero::guard` 等 builder 上註冊的，再執行模組宣告的；被 import 的模組先於 import 它的模組，同一模組依宣告順序 |
-| 重複 | 同一模組宣告兩次 `AppGuard<G>` 是 `DuplicateProvider`；不同模組各自宣告會各執行一次 |
+| 重複 | 同一模組宣告兩次 `AppGuard<G>` 是 `DuplicateProvider`；不同模組型別各自宣告會各執行一次；同一模組型別的多個實例（`Identity::Instance` 或不同 key）宣告同一個是 `DuplicateGlobalEnhancer` |
 | 替換 | `override_guard::<G>`（`override_interceptor`、`override_filter` 同理）同樣會替換這些全域 enhancer |
 
 Rust 沒有 Nest 的 multi-provider，同一個 key 只能註冊一次。每個 `AppGuard<X>` 都是不同的型別，所以一個模組可以註冊任意多個全域 guard。
@@ -967,12 +977,15 @@ pub struct ShutdownError { /* ... */ }
 | 變體 | 欄位 | 意義 |
 |---|---|---|
 | `MissingDependency` | `consumer`、`dependency`、`hint` | 依賴在該模組不可見 |
-| `AmbiguousDependency` | `consumer`、`dependency`、`candidates` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及 `export::<T>()` 轉出的型別也適用 |
-| `AmbiguousReexport` | `module`、`dependency`、`candidates` | `export_module` 轉出的幾個模組 export 了同一型別的不同 provider |
+| `AmbiguousDependency` | `consumer`、`dependency`、`candidates`、`hint` | 依賴在同一層有多個來源；guard、interceptor、filter 的目標，以及 `export::<T>()` 轉出的型別也適用 |
+| `AmbiguousReexport` | `module`、`dependency`、`candidates`、`hint` | `export_module` 轉出的幾個模組（或同一模組型別的幾個實例）export 了同一型別的不同 provider |
 | `DuplicateProvider` | `provider`、`module` | 同一模組重複註冊同一型別 |
 | `CircularDependency` | `path` | provider 之間的循環依賴 |
 | `CircularImport` | `path` | 模組之間的循環 import |
 | `InvalidExport` | `module`、`export` | export 了既沒提供、也沒 import 的型別 |
+| `InvalidModuleExport` | `module`、`export` | `export_module` 了沒有 import 的模組 |
+| `UndeclaredModuleIdentity` | `module`、`imported_by` | 帶資料、沒有宣告 `Identity` 的模組被 import 了不只一次 |
+| `DuplicateGlobalEnhancer` | `enhancer`、`module`、`instances` | 同一模組型別的多個實例宣告了同一個全域 enhancer |
 | `ScopeViolation` | `item`、`reason`、`chain` | middleware 或 mount 變成 request-scoped、有 hook 的 provider 不是 singleton，或 pinned 的 provider 被傳染 |
 | `UnusedOverride` | `provider` | override 了沒有任何模組提供的型別 |
 | `InvalidProvider` | `provider`、`reason` | provider 的註冊本身有誤，例如 `with_hooks::<T>()` 的 `T` 不是這個 provider 的型別 |

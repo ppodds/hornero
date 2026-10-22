@@ -45,6 +45,21 @@ async fn provides_a_global_connection() {
 }
 
 #[tokio::test]
+async fn a_local_connection_can_be_re_exported() {
+    #[module(
+        imports = [SeaOrmModule::for_root(memory()).local()],
+        exports = [module(SeaOrmModule)],
+    )]
+    struct DatabaseModule;
+
+    #[module(imports = [DatabaseModule], providers = [Probe], exports = [Probe])]
+    struct App;
+
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(app.get::<Probe>().unwrap().answer().await, 42);
+}
+
+#[tokio::test]
 async fn options_can_come_from_injected_providers() {
     #[module(global, providers = [value(DatabaseUrl("sqlite::memory:".into()))], exports = [DatabaseUrl])]
     struct Settings;

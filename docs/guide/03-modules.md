@@ -213,7 +213,7 @@ global 是刻意的捷徑，請留給真正橫切的關注點。`ConfigModule` �
 
 ## 動態模組
 
-NestJS 的 `forRoot(options)` 在 hornero 裡就是**帶著設定的 struct**。帶參數的模組通常手寫 `impl Module`，在 `define` 裡用 `ModuleDef` builder 描述內容：
+NestJS 的 `forRoot(options)` 在 hornero 裡就是**帶著設定的 struct**。帶參數的模組通常手寫 `impl Module`，在 `define` 裡用 `ModuleDef` builder 描述內容，並以 `fn identity()` 宣告每次呼叫都是獨立的模組（見下方「模組的身分」）：
 
 ```rust
 use hornero::prelude::*;
@@ -249,6 +249,10 @@ impl Module for CacheModule {
             .provide::<Cache>()
             .export::<Cache>();
     }
+
+    fn identity(&self) -> Identity {
+        Identity::Instance
+    }
 }
 
 #[module(imports = [CacheModule::new(1024)])]
@@ -264,7 +268,15 @@ assert_eq!(app.get::<Cache>().unwrap().capacity(), 1024);
 撰寫動態模組時要注意：
 
 - **`define` 只負責描述**。`validate()` 與 `build()` 都會呼叫它，所以不要在裡面做 I/O。連線、讀檔這類工作請放進 factory（`m.factory(...)`），失敗時會變成 bootstrap 錯誤。
-- **模組依型別去重**。同一個模組型別在整棵樹裡只會定義一次，以**第一個遇到的**為準，之後的 `CacheModule::new(2)` 會被忽略。若同一型別的模組需要多個實例，請覆寫 `fn id()`，並讓每個實例提供不同的型別（例如泛型 tag），否則使用方會遇到歧義：
+- **模組的身分**決定哪些 import 是同一個模組，不需要自己維護 id。預設的 `Identity::Auto`：零大小的模組（沒有欄位，或只有 `PhantomData`，例如 `struct UsersModule;`）以型別為身分，import 幾次都是同一個實例，同 Nest 的靜態模組；帶資料的模組可以 import 一次，同一型別被 import 第二次就是 bootstrap 錯誤（`module imported more than once`），要求在 `fn identity()` 宣告。合併會丟掉第二份設定、拆開會複製 singleton 與 global enhancer，兩者都不是安全的預設：
+
+| `fn identity()` | 意義 |
+|---|---|
+| `Identity::Instance` | 每次 import 都是獨立的模組，同 Nest 的 `forRoot()` |
+| `Identity::key(k)` | 同型別、key 相等（`==`）的 import 是同一個模組，以第一個為準；key 要涵蓋所有會讓兩次 import 不同的欄位 |
+| `Identity::Type` | 同型別的 import 都是同一個模組，以第一個為準 |
+
+宣告 `Identity::Instance` 之後，兩個 `CacheModule` 各自提供自己的 `Cache`：
 
 ```rust
 use hornero::prelude::*;
@@ -277,17 +289,43 @@ impl Module for CacheModule {
     fn define(&self, m: &mut ModuleDef) {
         m.provide_value(Cache(self.0)).export::<Cache>();
     }
+
+    fn identity(&self) -> Identity {
+        Identity::Instance
+    }
 }
 
-#[module(imports = [CacheModule(1), CacheModule(2)])] // 第二個被去重掉了
+#[derive(Injectable)]
+struct Sessions {
+    cache: Arc<Cache>,
+}
+
+#[derive(Injectable)]
+struct Tokens {
+    cache: Arc<Cache>,
+}
+
+#[module(imports = [CacheModule(1)], providers = [Sessions], exports = [Sessions])]
+struct SessionsModule;
+
+#[module(imports = [CacheModule(60)], providers = [Tokens], exports = [Tokens])]
+struct TokensModule;
+
+#[module(imports = [SessionsModule, TokensModule])]
 struct AppModule;
 
 # #[tokio::main(flavor = "current_thread")]
 # async fn main() {
 let app = Hornero::new(AppModule).build().await.unwrap();
-assert_eq!(app.get::<Cache>().unwrap().0, 1);
+assert_eq!(app.get::<Sessions>().unwrap().cache.0, 1);
+assert_eq!(app.get::<Tokens>().unwrap().cache.0, 60);
 # }
 ```
+
+- **同一個模組看得到兩個實例**，而兩者 export 同一個型別時，使用方會遇到歧義。要同時存在，就讓 provider 帶不同的型別（例如泛型 tag，`Db<Tag>`）。
+- **要共用同一個實例**，就在一個模組裡 import 一次，再以 `exports = [module(CacheModule)]`（`m.export_module::<CacheModule>()`）轉出，同 Nest 文件 re-export 動態模組的做法（`exports` 寫模組 class，不再呼叫 `forRoot()`）。`export_module` 依型別比對，`CacheModule::new(..)` 這類值也轉得出去；模組自己 export 的同型別 provider 優先於轉出的。若要讓內容相同的 import 自動合併，回傳 `Identity::key(..)`（`ConfigModule::for_feature` 就是這樣讓相同的 feature 去重）。
+- **宣告 global enhancer 的模組**（`AppGuard<G>` 等）不能有多個實例：每個實例都會在每個 route 上再執行一次，所以是 bootstrap 錯誤（`duplicate global enhancer`）。
+- **`Identity::Instance` 的模組不能直接或間接再 import 自己的型別**：那會無限遞迴，回報為循環 import。同一型別需要巢狀時，用 `Identity::key(..)` 區分。
 
 - **`fn name()`** 決定錯誤訊息與 scope report 中的模組名稱，預設是型別名稱。
 

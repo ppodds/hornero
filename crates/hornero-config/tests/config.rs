@@ -295,6 +295,35 @@ fn feature_modules_read_their_own_types_from_the_root_source() {
     assert_eq!(app.get::<BConsumer>().unwrap().conf.b, 2);
 }
 
+#[derive(Injectable)]
+struct AAuditor {
+    conf: Arc<AConf>,
+}
+
+#[module(
+    imports = [ConfigModule::for_feature().load::<AConf>()],
+    providers = [AAuditor],
+    exports = [AAuditor],
+)]
+struct AuditA;
+
+#[test]
+fn identical_features_are_one_module() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.import(ConfigModule::for_root(Source::new().toml_str("a = 1")))
+                .import(FeatureA)
+                .import(AuditA);
+        }
+    }
+    let app = block_on(Hornero::new(App).build()).unwrap();
+    assert!(Arc::ptr_eq(
+        &app.get::<AConsumer>().unwrap().conf,
+        &app.get::<AAuditor>().unwrap().conf,
+    ));
+}
+
 #[test]
 fn a_feature_without_a_root_says_to_register_for_root() {
     struct App;

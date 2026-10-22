@@ -228,4 +228,4 @@ struct AppModule;
 Hornero::new(AppModule).validate().unwrap();
 ```
 
-`Db` 是 `Db<Primary>` 的簡寫。每個 tag 是不同的模組型別，所以兩個 `SeaOrmModule` 不會被去重。
+`Db` 是 `Db<Primary>` 的簡寫。每個 `SeaOrmModule` 都是獨立的模組，tag 不同，提供的 `Db<Tag>` 就是不同的型別，所以兩條連線不會互相衝突。

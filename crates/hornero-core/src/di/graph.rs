@@ -4,6 +4,7 @@
 //! Nothing here constructs a provider, so [`Hornero::validate`](crate::Hornero::validate) can run it in a
 //! plain `#[test]`.
 
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -12,12 +13,13 @@ use axum::Router;
 
 use super::injectable::Scope;
 use super::key::Key;
-use super::module::{LayerFn, Module, ModuleDef, ModuleId};
+use super::module::{Identity, LayerFn, Module, ModuleDef, ModuleKey};
 use super::provider::{Builtin, ProviderDef};
 use super::runtime::{RtNode, Runtime};
 use crate::app::join_paths;
 use crate::error::{BootError, Problem};
 use crate::lifecycle::Shutdown;
+use crate::util::short_type_name;
 use crate::web::controller::ControllerEntry;
 use crate::web::enhancer::{EnhancerKind, EnhancerRef};
 use crate::web::routes::{EnhancerInfo, RouteInfo, Routes};
@@ -52,15 +54,21 @@ pub(crate) struct Node {
 }
 
 pub(crate) struct ModuleNode {
-    id: ModuleId,
+    type_id: TypeId,
+    /// [`Module::name`], numbered after collection when several modules share it (see
+    /// [`Graph::label_instances`]).
     pub(crate) name: String,
+    /// [`Module::name`] as returned.
+    base_name: String,
+    /// The module whose import created this one; `None` for the root and the core module.
+    importer: Option<usize>,
     global: bool,
     imports: Vec<usize>,
     local: HashMap<Key, usize>,
     implicit: HashMap<Key, usize>,
     pub(crate) slots: HashMap<Key, usize>,
     exports: Vec<Key>,
-    export_modules: Vec<ModuleId>,
+    export_modules: Vec<(TypeId, &'static str)>,
     exported: HashMap<Key, usize>,
     pub(crate) controllers: Vec<(usize, ControllerEntry)>,
     pub(crate) middlewares: Vec<EnhancerRef>,
@@ -70,10 +78,12 @@ pub(crate) struct ModuleNode {
 }
 
 impl ModuleNode {
-    fn new(id: ModuleId, name: String, global: bool) -> Self {
+    fn new(type_id: TypeId, name: String, global: bool, importer: Option<usize>) -> Self {
         Self {
-            id,
+            type_id,
+            base_name: name.clone(),
             name,
+            importer,
             global,
             imports: Vec::new(),
             local: HashMap::new(),
@@ -115,7 +125,13 @@ pub(crate) struct Graph {
     pub(crate) app_enhancers: Vec<(usize, EnhancerRef)>,
     /// Every controller route, also injectable as `Arc<Routes>` from the core module.
     pub(crate) routes: Arc<Routes>,
-    by_id: HashMap<ModuleId, usize>,
+    /// Modules identified by their type.
+    by_type: HashMap<TypeId, usize>,
+    /// Modules identified by their type and key.
+    keyed: Vec<(usize, ModuleKey)>,
+    /// Modules that carry data without declaring an identity, with the importer of each import
+    /// of their type (`None` for the root).
+    undeclared: Vec<(usize, Vec<Option<usize>>)>,
     overrides: Vec<Override>,
     problems: Vec<Problem>,
 }
@@ -139,7 +155,9 @@ impl Graph {
             report: ScopeReport::default(),
             app_enhancers: Vec::new(),
             routes: Arc::default(),
-            by_id: HashMap::new(),
+            by_type: HashMap::new(),
+            keyed: Vec::new(),
+            undeclared: Vec::new(),
             overrides: Vec::new(),
             problems: Vec::new(),
         };
@@ -159,6 +177,9 @@ impl Graph {
         graph.root = graph
             .collect(root, &mut Vec::new())
             .expect("the root module cannot be part of an import cycle");
+        graph.label_instances();
+        graph.report_undeclared_identities();
+        graph.check_global_enhancers();
         graph.compute_exports();
         graph.add_route_table(prefix, global);
 
@@ -212,14 +233,13 @@ impl Graph {
     }
 
     fn add_core(&mut self, shutdown: Shutdown) {
-        let mut core = ModuleNode::new(ModuleId::of::<CoreModule>(), "hornero".into(), true);
+        let mut core = ModuleNode::new(TypeId::of::<CoreModule>(), "hornero".into(), true, None);
         for def in [ProviderDef::value(shutdown), ProviderDef::request_context()] {
             let key = def.key;
             let node = self.push_node(def, 0, NodeKind::Builtin, key.short_name());
             core.local.insert(key, node);
             core.exported.insert(key, node);
         }
-        self.by_id.insert(core.id, 0);
         self.modules.push(core);
     }
 
@@ -278,26 +298,78 @@ impl Graph {
     }
 
     fn collect(&mut self, module: &dyn Module, stack: &mut Vec<usize>) -> Option<usize> {
-        let id = module.id();
-        if let Some(&existing) = self.by_id.get(&id) {
-            if let Some(position) = stack.iter().position(|&m| m == existing) {
-                let mut path: Vec<String> = stack[position..]
-                    .iter()
-                    .map(|&m| self.modules[m].name.clone())
-                    .collect();
-                path.push(self.modules[existing].name.clone());
-                self.problems.push(Problem::CircularImport { path });
-                return None;
-            }
-            return Some(existing);
+        let type_id = (module as &dyn std::any::Any).type_id();
+        let importer = stack.last().copied();
+        let identity = match module.identity() {
+            // A zero-sized type has a single value, so merging its imports loses nothing.
+            Identity::Auto if size_of_val(module) == 0 => Identity::Type,
+            identity => identity,
+        };
+
+        if let Identity::Auto = identity
+            && let Some(i) = self
+                .undeclared
+                .iter()
+                .position(|&(m, _)| self.modules[m].type_id == type_id)
+        {
+            // Reported once per type after collection. Meanwhile the import stands for the first
+            // one, unless that one is importing it, which would close an import cycle.
+            self.undeclared[i].1.push(importer);
+            let first = self.undeclared[i].0;
+            return (!stack.contains(&first)).then_some(first);
+        }
+
+        // A cycle repeats an identity on the stack. Instances never repeat theirs, so for them
+        // any module of the same type on the stack counts: importing it would recurse forever.
+        let repeats = |graph: &Self, m: usize| {
+            graph.modules[m].type_id == type_id
+                && match &identity {
+                    Identity::Key(key) => {
+                        graph.keyed.iter().any(|(k, other)| *k == m && other == key)
+                    }
+                    _ => true,
+                }
+        };
+        if let Some(position) = stack.iter().position(|&m| repeats(self, m)) {
+            let mut path: Vec<String> = stack[position..]
+                .iter()
+                .map(|&m| self.modules[m].name.clone())
+                .collect();
+            path.push(module.name());
+            self.problems.push(Problem::CircularImport { path });
+            return None;
+        }
+
+        let existing = match &identity {
+            Identity::Type => self.by_type.get(&type_id).copied(),
+            Identity::Key(key) => self
+                .keyed
+                .iter()
+                .find(|(m, other)| self.modules[*m].type_id == type_id && other == key)
+                .map(|&(m, _)| m),
+            Identity::Auto | Identity::Instance => None,
+        };
+        if existing.is_some() {
+            return existing;
         }
 
         let mut def = ModuleDef::default();
         module.define(&mut def);
         let idx = self.modules.len();
-        self.modules
-            .push(ModuleNode::new(id, module.name(), def.global));
-        self.by_id.insert(id, idx);
+        self.modules.push(ModuleNode::new(
+            type_id,
+            module.name(),
+            def.global,
+            importer,
+        ));
+        match identity {
+            Identity::Type => {
+                self.by_type.insert(type_id, idx);
+            }
+            Identity::Key(key) => self.keyed.push((idx, key)),
+            Identity::Auto => self.undeclared.push((idx, vec![importer])),
+            Identity::Instance => {}
+        }
 
         stack.push(idx);
         for import in std::mem::take(&mut def.imports) {
@@ -349,6 +421,85 @@ impl Graph {
         module.middlewares = def.middlewares;
         module.layers = def.layers;
         Some(idx)
+    }
+
+    /// Instances of one module type share a name. Numbers them in collection order and names the
+    /// module that imported each, so diagnostics, the scope report and the route table tell them
+    /// apart.
+    fn label_instances(&mut self) {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for module in &self.modules {
+            *counts.entry(&module.base_name).or_default() += 1;
+        }
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let labels: Vec<Option<String>> = self
+            .modules
+            .iter()
+            .map(|module| {
+                if counts[module.base_name.as_str()] < 2 {
+                    return None;
+                }
+                let n = seen.entry(&module.base_name).or_default();
+                *n += 1;
+                Some(match module.importer {
+                    Some(importer) => format!(
+                        "{}#{n}, imported by {}",
+                        module.base_name, self.modules[importer].base_name
+                    ),
+                    None => format!("{}#{n}", module.base_name),
+                })
+            })
+            .collect();
+        for (module, label) in self.modules.iter_mut().zip(labels) {
+            if let Some(label) = label {
+                module.name = label;
+            }
+        }
+    }
+
+    fn report_undeclared_identities(&mut self) {
+        for (module, importers) in std::mem::take(&mut self.undeclared) {
+            if importers.len() < 2 {
+                continue;
+            }
+            self.problems.push(Problem::UndeclaredModuleIdentity {
+                module: self.modules[module].name.clone(),
+                imported_by: importers
+                    .iter()
+                    .map(|importer| importer.map(|m| self.modules[m].name.clone()))
+                    .collect(),
+            });
+        }
+    }
+
+    /// A global enhancer runs once per declaring module on every route. Distinct module types
+    /// declaring the same one each run it, but instances of one type would multiply it at their
+    /// import sites, out of sight of the declaration, so that is an error.
+    fn check_global_enhancers(&mut self) {
+        let mut declared: Vec<(TypeId, &EnhancerRef, Vec<usize>)> = Vec::new();
+        for (module, enhancer) in &self.app_enhancers {
+            let type_id = self.modules[*module].type_id;
+            match declared
+                .iter_mut()
+                .find(|(t, e, _)| *t == type_id && e.slot_key == enhancer.slot_key)
+            {
+                Some((_, _, modules)) => modules.push(*module),
+                None => declared.push((type_id, enhancer, vec![*module])),
+            }
+        }
+        let problems: Vec<Problem> = declared
+            .into_iter()
+            .filter(|(_, _, modules)| modules.len() > 1)
+            .map(|(_, enhancer, modules)| Problem::DuplicateGlobalEnhancer {
+                enhancer: enhancer.token_name(),
+                module: self.modules[modules[0]].base_name.clone(),
+                instances: modules
+                    .iter()
+                    .map(|&m| self.modules[m].name.clone())
+                    .collect(),
+            })
+            .collect();
+        self.problems.extend(problems);
     }
 
     fn add_provider(&mut self, module: usize, def: ProviderDef) {
@@ -416,74 +567,139 @@ impl Graph {
         }
 
         let mut exported = HashMap::new();
-        for key in self.modules[module].exports.clone() {
+        let explicit = self.modules[module].exports.clone();
+        for &key in &explicit {
             if let Some(&node) = self.modules[module].local.get(&key) {
                 exported.insert(key, node);
                 continue;
             }
-            let from_imports = distinct(
+            let candidates = distinct(
                 imports
                     .iter()
                     .filter_map(|&import| self.modules[import].exported.get(&key).copied()),
             );
-            match from_imports.len() {
-                0 => self.problems.push(Problem::InvalidExport {
+            if candidates.is_empty() {
+                self.problems.push(Problem::InvalidExport {
                     module: self.modules[module].name.clone(),
                     export: key.short_name(),
-                }),
-                1 => {
-                    exported.insert(key, from_imports[0]);
-                }
-                _ => self.problems.push(Problem::AmbiguousDependency {
-                    consumer: format!("re-export in {}", self.modules[module].name),
-                    dependency: key.short_name(),
-                    candidates: from_imports.iter().map(|&n| self.describe(n)).collect(),
-                }),
+                });
+                continue;
             }
+            self.export_resolved(module, key, &candidates, &mut exported);
         }
-        // Keys re-exported from several sources that disagree, with every candidate.
-        let mut conflicts: Vec<(Key, Vec<usize>)> = Vec::new();
-        for id in self.modules[module].export_modules.clone() {
-            match imports
+
+        // Every import of a re-exported module type counts. Keys exported explicitly were settled
+        // above: a local provider shadows the re-exported one, as it does inside the module, and
+        // an ambiguity is reported once.
+        let mut reexported: HashMap<Key, Vec<usize>> = HashMap::new();
+        for (type_id, name) in self.modules[module].export_modules.clone() {
+            let matching: Vec<usize> = imports
                 .iter()
-                .find(|&&import| self.modules[import].id == id)
-            {
-                Some(&import) => {
-                    for (key, node) in self.modules[import].exported.clone() {
-                        let Some(&existing) = exported.get(&key) else {
-                            exported.insert(key, node);
-                            continue;
-                        };
-                        // An exported local provider shadows the re-export, as it does for lookups.
-                        if existing == node
-                            || self.modules[module].local.get(&key) == Some(&existing)
-                        {
-                            continue;
-                        }
-                        match conflicts.iter_mut().find(|(k, _)| *k == key) {
-                            Some((_, candidates)) if candidates.contains(&node) => {}
-                            Some((_, candidates)) => candidates.push(node),
-                            None => conflicts.push((key, vec![existing, node])),
-                        }
+                .copied()
+                .filter(|&import| self.modules[import].type_id == type_id)
+                .collect();
+            if matching.is_empty() {
+                self.problems.push(Problem::InvalidModuleExport {
+                    module: self.modules[module].name.clone(),
+                    export: short_type_name(name),
+                });
+            }
+            for import in matching {
+                for (&key, &node) in &self.modules[import].exported {
+                    if !explicit.contains(&key) {
+                        reexported.entry(key).or_default().push(node);
                     }
                 }
-                None => self.problems.push(Problem::InvalidExport {
-                    module: self.modules[module].name.clone(),
-                    export: "a module it does not import".into(),
-                }),
             }
         }
-        // `exported` iterates in no particular order; report in node order to stay deterministic.
-        conflicts.sort_by(|(_, a), (_, b)| a.cmp(b));
-        for (key, candidates) in conflicts {
-            self.problems.push(Problem::AmbiguousReexport {
-                module: self.modules[module].name.clone(),
-                dependency: key.short_name(),
-                candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
-            });
+        // `exported` maps iterate in random order; sorting by the full name keeps the problems'
+        // order stable even when two keys share a short name.
+        let mut reexported: Vec<(Key, Vec<usize>)> = reexported.into_iter().collect();
+        reexported.sort_by_cached_key(|(key, _)| format!("{key:?}"));
+        for (key, nodes) in reexported {
+            let candidates = distinct(nodes.into_iter());
+            if candidates.len() > 1 {
+                let problem = self.ambiguous_reexport(module, key, &candidates);
+                self.problems.push(problem);
+            }
+            // Exported even when ambiguous, so importers do not report a missing dependency on
+            // top of the ambiguity.
+            exported.insert(key, candidates[0]);
         }
         self.modules[module].exported = exported;
         state[module] = 2;
+    }
+
+    /// Exports `key` from `module` when a single node provides it, and reports the ambiguity
+    /// otherwise.
+    fn export_resolved(
+        &mut self,
+        module: usize,
+        key: Key,
+        candidates: &[usize],
+        exported: &mut HashMap<Key, usize>,
+    ) {
+        match candidates {
+            [node] => {
+                exported.insert(key, *node);
+            }
+            _ => {
+                let consumer = format!("re-export in {}", self.modules[module].name);
+                let problem = self.ambiguous(consumer, key, candidates);
+                self.problems.push(problem);
+            }
+        }
+    }
+
+    /// The problem of `consumer` seeing `key` from several `candidates`.
+    fn ambiguous(&self, consumer: String, key: Key, candidates: &[usize]) -> Problem {
+        let dependency = key.short_name();
+        let hint = self.instances_hint(candidates).unwrap_or_else(|| {
+            format!(
+                "provide `{dependency}` locally, or import only one of the modules that export it (a global module counts as imported everywhere)."
+            )
+        });
+        Problem::AmbiguousDependency {
+            consumer,
+            dependency,
+            candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
+            hint,
+        }
+    }
+
+    /// The problem of `module` re-exporting `key` from several `candidates` with `export_module`.
+    fn ambiguous_reexport(&self, module: usize, key: Key, candidates: &[usize]) -> Problem {
+        let module = self.modules[module].name.clone();
+        let dependency = key.short_name();
+        // A local provider only shadows re-exports when it is exported itself, and `export_module`
+        // needs the import, so "import only one" does not apply here.
+        let hint = self.instances_hint(candidates).unwrap_or_else(|| {
+            format!(
+                "provide `{dependency}` in {module} and export it, which shadows the re-exported ones, or re-export it from only one of these sources."
+            )
+        });
+        Problem::AmbiguousReexport {
+            module,
+            dependency,
+            candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
+            hint,
+        }
+    }
+
+    /// The hint for `candidates` that come from separate instances of one module type.
+    fn instances_hint(&self, candidates: &[usize]) -> Option<String> {
+        let modules = distinct(candidates.iter().map(|&n| self.nodes[n].module));
+        let first = &self.modules[modules[0]];
+        let instances = modules.len() > 1
+            && modules
+                .iter()
+                .all(|&m| self.modules[m].type_id == first.type_id);
+        instances.then(|| {
+            format!(
+                "the sources are separate instances of {}: import it once and share that instance, or give each instance's providers a type of its own, such as a generic tag.",
+                first.base_name
+            )
+        })
     }
 
     /// Resolves `key` as seen from `module`: local providers, then imported exports, then globals.
@@ -563,11 +779,9 @@ impl Graph {
         match self.lookup(module, key) {
             Lookup::Found(node) => Some(node),
             Lookup::Ambiguous(candidates) => {
-                self.problems.push(Problem::AmbiguousDependency {
-                    consumer: format!("{label} (in {})", self.modules[module].name),
-                    dependency: key.short_name(),
-                    candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
-                });
+                let consumer = format!("{label} (in {})", self.modules[module].name);
+                let problem = self.ambiguous(consumer, key, &candidates);
+                self.problems.push(problem);
                 None
             }
             Lookup::Missing => {
@@ -606,11 +820,8 @@ impl Graph {
                         hint: self.missing_hint(module, key),
                     }),
                     Lookup::Ambiguous(candidates) => {
-                        self.problems.push(Problem::AmbiguousDependency {
-                            consumer: self.describe(idx),
-                            dependency: key.short_name(),
-                            candidates: candidates.iter().map(|&n| self.describe(n)).collect(),
-                        })
+                        let problem = self.ambiguous(self.describe(idx), key, &candidates);
+                        self.problems.push(problem);
                     }
                 }
             }

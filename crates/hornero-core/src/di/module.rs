@@ -1,4 +1,4 @@
-use std::any::{TypeId, type_name};
+use std::any::{Any, TypeId, type_name};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -20,29 +20,6 @@ use crate::web::guard::Guard;
 use crate::web::interceptor::Interceptor;
 use crate::web::middleware::Middleware;
 
-/// Identifies a module for de-duplication. Importing the same module twice yields one instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ModuleId {
-    type_id: TypeId,
-    discriminator: u64,
-}
-
-impl ModuleId {
-    /// The identity of the module type `M`.
-    pub fn of<M: ?Sized + 'static>() -> Self {
-        Self {
-            type_id: TypeId::of::<M>(),
-            discriminator: 0,
-        }
-    }
-
-    /// Distinguishes several instances of the same dynamic module type.
-    pub fn with_discriminator(mut self, discriminator: u64) -> Self {
-        self.discriminator = discriminator;
-        self
-    }
-}
-
 /// A unit of encapsulation. Providers are private to their module unless exported.
 ///
 /// Usually written with `#[module(...)]`. Implementing it by hand is the L1 API:
@@ -60,22 +37,78 @@ impl ModuleId {
 /// }
 /// ```
 ///
-/// Dynamic modules (Nest's `forRoot`) are ordinary structs carrying configuration.
-/// `define` may be called more than once (`validate()` and `build()` both call it), so it must
-/// only describe the module; do I/O inside provider factories.
-pub trait Module: Send + Sync + 'static {
+/// Dynamic modules (Nest's `forRoot`) are ordinary structs carrying configuration, which return
+/// [`Identity::Instance`] from [`identity`](Module::identity) so that every call is a module of
+/// its own. `define` may be called more than once (`validate()` and `build()` both call it), so it
+/// must only describe the module; do I/O inside provider factories.
+pub trait Module: Any + Send + Sync {
     /// Describes the module's imports, providers, controllers and exports.
     fn define(&self, m: &mut ModuleDef);
 
-    /// Identity used for de-duplication; the type by default. Override it, with
-    /// [`ModuleId::with_discriminator`], when one type stands for several modules.
-    fn id(&self) -> ModuleId {
-        ModuleId::of::<Self>()
+    /// How the imports of this module type relate; [`Identity::Auto`] by default.
+    fn identity(&self) -> Identity {
+        Identity::Auto
     }
 
     /// Name used in diagnostics and the scope report; the short type name by default.
     fn name(&self) -> String {
         short_type_name(type_name::<Self>())
+    }
+}
+
+/// How the imports of one module type relate: which of them are one module, defined once.
+///
+/// Nest identifies a static module by its class and a dynamic module by reference, so every
+/// `forRoot()` call is a module of its own. hornero follows the first rule for zero-sized modules
+/// and asks a module that carries data to choose once it is imported more than once: merging the
+/// imports would drop every value but the first, and splitting them would duplicate their
+/// singletons and global enhancers, so neither is a safe guess.
+///
+/// To share one instance of a dynamic module, import it in one module and re-export it with
+/// [`ModuleDef::export_module`], as Nest re-exports a module configured with `forRoot()`.
+pub enum Identity {
+    /// The default. A zero-sized module (no fields, or only `PhantomData`) is identified by its
+    /// type, so importing it twice yields one instance. A module that carries data may be imported
+    /// once; a second import of its type is a bootstrap error asking it to declare one of the
+    /// other identities.
+    Auto,
+    /// Every import of the type is one module, defined by the first import; the values of the
+    /// others are ignored.
+    Type,
+    /// Every import is a module of its own, like Nest's `forRoot()`. A module of this type cannot
+    /// import its own type again, directly or through other modules: that would recurse forever,
+    /// and is reported as a circular import. Use [`Identity::key`] to nest distinct values.
+    Instance,
+    /// Imports of the type with equal keys are one module, defined by the first of them; built
+    /// with [`Identity::key`].
+    Key(ModuleKey),
+}
+
+impl Identity {
+    /// [`Identity::Key`]: imports of one module type are one module when their keys are equal
+    /// (`==`). The key must cover every field that makes two imports differ, since only the first
+    /// of the equal imports is defined.
+    pub fn key<K: Eq + Send + Sync + 'static>(key: K) -> Self {
+        Self::Key(ModuleKey(Box::new(key)))
+    }
+}
+
+/// The key of an [`Identity::Key`], compared with its type's `==`.
+pub struct ModuleKey(Box<dyn ErasedKey>);
+
+impl PartialEq for ModuleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_erased(other.0.as_ref())
+    }
+}
+
+trait ErasedKey: Any + Send + Sync {
+    fn eq_erased(&self, other: &dyn ErasedKey) -> bool;
+}
+
+impl<K: Eq + Send + Sync + 'static> ErasedKey for K {
+    fn eq_erased(&self, other: &dyn ErasedKey) -> bool {
+        (other as &dyn Any).downcast_ref::<K>() == Some(self)
     }
 }
 
@@ -96,7 +129,8 @@ pub struct ModuleDef {
     pub(crate) providers: Vec<ProviderDef>,
     pub(crate) controllers: Vec<ControllerEntry>,
     pub(crate) exports: Vec<Key>,
-    pub(crate) export_modules: Vec<ModuleId>,
+    /// Type and type name of each re-exported module.
+    pub(crate) export_modules: Vec<(TypeId, &'static str)>,
     pub(crate) middlewares: Vec<EnhancerRef>,
     pub(crate) layers: Vec<LayerFn>,
     pub(crate) mounts: Vec<MountEntry>,
@@ -209,14 +243,11 @@ impl ModuleDef {
         self
     }
 
-    /// Re-exports everything an imported module exports.
+    /// Re-exports everything the imported modules of type `M` export, whichever values they are,
+    /// so `export_module::<SeaOrmModule>()` matches `SeaOrmModule::for_root(..)`.
     pub fn export_module<M: Module>(&mut self) -> &mut Self {
-        self.export_module_id(ModuleId::of::<M>())
-    }
-
-    /// Like [`export_module`](Self::export_module), for a module identified by [`ModuleId`].
-    pub fn export_module_id(&mut self, id: ModuleId) -> &mut Self {
-        self.export_modules.push(id);
+        self.export_modules
+            .push((TypeId::of::<M>(), type_name::<M>()));
         self
     }
 
