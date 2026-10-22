@@ -420,6 +420,11 @@ impl Module for MailerModule {
         )
         .export::<Mailer>();
     }
+
+    // 每次 for_root_with 都是獨立的模組（Nest 的 forRoot）
+    fn identity(&self) -> Identity {
+        Identity::Instance
+    }
 }
 
 // ---- 使用者的應用 ----
