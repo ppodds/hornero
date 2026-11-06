@@ -33,4 +33,4 @@ Nest 提供 `DEFAULT`（singleton）、`REQUEST`、`TRANSIENT` 三種 scope，�
 
 - 保有 Nest 的使用體驗：在深層 service 取得目前使用者，不必層層傳參數。
 - 效能懸崖仍然存在，但會出現在啟動 log 與可斷言的報告中，而不是靜默發生。
-- 範例 `examples/todo` 刻意讓 `TodoService` 依賴 request-scoped 的 `AuditLog` 以示範傳染鏈；實務上若不希望 controller 每次重建，可以把 request 資料改由 extractor 承載。
+- 若不希望 controller 每次重建，可以把 request 資料改由 extractor 承載。範例 `examples/todo` 就是這樣做的：`AuditLog` 是 singleton，使用者由 handler 的 `AuthUser` 引數傳入，整條鏈都不會變成 request-scoped。

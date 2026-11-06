@@ -32,14 +32,14 @@ async fn start() -> (TestApp, TestClient, TestClient) {
 #[test]
 fn dependency_graph_is_valid() {
     let report = todo::hornero().validate().unwrap();
-    assert_eq!(
-        report.find("TodoController").unwrap().chain,
-        ["TodoController", "TodoService", "AuditLog [request]"]
-    );
-    assert!(
-        report.find("SeaOrmTodoRepo").is_none(),
-        "the repository stays a singleton"
-    );
+    for name in [
+        "TodoController",
+        "TodoService",
+        "AuditLog",
+        "SeaOrmTodoRepo",
+    ] {
+        assert!(report.find(name).is_none(), "{name} stays a singleton");
+    }
 }
 
 #[tokio::test]
@@ -95,8 +95,7 @@ async fn crud_round_trip() {
     );
     assert_eq!(missing["handler"], "TodoController::find_one");
 
-    // AuditLog is request-scoped and reads the user from the RequestContext captured after
-    // AuthGuard ran.
+    // AuditLog is a singleton; each call receives the user from the AuthUser argument.
     let trail = app.get::<AuditTrail>().entries();
     let entry = |user: &str, action: &str| AuditEntry {
         user: user.into(),

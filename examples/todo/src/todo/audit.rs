@@ -1,12 +1,10 @@
-//! A request-scoped provider. Everything depending on it is pulled into request scope too; the
-//! bootstrap logs the chain (`TodoController -> TodoService -> AuditLog [request]`).
+//! A singleton audit log. The caller is passed per call (from the `AuthUser` handler argument)
+//! instead of being captured from the request, so nothing is pulled into request scope.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use hornero::prelude::*;
-
-use crate::auth::AuthUser;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry {
@@ -37,27 +35,17 @@ impl AuditTrail {
     }
 }
 
-/// Knows who is making the current request, without every method taking a `user` parameter.
+/// Writes audit entries to the application-wide trail.
+#[derive(Injectable)]
 pub struct AuditLog {
-    user: String,
     trail: Arc<AuditTrail>,
 }
 
-#[injectable(scope = request)]
 impl AuditLog {
-    fn new(ctx: Arc<RequestContext>, trail: Arc<AuditTrail>) -> Self {
-        // The context is captured after the guards ran, so `AuthGuard`'s user is visible.
-        let user = ctx
-            .get::<AuthUser>()
-            .map(|user| user.name.clone())
-            .unwrap_or_else(|| "anonymous".into());
-        Self { user, trail }
-    }
-
-    pub fn record(&self, action: &str, todo: i32) {
-        tracing::info!(user = %self.user, action, todo, "audit");
+    pub fn record(&self, user: &str, action: &str, todo: i32) {
+        tracing::info!(user, action, todo, "audit");
         self.trail.push(AuditEntry {
-            user: self.user.clone(),
+            user: user.into(),
             action: action.into(),
             todo,
         });

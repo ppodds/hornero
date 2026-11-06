@@ -1,6 +1,6 @@
 [package]
 name = "todo"
-description = "A todo API showing every hornero concept: modules, DI, guards, interceptors, filters, request scope, OpenAPI"
+description = "A todo API showing every hornero concept: modules, DI, guards, interceptors, filters, OpenAPI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
