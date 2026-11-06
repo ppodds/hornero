@@ -53,10 +53,11 @@ impl TodoController {
     #[api_response(404, description = "No todo has this id")]
     async fn update(
         &self,
+        user: AuthUser,
         Path(id): Path<i32>,
         Valid(Json(input)): Valid<Json<UpdateTodo>>,
     ) -> Result<Json<Todo>, HttpError> {
-        Ok(Json(self.todos.update(id, input).await?))
+        Ok(Json(self.todos.update(id, input, &user.name).await?))
     }
 
     /// Deletes a todo. Admins only.
@@ -66,8 +67,8 @@ impl TodoController {
     #[api_response(204)]
     #[api_response(403, description = "The caller is not an admin")]
     #[api_response(404, description = "No todo has this id")]
-    async fn remove(&self, Path(id): Path<i32>) -> Result<StatusCode, HttpError> {
-        self.todos.delete(id).await?;
+    async fn remove(&self, user: AuthUser, Path(id): Path<i32>) -> Result<StatusCode, HttpError> {
+        self.todos.delete(id, &user.name).await?;
         Ok(StatusCode::NO_CONTENT)
     }
 }

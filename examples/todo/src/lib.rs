@@ -3,8 +3,8 @@
 //! * [`app`] – the root module: configuration, database, feature modules.
 //! * [`auth`] – a module exporting guards and an `AuthUser` "proof" extractor.
 //! * [`todo`](mod@todo) – a feature module: entity, repository trait, service, controller,
-//!   a domain error mapped by an exception filter, and a request-scoped audit log that pulls
-//!   the service into request scope.
+//!   a domain error mapped by an exception filter, and a singleton audit log fed with the
+//!   caller from the `AuthUser` handler argument.
 //! * [`common`] – global interceptor and exception filter.
 
 pub mod app;

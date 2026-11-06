@@ -27,11 +27,11 @@ impl TodoService {
 
     pub async fn create(&self, input: CreateTodo, owner: &str) -> Result<Todo, TodoError> {
         let todo = self.repo.insert(input.title, owner.to_owned()).await?;
-        self.audit.record("create", todo.id);
+        self.audit.record(owner, "create", todo.id);
         Ok(todo)
     }
 
-    pub async fn update(&self, id: i32, input: UpdateTodo) -> Result<Todo, TodoError> {
+    pub async fn update(&self, id: i32, input: UpdateTodo, user: &str) -> Result<Todo, TodoError> {
         let patch = TodoPatch {
             title: input.title,
             done: input.done,
@@ -41,15 +41,15 @@ impl TodoService {
             .update(id, patch)
             .await?
             .ok_or(TodoError::NotFound(id))?;
-        self.audit.record("update", id);
+        self.audit.record(user, "update", id);
         Ok(todo)
     }
 
-    pub async fn delete(&self, id: i32) -> Result<(), TodoError> {
+    pub async fn delete(&self, id: i32, user: &str) -> Result<(), TodoError> {
         if !self.repo.delete(id).await? {
             return Err(TodoError::NotFound(id));
         }
-        self.audit.record("delete", id);
+        self.audit.record(user, "delete", id);
         Ok(())
     }
 }
