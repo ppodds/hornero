@@ -9,7 +9,7 @@
 | [3. 模組](03-modules.md) | imports / exports、嚴格可見性、global 模組、動態模組 |
 | [4. Controller 與路由](04-controllers.md) | `#[controller]`、`#[routes]`、extractor、回傳型別、路徑規則 |
 | [5. Request pipeline](05-request-pipeline.md) | guard、interceptor、exception filter、middleware、tower layer 與它們的順序 |
-| [6. Scope](06-scopes.md) | singleton / request / transient、`RequestContext`、scope 傳染與 scope report |
+| [6. Scope 與 request 資料](06-scopes.md) | singleton / transient、用 extractor 傳遞 request 資料、依 request 呈現錯誤 |
 | [7. 生命週期與關閉](07-lifecycle.md) | `Lifecycle` hook、`Shutdown`、graceful shutdown、背景工作 |
 | [8. 錯誤處理](08-errors.md) | `HttpError`、problem+json、domain error、`BootError` 診斷 |
 | [9. 測試](09-testing.md) | `validate()`、`TestApp`、provider / guard override、斷言 |

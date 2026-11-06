@@ -16,8 +16,8 @@ use common::{get, send};
 use hornero_core::{
     AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ControllerDef, ExceptionFilter,
     Guard, GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor, Key, Lifecycle,
-    LifecycleFn, Middleware, Module, ModuleDef, Problem, RequestContext, Resolver, RouteContext,
-    Scope, Shutdown, hooks,
+    LifecycleFn, Middleware, Module, ModuleDef, Problem, Resolver, RouteContext, Scope, Shutdown,
+    hooks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -505,239 +505,22 @@ async fn interceptors_nest_global_controller_handler() {
     );
 }
 
-// --- request scope -------------------------------------------------------------------------
+// --- request data --------------------------------------------------------------------------
 
-static REQUEST_IDS: AtomicUsize = AtomicUsize::new(0);
-
-struct RequestId(usize);
-
-impl Injectable for RequestId {
-    const SCOPE: Scope = Scope::Request;
-    fn dependencies() -> Vec<Key> {
-        Vec::new()
-    }
-    async fn construct(_: &Resolver) -> Result<Self, BoxError> {
-        Ok(RequestId(REQUEST_IDS.fetch_add(1, Ordering::SeqCst)))
-    }
-}
-
-struct Helper(Arc<RequestId>);
-
-impl Injectable for Helper {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestId>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(Helper(r.get()?))
-    }
-}
-
-/// Pulled into request scope through both of its dependencies.
-struct ScopedController(Arc<RequestId>, Arc<Helper>);
-
-impl Injectable for ScopedController {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestId>(), Key::of::<Helper>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(ScopedController(r.get()?, r.get()?))
-    }
-}
-
-impl Controller for ScopedController {
-    fn routes(c: &mut ControllerDef<Self>) {
-        c.get("/ids", "ids", |this: Arc<Self>| async move {
-            format!("{} {}", this.0.0, this.1.0.0)
-        });
-    }
-}
-
-#[tokio::test]
-async fn request_scoped_controllers_are_built_per_request() {
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<RequestId>()
-                .provide::<Helper>()
-                .controller::<ScopedController>();
-        }
-    }
-    let app = Hornero::new(App).build().await.unwrap();
-    assert_eq!(
-        app.scope_report().find("ScopedController").unwrap().chain,
-        ["ScopedController", "RequestId [request]"]
-    );
-    let router = app.router();
-
-    let first = get(&router, "/ids").await.body;
-    let second = get(&router, "/ids").await.body;
-    let parse = |body: &str| -> (usize, usize) {
-        let (a, b) = body.split_once(' ').unwrap();
-        (a.parse().unwrap(), b.parse().unwrap())
-    };
-    let (a1, b1) = parse(&first);
-    let (a2, b2) = parse(&second);
-    assert_eq!(a1, b1, "one RequestId per request");
-    assert_eq!(a2, b2, "one RequestId per request");
-    assert_ne!(a1, a2, "a new RequestId for every request");
-}
-
-/// Built from the request context after the guards ran, so it sees the authenticated user.
-struct CurrentUser(Option<User>);
-
-impl Injectable for CurrentUser {
-    const SCOPE: Scope = Scope::Request;
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestContext>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        let ctx = r.get::<RequestContext>()?;
-        Ok(CurrentUser(ctx.get::<User>().cloned()))
-    }
-}
-
-struct ProfileController(Arc<CurrentUser>);
-
-impl Injectable for ProfileController {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<CurrentUser>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(ProfileController(r.get()?))
-    }
-}
+unit_injectable!(ProfileController, BusyController);
 
 impl Controller for ProfileController {
     fn routes(c: &mut ControllerDef<Self>) {
         c.guard::<AuthGuard>();
-        c.get("/profile", "profile", |this: Arc<Self>| async move {
-            match &this.0.0 {
-                Some(user) => format!("{} ({})", user.name, user.role),
-                None => "anonymous".into(),
-            }
-        });
+        c.get(
+            "/profile",
+            "profile",
+            |_: Arc<Self>, Extension(user): Extension<User>| async move {
+                format!("{} ({})", user.name, user.role)
+            },
+        );
     }
 }
-
-#[tokio::test]
-async fn request_context_sees_data_written_by_guards() {
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<CurrentUser>().controller::<ProfileController>();
-        }
-    }
-    let router = Hornero::new(App).build().await.unwrap().router();
-    let res = send(&router, bearer("/profile", "bob:admin")).await;
-    assert_eq!(
-        (res.status, res.body.as_str()),
-        (StatusCode::OK, "bob (admin)")
-    );
-}
-
-/// A request-scoped guard that runs before `AuthGuard` and records what its context held.
-struct TenantGuard(Arc<RequestContext>, Arc<TenantSeen>);
-
-struct TenantSeen(Mutex<Vec<Option<String>>>);
-
-impl Injectable for TenantSeen {
-    fn dependencies() -> Vec<Key> {
-        Vec::new()
-    }
-    async fn construct(_: &Resolver) -> Result<Self, BoxError> {
-        Ok(TenantSeen(Mutex::new(Vec::new())))
-    }
-}
-
-impl Injectable for TenantGuard {
-    const SCOPE: Scope = Scope::Request;
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestContext>(), Key::of::<TenantSeen>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(TenantGuard(r.get()?, r.get()?))
-    }
-}
-
-impl Guard for TenantGuard {
-    async fn can_activate(&self, _: &mut GuardContext<'_>) -> Result<(), HttpError> {
-        let user = self.0.get::<User>().map(|user| user.name.clone());
-        self.1.0.lock().unwrap().push(user);
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn a_context_is_snapshotted_when_its_component_is_built() {
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<TenantSeen>()
-                .provide::<CurrentUser>()
-                .controller::<ProfileController>();
-        }
-    }
-    let router = Hornero::new(App)
-        .guard::<TenantGuard>()
-        .build()
-        .await
-        .unwrap()
-        .router();
-
-    // `TenantGuard` runs before `AuthGuard` and keeps its snapshot; `CurrentUser`, built for the
-    // handler, gets a new one that has the user.
-    let res = send(&router, bearer("/profile", "alice")).await;
-    assert_eq!(
-        (res.status, res.body.as_str()),
-        (StatusCode::OK, "alice (user)")
-    );
-}
-
-#[tokio::test]
-async fn filters_get_a_context_when_a_guard_rejects() {
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<TenantSeen>()
-                .provide::<CurrentUser>()
-                .controller::<ProfileController>();
-        }
-    }
-    let router = Hornero::new(App)
-        .guard::<TenantGuard>()
-        .filter::<ContextFilter>()
-        .build()
-        .await
-        .unwrap()
-        .router();
-    let res = get(&router, "/profile").await;
-    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
-    assert!(res.body.ends_with(" at /profile"), "{}", res.body);
-}
-
-/// A request-scoped filter that names the user the guards authenticated.
-struct UserFilter(Arc<RequestContext>);
-
-impl Injectable for UserFilter {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestContext>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(UserFilter(r.get()?))
-    }
-}
-
-impl ExceptionFilter for UserFilter {
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        let user = self
-            .0
-            .get::<User>()
-            .map_or("anonymous", |user| user.name.as_str());
-        (err.status(), format!("{} for {user}", err.message())).into_response()
-    }
-}
-
-unit_injectable!(BusyController);
 
 impl Controller for BusyController {
     fn routes(c: &mut ControllerDef<Self>) {
@@ -748,22 +531,55 @@ impl Controller for BusyController {
     }
 }
 
+struct BusyModule;
+
+impl Module for BusyModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.controller::<BusyController>();
+    }
+}
+
 #[tokio::test]
-async fn filters_see_what_guards_wrote_when_the_handler_fails() {
+async fn extractors_see_data_written_by_guards() {
     struct App;
     impl Module for App {
         fn define(&self, m: &mut ModuleDef) {
-            m.controller::<BusyController>();
+            m.controller::<ProfileController>();
         }
     }
-    let router = Hornero::new(App)
-        .filter::<UserFilter>()
+    let router = Hornero::new(App).build().await.unwrap().router();
+    let res = send(&router, bearer("/profile", "bob:admin")).await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::OK, "bob (admin)")
+    );
+}
+
+// Names the authenticated user in error responses. Interceptors run after the guards and own the
+// request, so what a filter cannot see is available here.
+unit_injectable!(UserErrors);
+
+impl Interceptor for UserErrors {
+    async fn intercept(&self, _: &RouteContext, req: Request, next: Next) -> Response {
+        let user = req.extensions().get::<User>().cloned();
+        let mut response = next.run(req).await;
+        if let Some(err) = HttpError::in_response(&response) {
+            let name = user.map_or("anonymous".into(), |user| user.name);
+            let body = format!("{} for {name}", err.message());
+            *response.body_mut() = Body::from(body);
+        }
+        response
+    }
+}
+
+#[tokio::test]
+async fn interceptors_render_errors_from_what_guards_wrote() {
+    let router = Hornero::new(BusyModule)
+        .interceptor::<UserErrors>()
         .build()
         .await
         .unwrap()
         .router();
-
-    // The filter is built after the handler failed, so it sees the request as the guards left it.
     let res = send(&router, bearer("/busy", "bob")).await;
     assert_eq!(
         (res.status, res.body.as_str()),
@@ -771,62 +587,45 @@ async fn filters_see_what_guards_wrote_when_the_handler_fails() {
     );
 }
 
-/// A guard that is itself request-scoped.
-struct RequestGuard(Arc<RequestId>);
-
-impl Injectable for RequestGuard {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestId>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(RequestGuard(r.get()?))
-    }
+#[tokio::test]
+async fn filters_run_after_interceptors_that_keep_the_error() {
+    let router = Hornero::new(BusyModule)
+        .interceptor::<UserErrors>()
+        .filter::<GlobalFilter>()
+        .build()
+        .await
+        .unwrap()
+        .router();
+    let res = send(&router, bearer("/busy", "bob")).await;
+    assert_eq!(res.body, "global: busy at /busy");
 }
 
-impl Guard for RequestGuard {
-    async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
-        ctx.parts.extensions.insert(GuardSaw(self.0.0));
-        Ok(())
+// Names the path in error responses. Middleware wraps the guards too, so it sees their rejections.
+unit_injectable!(PathErrors);
+
+impl Middleware for PathErrors {
+    async fn handle(&self, req: Request, next: Next) -> Response {
+        let path = req.uri().path().to_owned();
+        let mut response = next.run(req).await;
+        if let Some(err) = HttpError::in_response(&response) {
+            let body = format!("{} at {path}", err.message());
+            *response.body_mut() = Body::from(body);
+        }
+        response
     }
 }
-
-#[derive(Clone)]
-struct GuardSaw(usize);
 
 #[tokio::test]
-async fn request_scoped_guards_share_the_request_scope() {
-    unit_injectable!(Plain);
-    struct Shared(Arc<RequestId>);
-    impl Injectable for Shared {
-        fn dependencies() -> Vec<Key> {
-            vec![Key::of::<RequestId>()]
-        }
-        async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-            Ok(Shared(r.get()?))
-        }
-    }
-    impl Controller for Shared {
-        fn routes(c: &mut ControllerDef<Self>) {
-            c.guard::<RequestGuard>();
-            c.get(
-                "/shared",
-                "shared",
-                |this: Arc<Self>, Extension(saw): Extension<GuardSaw>| async move {
-                    (this.0.0 == saw.0).to_string()
-                },
-            );
-        }
-    }
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<RequestId>()
-                .provide::<Plain>()
-                .controller::<Shared>();
-        }
-    }
-    let router = Hornero::new(App).build().await.unwrap().router();
-    assert_eq!(get(&router, "/shared").await.body, "true");
+async fn middleware_renders_guard_rejections_from_the_request() {
+    let router = Hornero::new(BusyModule)
+        .middleware::<PathErrors>()
+        .build()
+        .await
+        .unwrap()
+        .router();
+    let res = get(&router, "/busy").await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    assert!(res.body.ends_with(" at /busy"), "{}", res.body);
 }
 
 // --- exception filters ---------------------------------------------------------------------
@@ -1277,32 +1076,6 @@ async fn module_middleware_only_wraps_its_own_controllers() {
     assert!(unwrapped.headers.get("x-layer").is_none());
 }
 
-#[test]
-fn request_scoped_middleware_is_rejected() {
-    struct ScopedMiddleware(#[allow(dead_code)] Arc<RequestId>);
-    impl Injectable for ScopedMiddleware {
-        fn dependencies() -> Vec<Key> {
-            vec![Key::of::<RequestId>()]
-        }
-        async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-            Ok(ScopedMiddleware(r.get()?))
-        }
-    }
-    impl Middleware for ScopedMiddleware {
-        async fn handle(&self, req: Request, next: Next) -> Response {
-            next.run(req).await
-        }
-    }
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<RequestId>().middleware::<ScopedMiddleware>();
-        }
-    }
-    let err = Hornero::new(App).validate().unwrap_err();
-    insta::assert_snapshot!(err.to_string());
-}
-
 #[tokio::test]
 async fn plain_axum_routers_can_be_mounted() {
     struct Greeting(&'static str);
@@ -1384,53 +1157,6 @@ fn validate_finds_the_conflicts_axum_rejects() {
     }
     Hornero::new(Fine).validate().unwrap();
     Hornero::new(Fine).global_prefix("/api").validate().unwrap();
-}
-
-#[tokio::test]
-async fn failing_request_scoped_providers_become_500s() {
-    struct Flaky;
-    impl Injectable for Flaky {
-        const SCOPE: Scope = Scope::Request;
-        fn dependencies() -> Vec<Key> {
-            Vec::new()
-        }
-        async fn construct(_: &Resolver) -> Result<Self, BoxError> {
-            Err("upstream unavailable".into())
-        }
-    }
-    struct FlakyController(#[allow(dead_code)] Arc<Flaky>);
-    impl Injectable for FlakyController {
-        fn dependencies() -> Vec<Key> {
-            vec![Key::of::<Flaky>()]
-        }
-        async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-            Ok(FlakyController(r.get()?))
-        }
-    }
-    impl Controller for FlakyController {
-        fn routes(c: &mut ControllerDef<Self>) {
-            c.get("/flaky", "flaky", |_: Arc<Self>| async { "unreachable" });
-        }
-    }
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<Flaky>().controller::<FlakyController>();
-        }
-    }
-    let router = Hornero::new(App)
-        .filter::<GlobalFilter>()
-        .build()
-        .await
-        .unwrap()
-        .router();
-    let res = get(&router, "/flaky").await;
-    assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        res.body,
-        "global: failed to construct a request-scoped component at /flaky"
-    );
-    assert!(!res.body.contains("upstream unavailable"));
 }
 
 // --- lifecycle -----------------------------------------------------------------------------
@@ -1570,56 +1296,6 @@ async fn failing_hooks_abort_the_bootstrap() {
     }
     let err = Hornero::new(App).build().await.err().unwrap();
     insta::assert_snapshot!(err.to_string());
-}
-
-/// A request-scoped filter that reads the request context.
-struct ContextFilter(Arc<RequestContext>);
-
-impl Injectable for ContextFilter {
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<RequestContext>()]
-    }
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(ContextFilter(r.get()?))
-    }
-}
-
-impl ExceptionFilter for ContextFilter {
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        (
-            err.status(),
-            format!("{} at {}", err.message(), self.0.uri().path()),
-        )
-            .into_response()
-    }
-}
-
-#[tokio::test]
-async fn request_scoped_filters_do_not_hide_guard_data_from_the_handler() {
-    struct App;
-    impl Module for App {
-        fn define(&self, m: &mut ModuleDef) {
-            m.provide::<CurrentUser>().controller::<ProfileController>();
-        }
-    }
-    let router = Hornero::new(App)
-        .filter::<ContextFilter>()
-        .build()
-        .await
-        .unwrap()
-        .router();
-
-    // The filter captures nothing up front, so the handler's `CurrentUser` sees the guard's user.
-    let res = send(&router, bearer("/profile", "bob:admin")).await;
-    assert_eq!(
-        (res.status, res.body.as_str()),
-        (StatusCode::OK, "bob (admin)")
-    );
-
-    // The filter still gets a context when it has to render a guard rejection.
-    let res = get(&router, "/profile").await;
-    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
-    assert!(res.body.ends_with(" at /profile"), "{}", res.body);
 }
 
 // --- enhancer resolution --------------------------------------------------------------------
@@ -2888,21 +2564,30 @@ async fn head_requests_run_the_guards_of_the_get_route() {
 // --- scope and override diagnostics ---------------------------------------------------------
 
 #[test]
-fn mounts_cannot_be_request_scoped() {
+fn controllers_cannot_be_transient() {
+    struct Ephemeral;
+    impl Injectable for Ephemeral {
+        const SCOPE: Scope = Scope::Transient;
+        fn dependencies() -> Vec<Key> {
+            Vec::new()
+        }
+        async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+            Ok(Ephemeral)
+        }
+    }
+    impl Controller for Ephemeral {
+        fn routes(c: &mut ControllerDef<Self>) {
+            c.get("/ephemeral", "ephemeral", |_: Arc<Self>| async { "ok" });
+        }
+    }
     struct App;
     impl Module for App {
         fn define(&self, m: &mut ModuleDef) {
-            m.mount("/whoami", |_: Arc<RequestContext>| async {
-                Ok::<_, BoxError>(Router::new())
-            });
+            m.controller::<Ephemeral>();
         }
     }
     let err = Hornero::new(App).validate().unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("mount /whoami (in App) cannot be request-scoped"),
-        "{err}"
-    );
+    insta::assert_snapshot!(err.to_string());
 }
 
 #[test]
@@ -2917,37 +2602,44 @@ fn unused_enhancer_overrides_name_the_enhancer() {
 }
 
 #[tokio::test]
-async fn transient_providers_are_fresh_within_one_request() {
-    service!(Nonce; scope = Scope::Transient);
-    service!(Shared; scope = Scope::Request);
-    service!(First: Nonce, Shared; scope = Scope::Request);
-    service!(Second: Nonce, Shared; scope = Scope::Request);
-    service!(Pairing: First, Second);
-    impl Controller for Pairing {
+async fn transient_enhancers_are_built_at_bootstrap() {
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+    struct Counted;
+    impl Injectable for Counted {
+        const SCOPE: Scope = Scope::Transient;
+        fn dependencies() -> Vec<Key> {
+            Vec::new()
+        }
+        async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Ok(Counted)
+        }
+    }
+    impl Guard for Counted {
+        async fn can_activate(&self, _: &mut GuardContext<'_>) -> Result<(), HttpError> {
+            Ok(())
+        }
+    }
+    unit_injectable!(Counting);
+    impl Controller for Counting {
         fn routes(c: &mut ControllerDef<Self>) {
-            c.get("/pairing", "pairing", |this: Arc<Self>| async move {
-                format!(
-                    "nonce shared: {}, scoped shared: {}",
-                    Arc::ptr_eq(&this.0.0, &this.1.0),
-                    Arc::ptr_eq(&this.0.1, &this.1.1)
-                )
-            });
+            c.guard::<Counted>();
+            c.get("/counted", "counted", |_: Arc<Self>| async { "ok" });
         }
     }
     struct App;
     impl Module for App {
         fn define(&self, m: &mut ModuleDef) {
-            m.provide::<Nonce>()
-                .provide::<Shared>()
-                .provide::<First>()
-                .provide::<Second>()
-                .controller::<Pairing>();
+            m.controller::<Counting>();
         }
     }
     let router = Hornero::new(App).build().await.unwrap().router();
+    get(&router, "/counted").await;
+    get(&router, "/counted").await;
     assert_eq!(
-        get(&router, "/pairing").await.body,
-        "nonce shared: false, scoped shared: true"
+        BUILDS.load(Ordering::SeqCst),
+        1,
+        "no request builds a provider"
     );
 }
 

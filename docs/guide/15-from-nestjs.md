@@ -22,8 +22,9 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 | `forRootAsync({ useFactory, inject })` | `XxxModule::for_root_with(\|cfg: Arc<Cfg>\| async move { .. })` | |
 | `forwardRef()` | 不支援；循環依賴是 bootstrap 錯誤 | 把共用部分抽成新的 provider |
 | `ModuleRef.get()` / `app.get()` | `App::get::<T>()`、`App::get_qualified::<T, Q>()`，只給測試與啟動程式碼使用 | 一般程式碼請宣告依賴 |
-| `Scope.REQUEST` / `Scope.TRANSIENT` | `#[inject(scope = request)]` / `scope = transient` | 同樣會傳染，另外有 scope report |
-| `@Inject(REQUEST)` | `Arc<RequestContext>` | request head 的快照 |
+| `Scope.TRANSIENT` | `#[inject(scope = transient)]` | 在啟動時為每個依賴它的元件建構一個 |
+| `Scope.REQUEST` | 不支援 | request 資料走 extractor，見 [Request 資料](06-scopes.md#request-資料) |
+| `@Inject(REQUEST)` | `HeaderMap`、`Extension<T>` 等 extractor | guard 與 interceptor 直接拿得到 request |
 | `OnModuleInit` 等介面 | `impl Lifecycle`，加上 `#[inject(hooks)]` 啟用 | 只支援 singleton |
 | `app.enableShutdownHooks()` | 總是啟用（`listen` / `serve`） | |
 
@@ -70,7 +71,7 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 - **衝突一律是錯誤**：同一模組重複註冊同一個 provider（Nest 會讓後者覆蓋前者），或兩個 import 都 export 同一個 provider（Nest 依 import 順序挑一個），在 hornero 都是 bootstrap 錯誤。
 - **沒有反射**：provider 的依賴寫在型別上（`Arc<T>` 欄位），metadata 以型別為 key。生命週期 hook 需要明確啟用，因為 Rust 沒有 specialization，hornero 無法自動發現 trait 實作。
 - **沒有 exception**：handler 回傳 `Result<_, HttpError>`，`?` 會把任何錯誤變成不透露細節的 500，原始錯誤保留下來，讓 exception filter 依型別轉成其他回應。
-- **request 期間沒有 DI 成本**：singleton 在啟動時注入完畢，只有 request-scoped 鏈才會在每個 request 建構。
+- **request 期間沒有 DI 成本**：所有 provider 在啟動時建構完畢，request 只是 clone 一個 `Arc`。
 - **不包裝 axum**：extractor、`IntoResponse`、tower layer 都是 axum 原生的東西，可以隨時退回純 axum。
 
 ## FAQ
@@ -88,10 +89,10 @@ proc macro 一次只看得到一個 item，跨模組、跨 crate 的檢查只能
 controller 不使用 `State`，依賴透過 DI 注入。mount 進來的 axum router 可以照常使用 `State`，見 [L0](13-without-macros.md#l0掛進既有的-axum-router)。
 
 **深層的 service 要怎麼拿到目前的使用者？**
-把它做成 request-scoped provider，從 `Arc<RequestContext>` 讀取 guard 寫入的資料，見 [Scope](06-scopes.md)。如果只有 handler 需要，用 extractor 更簡單，也不會傳染 scope。
+handler 用 extractor 取得使用者，再當參數傳給 service，見 [Request 資料](06-scopes.md#request-資料)。hornero 沒有 Nest 的 request scope：這樣每一層的依賴都寫在簽名上，也不會讓整條依賴鏈變成每個 request 重建。取捨見 [ADR-0007](../adr/0007-no-request-scope.md)。
 
-**request 回應 `500 failed to construct a request-scoped component`？**
-某個 request-scoped 元件在 request 期間建構失敗（例如從 `RequestContext` 找不到預期的資料）。真正的原因寫在 log 裡。
+**exception filter 怎麼讀取 request？**
+讀不到：filter 執行時 request 已經被 handler 消耗了。請改用 interceptor 或 middleware，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
 
 **我的 interceptor 沒有記錄到 401？**
 interceptor 在 guard 裡面執行，被 guard 擋下的 request 不會經過 interceptor。請用 `TraceLayer` 或 middleware 記錄所有 request。

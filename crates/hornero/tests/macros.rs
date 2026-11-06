@@ -98,12 +98,12 @@ impl Shouter {
     }
 }
 
-static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static STAMPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Request-scoped through the struct form of `#[injectable]`.
-#[injectable(scope = request)]
-pub struct RequestStamp {
-    #[inject(with = REQUESTS.fetch_add(1, Ordering::SeqCst))]
+/// Transient through the struct form of `#[injectable]`.
+#[injectable(scope = transient)]
+pub struct Stamp {
+    #[inject(with = STAMPS.fetch_add(1, Ordering::SeqCst))]
     number: usize,
 }
 
@@ -252,9 +252,9 @@ impl NoteController {
 }
 
 #[controller]
-#[injectable(scope = request)]
+#[injectable(scope = singleton)]
 pub struct StampController {
-    stamp: Arc<RequestStamp>,
+    stamp: Arc<Stamp>,
 }
 
 #[routes]
@@ -291,7 +291,7 @@ pub struct CoreModule;
 )]
 pub struct NotesModule;
 
-#[module(controllers = [StampController], providers = [RequestStamp])]
+#[module(controllers = [StampController], providers = [Stamp])]
 pub struct StampModule;
 
 #[module(imports = [ConfigModule, NotesModule, StampModule])]
@@ -318,10 +318,7 @@ fn request(method: &str, uri: &str) -> axum::http::request::Builder {
 
 #[test]
 fn the_macro_built_graph_is_valid() {
-    let report = Hornero::new(AppModule).validate().unwrap();
-    assert!(report.find("RequestStamp").unwrap().declared);
-    assert!(report.find("StampController").unwrap().declared);
-    assert!(report.find("NoteController").is_none());
+    Hornero::new(AppModule).validate().unwrap();
 }
 
 #[tokio::test]
@@ -416,10 +413,7 @@ async fn macro_built_application_serves_requests() {
         request("GET", "/stamp").body(Body::empty()).unwrap(),
     )
     .await;
-    assert_ne!(
-        first, second,
-        "request-scoped controller sees a new stamp per request"
-    );
+    assert_eq!(first, second, "a controller is built once, at bootstrap");
 
     assert!(app.get::<Counter>().unwrap().0.load(Ordering::SeqCst) >= 6);
 }
@@ -458,23 +452,6 @@ async fn macro_built_providers_can_be_overridden() {
     assert_eq!(status, StatusCode::CREATED);
     let note: Note = serde_json::from_str(&body).unwrap();
     assert_eq!((note.created_at, note.text.as_str()), (42, "t (by tester)"));
-}
-
-#[test]
-fn explicit_scopes_are_pinned() {
-    #[injectable(scope = singleton)]
-    pub struct Pinned {
-        #[allow(dead_code)]
-        stamp: Arc<RequestStamp>,
-    }
-    #[module(providers = [RequestStamp, Pinned])]
-    pub struct App;
-    let err = Hornero::new(App).validate().unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Pinned (in App) is pinned to singleton scope"),
-        "{err}"
-    );
 }
 
 #[test]

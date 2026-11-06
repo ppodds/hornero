@@ -19,12 +19,6 @@ pub(crate) struct Built {
 pub(crate) type Factory =
     Arc<dyn Fn(Resolver) -> BoxFuture<'static, Result<Built, BoxError>> + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Builtin {
-    None,
-    RequestContext,
-}
-
 /// A type-erased provider registration: the key it satisfies, what it depends on, how to build it.
 ///
 /// Every registration style (`provide::<T>()`, values, factories, `bind!`) produces one of these.
@@ -33,10 +27,8 @@ pub struct ProviderDef {
     pub(crate) key: Key,
     pub(crate) deps: Vec<Key>,
     pub(crate) scope: Scope,
-    pub(crate) pinned: bool,
     pub(crate) has_hooks: bool,
     pub(crate) factory: Factory,
-    pub(crate) builtin: Builtin,
     /// A builder misuse recorded for the graph to report (builders cannot return errors).
     pub(crate) invalid: Option<String>,
 }
@@ -48,7 +40,6 @@ impl ProviderDef {
             key: Key::of::<T>(),
             deps: T::dependencies(),
             scope: T::SCOPE,
-            pinned: T::SCOPE_PINNED,
             has_hooks: T::LIFECYCLE.is_some(),
             factory: Arc::new(|resolver| {
                 Box::pin(async move {
@@ -60,7 +51,6 @@ impl ProviderDef {
                     })
                 })
             }),
-            builtin: Builtin::None,
             invalid: None,
         }
     }
@@ -78,7 +68,6 @@ impl ProviderDef {
             key: Key::of::<D>(),
             deps: I::dependencies(),
             scope: I::SCOPE,
-            pinned: I::SCOPE_PINNED,
             has_hooks: I::LIFECYCLE.is_some(),
             factory: Arc::new(move |resolver| {
                 Box::pin(async move {
@@ -90,7 +79,6 @@ impl ProviderDef {
                     })
                 })
             }),
-            builtin: Builtin::None,
             invalid: None,
         }
     }
@@ -107,7 +95,6 @@ impl ProviderDef {
             key: Key::of::<T>(),
             deps: Vec::new(),
             scope: Scope::Singleton,
-            pinned: false,
             has_hooks: false,
             factory: Arc::new(move |_| {
                 let instance = instance.clone();
@@ -118,7 +105,6 @@ impl ProviderDef {
                     })
                 })
             }),
-            builtin: Builtin::None,
             invalid: None,
         }
     }
@@ -150,7 +136,6 @@ impl ProviderDef {
             key: Key::of::<T>(),
             deps,
             scope: Scope::Singleton,
-            pinned: false,
             has_hooks: false,
             factory: Arc::new(move |resolver| {
                 let fut = f(resolver);
@@ -161,35 +146,13 @@ impl ProviderDef {
                     })
                 })
             }),
-            builtin: Builtin::None,
             invalid: None,
         }
     }
 
-    pub(crate) fn request_context() -> Self {
-        Self {
-            key: Key::of::<crate::RequestContext>(),
-            deps: Vec::new(),
-            scope: Scope::Request,
-            pinned: false,
-            has_hooks: false,
-            factory: Arc::new(|_| {
-                Box::pin(async { Err("RequestContext is provided by the request scope".into()) })
-            }),
-            builtin: Builtin::RequestContext,
-            invalid: None,
-        }
-    }
-
-    /// Sets the declared scope.
+    /// Sets the scope.
     pub fn scope(mut self, scope: Scope) -> Self {
         self.scope = scope;
-        self
-    }
-
-    /// Makes bubbling into request scope a bootstrap error for this provider.
-    pub fn pinned(mut self) -> Self {
-        self.pinned = true;
         self
     }
 

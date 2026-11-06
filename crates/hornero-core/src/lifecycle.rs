@@ -9,8 +9,8 @@ use crate::util::{BoxError, BoxFuture};
 ///
 /// Rust has no specialization, so hornero cannot discover that a provider implements this trait.
 /// Opt in with `#[injectable(hooks)]` (or `const LIFECYCLE = hornero::hooks::<Self>()` by hand).
-/// Hooks are only supported on singletons; the bootstrap fails if a provider with hooks
-/// ends up request-scoped or transient.
+/// Hooks are only supported on singletons; the bootstrap fails if a provider with hooks is
+/// transient.
 ///
 /// `Drop` cannot await, so cleanup that needs I/O (closing pools, flushing buffers) belongs in
 /// [`on_module_destroy`](Lifecycle::on_module_destroy) or

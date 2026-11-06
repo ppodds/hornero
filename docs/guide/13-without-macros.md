@@ -61,7 +61,7 @@ assert_eq!(client.get("/legacy/hits").await.text(), "2");
 
 - mount 的路徑會加上 global prefix；模組的 middleware 與 layer 也會包住它。
 - mount 進來的 router 不經過 guard、interceptor 與 filter（它們是 controller 路由的功能）。要保護它，請在 axum router 上加 layer，或放進有 middleware 的模組。
-- `mount` 的 factory 必須是 singleton（它在啟動時執行），依賴 request-scoped 的東西會是 bootstrap 錯誤。
+- `mount` 的 factory 在啟動時執行一次。
 
 反過來，把 hornero 應用嵌入既有的 axum 應用也可以，見 [常見做法](14-recipes.md#嵌入既有的-axum-應用)。
 
@@ -81,9 +81,8 @@ struct Greeter {
 }
 
 impl Injectable for Greeter {
-    // 以下三個常數都有預設值，需要時再覆寫：
-    // const SCOPE: Scope = Scope::Request;
-    // const SCOPE_PINNED: bool = true;
+    // 以下兩個常數都有預設值，需要時再覆寫：
+    // const SCOPE: Scope = Scope::Transient;
     // const LIFECYCLE: Option<LifecycleFn<Self>> = hornero::hooks::<Self>();
 
     fn dependencies() -> Vec<Key> {
@@ -303,8 +302,7 @@ impl Module for UsersModule {
 
 | Builder | 用途 |
 |---|---|
-| `.scope(Scope::Request)` | 設定 scope |
-| `.pinned()` | 禁止被傳染成 request scope |
+| `.scope(Scope::Transient)` | 設定 scope |
 | `.qualified::<Q>()` | 以 qualifier `Q` 註冊，見 [同一個型別要多個實例](02-providers.md#同一個型別要多個實例) |
 | `.with_hooks::<T>()` | 為 factory 或 value provider 啟用 `T` 的 `Lifecycle` hook |
 

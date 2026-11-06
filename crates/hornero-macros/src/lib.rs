@@ -17,7 +17,7 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[derive(Injectable)]
-/// #[inject(scope = request, hooks)]        // optional
+/// #[inject(scope = transient, hooks)]      // optional
 /// struct TodoService {
 ///     repo: Arc<dyn TodoRepo>,
 ///     #[inject(default)]
@@ -38,9 +38,9 @@ pub fn derive_injectable(input: TokenStream) -> TokenStream {
 /// On a struct: shorthand for `#[derive(Injectable)]` with options.
 ///
 /// ```ignore
-/// #[injectable(scope = request)]
+/// #[injectable(scope = transient)]
 /// impl AuditLog {
-///     async fn new(ctx: Arc<RequestContext>, db: Arc<Db>) -> Result<Self, DbErr> { ... }
+///     async fn new(db: Arc<Db>) -> Result<Self, DbErr> { ... }
 /// }
 /// ```
 #[proc_macro_attribute]

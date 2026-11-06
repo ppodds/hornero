@@ -58,7 +58,7 @@ use hornero::prelude::*;
 |---|---|
 | `std` | `Arc` |
 | `axum` | `Json`、`Extension`、`Path`、`Query`、`StatusCode`、`IntoResponse`、`Response` |
-| hornero 型別 | `App`、`Hornero`、`Module`、`ModuleDef`、`Scope`、`Qualified`、`RequestContext`、`RouteContext`、`GuardContext`、`HttpError`、`BoxError`、`Shutdown`、`AppGuard`、`AppInterceptor`、`AppFilter` |
+| hornero 型別 | `App`、`Hornero`、`Module`、`ModuleDef`、`Scope`、`Qualified`、`RouteContext`、`GuardContext`、`HttpError`、`BoxError`、`Shutdown`、`AppGuard`、`AppInterceptor`、`AppFilter` |
 | hornero trait | `Injectable`、`Controller`、`Guard`、`Interceptor`、`ExceptionFilter`、`Middleware`、`Lifecycle` |
 | macro | `Injectable`（derive）、`injectable`、`module`、`controller`、`routes`、`guards`、`interceptors`、`filters`、`meta`、`api_response`、`api_body`、`api_tags`、`api_exclude`、`bind` |
 
@@ -72,7 +72,7 @@ use hornero::prelude::*;
 
 ```rust,ignore
 #[derive(Injectable)]
-#[inject(scope = request | transient | singleton, hooks)]   // 選用
+#[inject(scope = transient | singleton, hooks)]   // 選用
 struct Name {
     dep: Arc<T>,                       // 依賴（T 可以是 dyn Trait）
     maybe: Option<Arc<U>>,             // 可選的依賴：沒有 provider 時是 None
@@ -89,8 +89,7 @@ struct Name {
 
 | 選項 | 效果 |
 |---|---|
-| `scope = singleton` | 預設的 scope，但**明確寫出**時會固定（pin）：被傳染成 request scope 會是 bootstrap 錯誤 |
-| `scope = request` | 每個 request 一個實例 |
+| `scope = singleton` | 預設的 scope：整個應用一個實例 |
 | `scope = transient` | 每個依賴它的元件一個實例 |
 | `hooks` | 啟用 [`Lifecycle`](hornero-core.md#trait-lifecycle) hook，需要另外寫 `impl Lifecycle for Name` |
 
@@ -133,8 +132,7 @@ struct Pair(Arc<Clock>, Arc<Stopwatch>);
 #[module(providers = [Clock, Stopwatch, Pair])]
 struct AppModule;
 
-let report = Hornero::new(AppModule).validate().unwrap();
-assert!(report.is_empty());
+Hornero::new(AppModule).validate().unwrap();
 ```
 
 ---
@@ -146,7 +144,7 @@ assert!(report.is_empty());
 ### 在 `impl` 區塊上：建構函式注入
 
 ```rust,ignore
-#[injectable(scope = request, hooks)]   // 選項與 #[inject(...)] 相同，都可省略
+#[injectable(scope = singleton, hooks)]   // 選項與 #[inject(...)] 相同，都可省略
 impl Name {
     async fn new(a: Arc<A>, #[inject(qualifier = Primary)] b: Arc<B>, c: Option<Arc<C>>) -> Result<Self, E> { /* ... */ }
 }
@@ -196,7 +194,7 @@ assert_eq!(app.get::<Mailer>().unwrap().from(), "noreply@example.com");
 
 ### 在 struct 上
 
-`#[injectable(scope = request)] struct Name { ... }` 等於 `#[derive(Injectable)] #[inject(scope = request)] struct Name { ... }`，欄位規則相同。
+`#[injectable(scope = transient)] struct Name { ... }` 等於 `#[derive(Injectable)] #[inject(scope = transient)] struct Name { ... }`，欄位規則相同。
 
 ---
 
@@ -213,7 +211,7 @@ assert_eq!(app.get::<Mailer>().unwrap().from(), "noreply@example.com");
         bind!(dyn TodoRepo => SeaOrmTodoRepo),       // 任何產生 ProviderDef 的 macro
         value(Clock::system()),                      // 固定值
         factory(|cfg: Arc<AppConfig>| async move { Ok::<_, BoxError>(Client::new(&cfg.url)) }),
-        provider(ProviderDef::value(42_u32).pinned()), // 任何 ProviderDef 運算式
+        provider(ProviderDef::factory(make_client).scope(Scope::Transient)), // 任何 ProviderDef 運算式
         value(Pool::new(PRIMARY)).qualified::<Primary>(), // 後面可以接 ProviderDef 的 builder 方法
         Qualified<Archiver, Primary>,                // 以 qualifier 註冊的 class provider
     ],
@@ -325,7 +323,7 @@ enhancer 也可以寫成參數，效果相同；兩種寫法並用時，參數�
 | `filters = [A, B]` | `#[filters(A, B)]` |
 | `meta = [X, Y]` | `#[meta(X)]` 加 `#[meta(Y)]` |
 
-設定 controller 的 scope：在 `#[controller]` **下方**加上 `#[injectable(scope = request)]`，或使用 `#[inject(scope = request)]`。欄位上的 `#[inject(default)]`、`#[inject(with = ..)]` 也可以使用。
+controller 的欄位上可以使用 `#[inject(default)]`、`#[inject(with = ..)]`。
 
 ---
 
@@ -540,7 +538,7 @@ macro 只是 [L1 API](../guide/13-without-macros.md) 的簡寫。
 | macro | 產生 |
 |---|---|
 | `#[derive(Injectable)]` | `impl Injectable`：`dependencies()` 列出每個 `Arc<T>` 欄位的 `Key`，`construct()` 逐一 `resolver.get::<T>()?`；`#[inject(qualifier = Q)]` 加上 `.qualified::<Q>()`、`Option<Arc<T>>` 加上 `.optional()`，改用 `resolver.resolve::<..>()?` 取值 |
-| `#[inject(scope = s)]` | `const SCOPE = Scope::S;` 與 `const SCOPE_PINNED = true;` |
+| `#[inject(scope = s)]` | `const SCOPE = Scope::S;` |
 | `#[inject(hooks)]` | `const LIFECYCLE = hornero::hooks::<Self>();` |
 | `#[injectable] impl` | 原本的 `impl`，加上呼叫建構函式的 `impl Injectable` |
 | `#[module(..)]` | `impl Module`：依序呼叫 `global`、`import`、provider 註冊、`controller`、`middleware`、`export` |

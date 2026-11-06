@@ -11,8 +11,8 @@ use super::handler::RouteHandler;
 use super::interceptor::Interceptor;
 use super::route::Metadata;
 use crate::di::injectable::Injectable;
+use crate::di::key::Instance;
 use crate::di::provider::ProviderDef;
-use crate::di::scope::{ErasedHandle, Handle};
 use crate::util::short_type_name;
 
 /// A group of routes backed by an injectable struct.
@@ -60,6 +60,9 @@ pub struct ControllerDef<C> {
     _controller: PhantomData<fn() -> C>,
 }
 
+/// Builds the method router of a route from the controller instance.
+type BuildRoute = Box<dyn FnOnce(&Instance, MethodFilter) -> MethodRouter + Send>;
+
 /// One route registered on a controller. Handler-level enhancers and metadata go here.
 pub struct RouteDef {
     pub(crate) method: Method,
@@ -69,9 +72,9 @@ pub struct RouteDef {
     pub(crate) interceptors: Vec<EnhancerRef>,
     pub(crate) filters: Vec<EnhancerRef>,
     pub(crate) meta: Metadata,
-    /// `false` for methods axum's router cannot match; reported by the bootstrap.
-    pub(crate) method_supported: bool,
-    pub(crate) build: Box<dyn FnOnce(ErasedHandle) -> MethodRouter + Send>,
+    /// `None` for methods axum's router cannot match; reported by the bootstrap.
+    pub(crate) filter: Option<MethodFilter>,
+    pub(crate) build: BuildRoute,
 }
 
 pub(crate) struct ControllerEntry {
@@ -181,10 +184,12 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
             interceptors: Vec::new(),
             filters: Vec::new(),
             meta: Metadata::default(),
-            method_supported: filter.is_some(),
-            build: Box::new(move |handle: ErasedHandle| {
-                let filter = filter.expect("unsupported methods are rejected by the bootstrap");
-                handler.into_method_router(Handle::<C>::from_erased(handle), filter)
+            filter,
+            build: Box::new(move |controller, filter| {
+                let this = controller
+                    .downcast::<C>()
+                    .expect("a controller's node holds the controller");
+                handler.into_method_router(this, filter)
             }),
         });
         self.routes.last_mut().expect("route was just pushed")

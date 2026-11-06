@@ -420,7 +420,7 @@ match &err.problems()[0] {
 | `InvalidModuleExport` | 轉出（`export_module`）了沒有 import 的模組 | import 那個模組 |
 | `UndeclaredModuleIdentity` | 帶資料的模組被 import 了不只一次，卻沒有宣告身分 | 在 `fn identity()` 回傳 `Identity::Instance`、`Identity::key(..)` 或 `Identity::Type`，見 [模組的身分](03-modules.md#動態模組) |
 | `DuplicateGlobalEnhancer` | 同一模組型別的多個實例宣告了同一個全域 enhancer | 改在只 import 一次的模組（例如根模組）宣告 |
-| `ScopeViolation` | middleware / mount / 有 hook 的 provider 變成 request-scoped，或 pinned 的 provider 被傳染 | 見 [Scope](06-scopes.md#傳染的限制) |
+| `ScopeViolation` | 有 hook 的 provider 或 controller 宣告成 transient | 改成 singleton，見 [Scope 的限制](06-scopes.md#scope-的限制) |
 | `UnusedOverride` | override 了沒有任何模組提供的型別 | 修正型別，或移除 override |
 | `InvalidRoute` | 舊的 `:id` 語法、axum 不支援的 method、axum 拒絕的路由 | 改用 `{id}`；調整路徑 |
 | `DuplicateRoute` | 兩個 handler 處理同一個 method 與路徑 | 調整路徑或前綴 |

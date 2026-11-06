@@ -148,6 +148,17 @@ impl HttpError {
         self.downcast_ref::<E>().is_some()
     }
 
+    /// The error `response` was rendered from, if any.
+    ///
+    /// An [`ExceptionFilter`](crate::ExceptionFilter) runs after the request is gone. An error
+    /// response that depends on the request belongs in an
+    /// [`Interceptor`](crate::Interceptor) or [`Middleware`](crate::Middleware) instead: read what
+    /// it needs before `next.run`, then look up the error here.
+    pub fn in_response(response: &Response) -> Option<&HttpError> {
+        let ErrorExtension(err) = response.extensions().get::<ErrorExtension>()?;
+        Some(err)
+    }
+
     /// The RFC 9457 problem document used by the default rendering.
     pub fn to_problem(&self) -> Value {
         let mut problem = json!({
@@ -325,15 +336,12 @@ pub enum Problem {
         /// The instances declaring it.
         instances: Vec<String>,
     },
-    /// A component ends up in a scope it cannot have: middleware, mounts or providers with hooks
-    /// that are not singletons, or a pinned provider pulled into request scope.
+    /// A component is transient but needs a single instance: a provider with hooks, or a controller.
     ScopeViolation {
         /// The offending component, with its module.
         item: String,
-        /// What is wrong, e.g. `is pinned to singleton scope but depends on a request-scoped provider`.
+        /// What is wrong, e.g. `has lifecycle hooks but is transient; hooks only run on singletons`.
         reason: String,
-        /// The dependency chain that made it request-scoped, when bubbling caused the problem.
-        chain: Vec<String>,
     },
     /// An override replaces a type that no module provides, or an enhancer nothing uses.
     UnusedOverride {
@@ -541,17 +549,7 @@ impl Problem {
                     "{INDENT}hint: declare it in a module imported once, such as the root module, or merge the instances with `Module::identity`."
                 )
             }
-            Problem::ScopeViolation {
-                item,
-                reason,
-                chain,
-            } => {
-                writeln!(f, "{INDENT}{item} {reason}.")?;
-                if !chain.is_empty() {
-                    writeln!(f, "{INDENT}chain: {}", chain.join(" -> "))?;
-                }
-                Ok(())
-            }
+            Problem::ScopeViolation { item, reason } => writeln!(f, "{INDENT}{item} {reason}."),
             Problem::UnusedOverride { provider } => {
                 writeln!(
                     f,
@@ -715,11 +713,11 @@ mod tests {
             "application/problem+json"
         );
         assert_eq!(rendered.headers()[header::RETRY_AFTER], "5");
-        assert!(rendered.extensions().get::<ErrorExtension>().is_none());
+        assert!(HttpError::in_response(&rendered).is_none());
 
         let response = HttpError::conflict("taken").into_response();
-        let attached = response.extensions().get::<ErrorExtension>().unwrap();
-        assert_eq!(attached.0.message(), "taken");
+        let attached = HttpError::in_response(&response).unwrap();
+        assert_eq!(attached.message(), "taken");
     }
 
     #[test]

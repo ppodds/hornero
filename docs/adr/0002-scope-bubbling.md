@@ -1,6 +1,6 @@
 # ADR-0002：Provider scope 與 Nest 式傳染
 
-- 狀態：已採納
+- 狀態：已被 [ADR-0007](0007-no-request-scope.md) 取代
 - 日期：2026-10-17
 
 ## 背景

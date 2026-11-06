@@ -140,7 +140,7 @@ pub struct TodoController {
 - 這些 attribute 必須寫在 `#[controller]` **下方**（Nest 的慣例也是 `@Controller` 寫在最上面）；寫在上方會得到明確的編譯錯誤。同一種 attribute 可以寫多次，也可以一次列多個：`#[guards(AuthGuard, RolesGuard)]`，依由上到下、由左到右的順序執行。
 - 也可以寫成參數：`#[controller("/todos", guards = [AuthGuard], meta = [Public])]`，效果相同。兩種寫法並用時，參數裡的先執行。
 - struct 的規則和 `#[derive(Injectable)]` 相同：`Arc<T>` 欄位是依賴，其他欄位要加 `#[inject(default)]` 或 `#[inject(with = ...)]`。
-- 要設定 scope 時，在 struct 上加 `#[injectable(scope = request)]` 或 `#[inject(scope = request)]`。通常不需要：controller 會依依賴自動變成 request-scoped（見 [Scope](06-scopes.md)）。
+- controller 是 singleton：只在啟動時建構一次，由所有 request 共用，宣告成 transient 是 bootstrap 錯誤（見 [Scope 的限制](06-scopes.md#scope-的限制)）。request 的資料用 extractor 取得，不要存在 controller 上。
 
 ## `#[routes]`
 

@@ -537,8 +537,7 @@ fn assert_documented(reference: &str, items: &[String]) {
 
 #[test]
 fn api_reference_covers_hornero_core() {
-    // `Handle::resolve_in` belongs to a `#[doc(hidden)]` type used by generated code.
-    let items = public_items("hornero-core", &["resolve_in"]);
+    let items = public_items("hornero-core", &[]);
     assert!(
         items.len() > 100,
         "the scanner found suspiciously few items: {items:?}"

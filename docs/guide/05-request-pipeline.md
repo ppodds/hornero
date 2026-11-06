@@ -21,7 +21,6 @@ hornero 有四種可注入的 enhancer，加上 tower layer。它們都可以有
 CatchPanicLayer                                 panic → 500 problem+json
   模組 middleware    #[module(middlewares = [..])]  只包住該模組的路由與 mount
   模組 tower layer   ModuleDef::layer
-    request scope                               只有用到 request-scoped 元件的路由才有
     exception filter                            最具體、且 catches 該錯誤的那一個
     guards           global → controller → handler
     interceptors     global ⊃ controller ⊃ handler
@@ -51,7 +50,7 @@ pub struct GuardContext<'a> {
 }
 ```
 
-guard 回傳 `Result` 而不是 `bool`，所以 guard 可以自己決定回 401 還是 403，以及錯誤訊息。guard 可以把資料寫進 `parts.extensions`，例如已驗證的使用者，讓之後的 guard、extractor 與 request-scoped provider 讀取。
+guard 回傳 `Result` 而不是 `bool`，所以 guard 可以自己決定回 401 還是 403，以及錯誤訊息。guard 可以把資料寫進 `parts.extensions`，例如已驗證的使用者，讓之後的 guard、interceptor 與 extractor 讀取。
 
 以下範例包含一個驗證 bearer token 的 guard、一個讀取 metadata 的權限 guard，以及一個「proof」extractor：
 
@@ -355,8 +354,9 @@ Rust 沒有 exception。handler 回傳 `Result<_, HttpError>`，`HttpError` 轉�
 
 - **每個錯誤由一個 filter 處理**：依序查看 handler 層、controller 層、全域的 filter（同一層依註冊順序；全域的先看 `Hornero::filter::<F>()`，再看模組 `providers` 裡的 `AppFilter<F>`，即 Nest 的 `APP_FILTER`），第一個 `catches` 回傳 `true` 的處理它。沒有 filter 接住時，錯誤以預設格式回應。
 - **依錯誤型別接住**：用 `?` 拋出的 domain error 會變成 500，原始錯誤保留為 source。`catches` 裡用 `err.is::<TodoError>()` 判斷，`catch` 裡用 `err.downcast_ref::<TodoError>()` 取出，就能把它轉成 404、409 等回應。完整範例見 [錯誤處理](08-errors.md#domain-error)。
-- **filter 看得到**：handler、guard、interceptor 回傳的 `HttpError`；`Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）；request-scoped 元件建構失敗產生的 500。
+- **filter 看得到**：handler、guard、interceptor 回傳的 `HttpError`；`Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）。
 - **filter 看不到**：axum 內建 extractor 的 rejection（純文字，例如格式錯誤的 `Json`）、404 fallback、panic。要讓輸入錯誤也走 filter，請使用 `Valid<Json<T>>` 或 `Rejection = HttpError` 的自訂 extractor。
+- **filter 也看不到 request**：它執行時 request 已經被 handler 消耗了，手上只有錯誤與路由。回應要依 request 內容變化時，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
 
 ```rust
 use hornero::axum::http::header::CONTENT_TYPE;
@@ -466,7 +466,6 @@ assert_eq!(app.client().get("/ping").await.header("x-powered-by"), Some("hornero
 
 - **模組 middleware**（`middlewares = [..]` 或 `m.middleware::<M>()`）只包住該模組的 controller 與 mount 的路由，包括 mount 在非 `/` 前綴（例如 `/admin`）的 router 自己的 fallback。交給應用 fallback 的 request（掛在 `/` 的 router 的 fallback，或 hornero 的 404）不經過任何模組的 middleware，即使那個 router 是該模組掛的。
 - **全域 middleware**（`Hornero::middleware::<M>()`）包住所有路由，包括 404 fallback。
-- middleware 在啟動時就要實例化，所以**必須是 singleton**。如果它依賴 request-scoped 的東西而被傳染，啟動會失敗。
 
 ## tower layer
 

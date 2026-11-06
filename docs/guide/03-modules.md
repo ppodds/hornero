@@ -115,7 +115,7 @@ assert_eq!(
 
 1. **local**：`M` 自己的 provider。
 2. **imports**：`M` import 的模組所 export 的 provider（包含它們轉出的東西）。
-3. **global**：所有 global 模組 export 的 provider，以及內建的 `Shutdown`、`RequestContext`、`Routes`。
+3. **global**：所有 global 模組 export 的 provider，以及內建的 `Shutdown`、`Routes`。
 
 因此：
 
@@ -327,7 +327,7 @@ assert_eq!(app.get::<Tokens>().unwrap().cache.0, 60);
 - **宣告 global enhancer 的模組**（`AppGuard<G>` 等）不能有多個實例：每個實例都會在每個 route 上再執行一次，所以是 bootstrap 錯誤（`duplicate global enhancer`）。
 - **`Identity::Instance` 的模組不能直接或間接再 import 自己的型別**：那會無限遞迴，回報為循環 import。同一型別需要巢狀時，用 `Identity::key(..)` 區分。
 
-- **`fn name()`** 決定錯誤訊息與 scope report 中的模組名稱，預設是型別名稱。
+- **`fn name()`** 決定錯誤訊息與路由表中的模組名稱，預設是型別名稱。
 
 `hornero-config` 與 `hornero-sea-orm` 都是這種寫法的完整範例，見 [不用 macro](13-without-macros.md#自製整合-crate)。
 

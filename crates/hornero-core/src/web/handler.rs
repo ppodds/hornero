@@ -5,16 +5,13 @@ use axum::extract::{FromRequest, FromRequestParts};
 use axum::response::IntoResponse;
 use axum::routing::{MethodFilter, MethodRouter, on};
 
-use crate::di::scope::{Handle, ScopeExt};
-
 /// Closures usable as controller handlers: `Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`,
 /// where `T1..Tn` are axum extractors (the last one may consume the body).
 ///
-/// The controller instance is resolved per request through its [`Handle`]: a cloned `Arc` for
-/// singletons, a request-scope lookup when the controller was pulled into request scope.
+/// The controller is built during bootstrap; every request gets a clone of its `Arc`.
 pub trait RouteHandler<C, Args>: Clone + Send + Sync + 'static {
     #[doc(hidden)]
-    fn into_method_router(self, handle: Handle<C>, filter: MethodFilter) -> MethodRouter;
+    fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter;
 }
 
 impl<C, F, Fut, Res> RouteHandler<C, ()> for F
@@ -24,13 +21,8 @@ where
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + 'static,
 {
-    fn into_method_router(self, handle: Handle<C>, filter: MethodFilter) -> MethodRouter {
-        on(filter, move |scope: ScopeExt| async move {
-            match handle.resolve_in(&scope).await {
-                Ok(this) => (self)(this).await.into_response(),
-                Err(err) => err.into_response(),
-            }
-        })
+    fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter {
+        on(filter, move || (self)(this.clone()))
     }
 }
 
@@ -47,13 +39,8 @@ macro_rules! impl_route_handler {
             $($ty: FromRequestParts<()> + Send + 'static,)*
             $last: FromRequest<(), M> + Send + 'static,
         {
-            fn into_method_router(self, handle: Handle<C>, filter: MethodFilter) -> MethodRouter {
-                on(filter, move |scope: ScopeExt, $($ty: $ty,)* $last: $last| async move {
-                    match handle.resolve_in(&scope).await {
-                        Ok(this) => (self)(this, $($ty,)* $last).await.into_response(),
-                        Err(err) => err.into_response(),
-                    }
-                })
+            fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter {
+                on(filter, move |$($ty: $ty,)* $last: $last| (self)(this.clone(), $($ty,)* $last))
             }
         }
     };

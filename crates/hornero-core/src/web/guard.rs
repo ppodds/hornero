@@ -8,8 +8,8 @@ use crate::util::BoxFuture;
 
 /// Everything a guard can see: the route and the request head.
 ///
-/// Guards may write to `parts.extensions` (an authenticated user, say) for later extractors and
-/// request-scoped providers to read.
+/// Guards may write to `parts.extensions` (an authenticated user, say) for later guards,
+/// interceptors and extractors to read.
 pub struct GuardContext<'a> {
     /// The route being handled, with its metadata.
     pub route: &'a RouteContext,

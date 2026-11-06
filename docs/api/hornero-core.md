@@ -7,7 +7,6 @@
 | [應用程式](#應用程式) | `Hornero`、`App` |
 | [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
-| [Request scope](#request-scope) | `RequestContext`、`ScopeReport`、`ScopeEntry` |
 | [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
 | [錯誤](#錯誤) | `HttpError`、`BootError`、`ShutdownError`、`Problem` |
 | [生命週期](#生命週期) | `Lifecycle`、`Hook`、`Shutdown` |
@@ -42,7 +41,7 @@ pub struct Hornero { /* ... */ }
 | `fn override_interceptor<I>(self, interceptor: impl Interceptor) -> Self` | 同上，interceptor |
 | `fn override_filter<F>(self, filter: impl ExceptionFilter) -> Self` | 同上，exception filter |
 | `fn routes(&self) -> Result<Routes, BootError>` | 列出所有 controller 路由（見 [`Routes`](#routesrouteinfo-與-enhancerinfo)），和 `validate` 一樣驗證依賴圖與路由、不建構任何東西；產生 API 文件用 |
-| `fn validate(&self) -> Result<ScopeReport, BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
+| `fn validate(&self) -> Result<(), BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
 | `async fn build(self) -> Result<App, BootError>` | 驗證、建構所有 singleton、組出 router，再執行 `on_module_init` 與 `on_application_bootstrap`。建構之後任何一步失敗，都會觸發 `Shutdown` 並對已建構的有 hook 的 singleton 執行 `on_module_destroy` 與 `on_application_shutdown`（反向依賴順序），清理失敗接在原本的問題之後 |
 | `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook；位址無法綁定時，先執行關閉 hook 再回傳錯誤：一個與綁定錯誤同 `ErrorKind` 的 `io::Error`，關閉 hook 也失敗時它的 `source()` 是 `ShutdownError`。先 `build` 再綁定是刻意的：port 一開就會通過 TCP health check，應用卻還沒啟動完 |
 
@@ -69,8 +68,7 @@ let hornero = Hornero::new(AppModule)
     .guard::<AllowAll>()
     .layer(TraceLayer::new_for_http());
 
-let report = hornero.validate().unwrap();
-assert!(report.is_empty());
+hornero.validate().unwrap();
 ```
 
 ### `App`
@@ -84,7 +82,6 @@ pub struct App { /* ... */ }
 | 方法 | 說明 |
 |---|---|
 | `fn router(&self) -> Router` | 組好的 axum `Router`（clone 成本很低） |
-| `fn scope_report(&self) -> &ScopeReport` | 哪些元件是 request-scoped，以及原因 |
 | `fn routes(&self) -> &Routes` | 所有 controller 路由，與 `Hornero::routes` 相同 |
 | `fn shutdown_handle(&self) -> Shutdown` | 應用的 `Shutdown`；呼叫 `trigger()` 會停止 `serve` |
 | `fn get<T: ?Sized>(&self) -> Option<Arc<T>>` | 依型別取得 singleton：根模組看得到的那個，或整個應用唯一的那個。service locator，只給測試與啟動程式碼使用 |
@@ -112,7 +109,7 @@ pub trait Module: Any + Send + Sync {
 |---|---|
 | `define` | 用 `ModuleDef` 描述模組內容。可能被呼叫多次（`validate` 與 `build`），所以不要做 I/O |
 | `identity` | 同一型別的多次 import 是否為同一個模組，見 [`Identity`](#identity)。預設 `Identity::Auto` |
-| `name` | 錯誤訊息與 scope report 中的名稱，預設是不含路徑的型別名稱 |
+| `name` | 錯誤訊息與路由表中的名稱，預設是不含路徑的型別名稱 |
 
 見 [模組](../guide/03-modules.md)。
 
@@ -212,7 +209,6 @@ pub enum Identity {
 ```rust,ignore
 pub trait Injectable: Send + Sync + Sized + 'static {
     const SCOPE: Scope = Scope::Singleton;
-    const SCOPE_PINNED: bool = false;
     const LIFECYCLE: Option<LifecycleFn<Self>> = None;
 
     fn dependencies() -> Vec<Key>;
@@ -225,8 +221,7 @@ pub trait Injectable: Send + Sync + Sized + 'static {
 
 | 項目 | 說明 |
 |---|---|
-| `SCOPE` | 宣告的 scope；實際 scope 仍可能因傳染變成 `Request` |
-| `SCOPE_PINNED` | `true` 時，被傳染成 request scope 會是 bootstrap 錯誤 |
+| `SCOPE` | 這個 provider 的 scope |
 | `LIFECYCLE` | 生命週期 hook，用 `hornero::hooks::<Self>()` 啟用 |
 | `dependencies()` | 依賴的 `Key`，順序與 `construct` 取用的順序一致；帶 qualifier 的依賴寫 `Key::of::<T>().qualified::<Q>()`，可選的依賴加上 `.optional()` |
 | `construct(resolver)` | 從 `resolver` 取得依賴並建構實例；可以用 `async fn` 實作 |
@@ -256,16 +251,15 @@ impl Injectable for Greeter {
 ### `enum Scope`
 
 ```rust,ignore
-pub enum Scope { Singleton, Request, Transient }
+pub enum Scope { Singleton, Transient }
 ```
 
 | 變體 | 說明 |
 |---|---|
-| `Singleton` | 整個應用一個，啟動時建構。預設值 |
-| `Request` | 每個 request 一個，第一次需要時建構；會向上傳染 |
+| `Singleton` | 整個應用一個。預設值 |
 | `Transient` | 每個依賴它的元件各一個 |
 
-實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。見 [Scope](../guide/06-scopes.md)。
+所有實例都在啟動時建構。實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。見 [Scope](../guide/06-scopes.md)。
 
 ### `hooks` 與 `LifecycleFn`
 
@@ -296,7 +290,6 @@ type-erased 的 provider 註冊：滿足哪個 key、依賴什麼、如何建構
 | Builder 與存取 | 說明 |
 |---|---|
 | `fn scope(self, scope: Scope) -> Self` | 設定 scope |
-| `fn pinned(self) -> Self` | 禁止被傳染成 request scope |
 | `fn qualified<Q: 'static>(self) -> Self` | 以 qualifier `Q` 註冊，讓同一個模組可以有多個同型別的 provider；使用方以 `#[inject(qualifier = Q)]` 或 [`Qualified<T, Q>`](#qualified) 指定 |
 | `fn with_hooks<T: Lifecycle>(self) -> Self` | 為型別為 `T` 的 factory 或 value provider 啟用 hook；`T` 必須是這個 provider 的型別（qualifier 不影響），否則啟動時回報 `Problem::InvalidProvider` |
 | `fn key(&self) -> Key` | 這個 provider 滿足的 key |
@@ -478,56 +471,6 @@ pub struct Resolver { /* ... */ }
 
 ---
 
-## Request scope
-
-### `RequestContext`
-
-```rust,ignore
-pub struct RequestContext { /* ... */ }
-```
-
-request head 的快照，以 `Arc<RequestContext>` 注入 request-scoped provider，相當於 Nest 的 `REQUEST`。元件看到的是它被建構當下的 request：快照在每個 guard 與 interceptor 之後作廢並於下次需要時重拍，所以 guard 寫進 extensions 的資料對之後建構的元件（包含 controller 及其依賴）可見，已建構的元件則保留原本的快照。
-
-| 方法 | 說明 |
-|---|---|
-| `fn method(&self) -> &Method` | HTTP method |
-| `fn uri(&self) -> &Uri` | 完整 URI |
-| `fn version(&self) -> Version` | HTTP 版本 |
-| `fn headers(&self) -> &HeaderMap` | headers |
-| `fn extensions(&self) -> &Extensions` | extensions（guard 與 middleware 寫入的資料） |
-| `fn get<T: Clone + Send + Sync + 'static>(&self) -> Option<&T>` | `extensions().get::<T>()` 的簡寫 |
-
-### `ScopeReport` 與 `ScopeEntry`
-
-```rust,ignore
-pub struct ScopeReport {
-    pub entries: Vec<ScopeEntry>,
-}
-
-pub struct ScopeEntry {
-    pub item: String,
-    pub module: String,
-    pub declared: bool,
-    pub chain: Vec<String>,
-}
-```
-
-所有 request-scoped 元件與原因。由 `Hornero::validate()` 與 `App::scope_report()` 回傳，啟動時也會寫進 log。
-
-| 項目 | 說明 |
-|---|---|
-| `ScopeReport::entries` | 每個 request-scoped 元件一筆，依依賴順序排列 |
-| `fn is_empty(&self) -> bool` | 沒有任何 request-scoped 元件 |
-| `fn find(&self, item: &str) -> Option<&ScopeEntry>` | 依名稱（不含路徑的型別名稱）查詢 |
-| `ScopeEntry::item` | 元件名稱 |
-| `ScopeEntry::module` | 所屬模組 |
-| `ScopeEntry::declared` | `true`：自己宣告為 request；`false`：被傳染 |
-| `ScopeEntry::chain` | 被傳染時的依賴鏈，終點是宣告為 request 的 provider |
-
-`Display` 每筆輸出一行，例如 `  TodoService (in TodoModule): request-scoped via TodoService -> AuditLog [request]`。
-
----
-
 ## HTTP
 
 ### `trait Controller` 與 `trait ControllerAttrs`
@@ -583,7 +526,7 @@ pub struct RouteDef { /* ... */ }
 pub trait RouteHandler<C, Args>: Clone + Send + Sync + 'static { /* 只有 hornero 內部使用的方法 */ }
 ```
 
-可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>`，`Tn` 實作 `FromRequest<()>`（可以讀取 body）。controller 實例在每個 request 透過 handle 取得：singleton 是一次 `Arc` clone，request-scoped 則從 request scope 取得。
+可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>`，`Tn` 實作 `FromRequest<()>`（可以讀取 body）。controller 在啟動時建構，每個 request 拿到的是它的 `Arc` clone。
 
 ### `trait Guard` 與 `GuardContext`
 
@@ -625,7 +568,7 @@ pub trait ExceptionFilter: Send + Sync + 'static {
 }
 ```
 
-重新渲染帶有 `HttpError` 的回應（來自 handler、guard、interceptor、`Rejection = HttpError` 的 extractor，或 request-scoped 元件建構失敗）。
+重新渲染帶有 `HttpError` 的回應（來自 handler、guard、interceptor 或 `Rejection = HttpError` 的 extractor）。filter 執行時 request 已經被消耗，只看得到錯誤與路由；要依 request 呈現錯誤，見 [`HttpError::in_response`](#httperror)。
 
 | 方法 | 說明 |
 |---|---|
@@ -922,6 +865,7 @@ pub struct HttpError { /* ... */ }
 | `fn source(&self) -> Option<&(dyn Error + Send + Sync + 'static)>` | 內部原因 |
 | `fn downcast_ref<E: Error + 'static>(&self) -> Option<&E>` | 內部原因是 `E` 時取得它：`?` 轉換的錯誤，或傳給 `from_boxed` / `with_source` 的錯誤。不會往 source chain 裡找 |
 | `fn is<E: Error + 'static>(&self) -> bool` | 內部原因是否為 `E`，常用在 `ExceptionFilter::catches` |
+| `fn in_response(response: &Response) -> Option<&HttpError>` | `response` 來自哪個 `HttpError`。給手上還有 request 的 interceptor 與 middleware 使用，見 [依 request 資料呈現錯誤](../guide/06-scopes.md#依-request-資料呈現錯誤) |
 | `fn to_problem(&self) -> Value` | problem document：`type`、`title`、`status`、`detail`，以及選用的 `errors` |
 | `fn render(&self) -> Response` | 預設的 problem+json 回應，不消耗 `self`、不寫 log、不附加 extension |
 
@@ -986,7 +930,7 @@ pub struct ShutdownError { /* ... */ }
 | `InvalidModuleExport` | `module`、`export` | `export_module` 了沒有 import 的模組 |
 | `UndeclaredModuleIdentity` | `module`、`imported_by` | 帶資料、沒有宣告 `Identity` 的模組被 import 了不只一次 |
 | `DuplicateGlobalEnhancer` | `enhancer`、`module`、`instances` | 同一模組型別的多個實例宣告了同一個全域 enhancer |
-| `ScopeViolation` | `item`、`reason`、`chain` | middleware 或 mount 變成 request-scoped、有 hook 的 provider 不是 singleton，或 pinned 的 provider 被傳染 |
+| `ScopeViolation` | `item`、`reason` | 有 hook 的 provider 或 controller 宣告成 transient |
 | `UnusedOverride` | `provider` | override 了沒有任何模組提供的型別 |
 | `InvalidProvider` | `provider`、`reason` | provider 的註冊本身有誤，例如 `with_hooks::<T>()` 的 `T` 不是這個 provider 的型別 |
 | `InvalidRoute` | `handler`、`reason` | 舊路徑語法、不支援的 method、axum 拒絕的路由 |

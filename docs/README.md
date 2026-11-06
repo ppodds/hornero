@@ -21,7 +21,7 @@ hornero 是建立在 tokio 與 axum 0.8 之上、NestJS 風格的 Rust Web frame
 3. [模組](guide/03-modules.md)
 4. [Controller 與路由](guide/04-controllers.md)
 5. [Request pipeline：guard、interceptor、filter、middleware](guide/05-request-pipeline.md)
-6. [Scope：singleton、request、transient](guide/06-scopes.md)
+6. [Scope 與 request 資料](guide/06-scopes.md)
 7. [生命週期與關閉](guide/07-lifecycle.md)
 8. [錯誤處理](guide/08-errors.md)
 9. [測試](guide/09-testing.md)

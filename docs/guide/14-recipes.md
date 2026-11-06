@@ -14,7 +14,7 @@ hornero 會輸出：
 
 | 層級 | 內容 |
 |---|---|
-| `info` | 開始 listen 的位址、scope report、收到關閉訊號 |
+| `info` | 開始 listen 的位址、收到關閉訊號 |
 | `error` | 5xx 錯誤（含完整的 source chain）、handler panic、失敗的生命週期 hook |
 
 每個 request 的 log 請用 `tower_http::trace::TraceLayer`（見下一節）。需要 handler 名稱時，可以寫一個 interceptor（見 [Request pipeline](05-request-pipeline.md#interceptor)）。
@@ -42,7 +42,7 @@ let _hornero = Hornero::new(AppModule)
 
 ## Request ID
 
-用 tower-http 產生 request id，並在 handler 或 request-scoped provider 裡讀取：
+用 tower-http 產生 request id，並在 handler 裡讀取：
 
 ```rust
 use hornero::prelude::*;
@@ -75,7 +75,7 @@ assert_eq!(res.header("x-request-id"), Some("abc-123"));
 # }
 ```
 
-request-scoped provider 可以用 `ctx.get::<RequestId>()`（`ctx` 是注入的 `Arc<RequestContext>`）取得同一個值，例如替 audit log 加上 request id。
+service 需要 request id 時（例如替 audit log 加上它），由 handler 當參數傳進去。
 
 ## 統一回應格式（envelope）
 
