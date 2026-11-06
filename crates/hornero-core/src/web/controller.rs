@@ -71,6 +71,8 @@ pub struct RouteDef {
     pub(crate) guards: Vec<EnhancerRef>,
     pub(crate) interceptors: Vec<EnhancerRef>,
     pub(crate) filters: Vec<EnhancerRef>,
+    /// What the handler's `Extracted` parameters need, declared by its signature.
+    pub(crate) extractors: Vec<EnhancerRef>,
     pub(crate) meta: Metadata,
     /// `None` for methods axum's router cannot match; reported by the bootstrap.
     pub(crate) filter: Option<MethodFilter>,
@@ -100,6 +102,7 @@ impl ControllerEntry {
                     .iter()
                     .chain(&route.interceptors)
                     .chain(&route.filters)
+                    .chain(&route.extractors)
             }))
     }
 }
@@ -164,7 +167,8 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
         self
     }
 
-    /// Registers a handler. `handler` receives `Arc<Self>` followed by any axum extractors.
+    /// Registers a handler. `handler` receives `Arc<Self>` followed by any axum extractors or
+    /// [`Extracted`](crate::Extracted) parameters.
     pub fn route<H, Args>(
         &mut self,
         method: Method,
@@ -176,13 +180,14 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
         H: RouteHandler<C, Args>,
     {
         let filter = MethodFilter::try_from(method.clone()).ok();
-        self.routes.push(RouteDef {
+        let mut route = RouteDef {
             method,
             path: path.into(),
             name,
             guards: Vec::new(),
             interceptors: Vec::new(),
             filters: Vec::new(),
+            extractors: Vec::new(),
             meta: Metadata::default(),
             filter,
             build: Box::new(move |controller, filter| {
@@ -191,7 +196,9 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
                     .expect("a controller's node holds the controller");
                 handler.into_method_router(this, filter)
             }),
-        });
+        };
+        H::declare(&mut route);
+        self.routes.push(route);
         self.routes.last_mut().expect("route was just pushed")
     }
 

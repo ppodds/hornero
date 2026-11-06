@@ -7,7 +7,7 @@
 | [應用程式](#應用程式) | `Hornero`、`App` |
 | [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
-| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
+| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Extractor`、`Extracted`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
 | [錯誤](#錯誤) | `HttpError`、`BootError`、`ShutdownError`、`Problem` |
 | [生命週期](#生命週期) | `Lifecycle`、`Hook`、`Shutdown` |
 | [工具型別](#工具型別) | `BoxError`、`BoxFuture` |
@@ -40,6 +40,7 @@ pub struct Hornero { /* ... */ }
 | `fn override_guard<G>(self, guard: impl Guard) -> Self` | 以任意 `Guard` 取代所有用到 guard `G` 的地方 |
 | `fn override_interceptor<I>(self, interceptor: impl Interceptor) -> Self` | 同上，interceptor |
 | `fn override_filter<F>(self, filter: impl ExceptionFilter) -> Self` | 同上，exception filter |
+| `fn override_extractor<E: Extractor>(self, extractor: impl Extractor<Output = E::Output>) -> Self` | 以 `Output` 相同的任意 `Extractor` 取代所有 `Extracted<E>` 參數 |
 | `fn routes(&self) -> Result<Routes, BootError>` | 列出所有 controller 路由（見 [`Routes`](#routesrouteinfo-與-enhancerinfo)），和 `validate` 一樣驗證依賴圖與路由、不建構任何東西；產生 API 文件用 |
 | `fn validate(&self) -> Result<(), BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
 | `async fn build(self) -> Result<App, BootError>` | 驗證、建構所有 singleton、組出 router，再執行 `on_module_init` 與 `on_application_bootstrap`。建構之後任何一步失敗，都會觸發 `Shutdown` 並對已建構的有 hook 的 singleton 執行 `on_module_destroy` 與 `on_application_shutdown`（反向依賴順序），清理失敗接在原本的問題之後 |
@@ -526,7 +527,35 @@ pub struct RouteDef { /* ... */ }
 pub trait RouteHandler<C, Args>: Clone + Send + Sync + 'static { /* 只有 hornero 內部使用的方法 */ }
 ```
 
-可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>`，`Tn` 實作 `FromRequest<()>`（可以讀取 body）。controller 在啟動時建構，每個 request 拿到的是它的 `Arc` clone。
+可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>` 或是 `Extracted<E>`，`Tn` 還可以實作 `FromRequest<()>`（可以讀取 body）。controller 在啟動時建構，每個 request 拿到的是它的 `Arc` clone。
+
+### `trait Extractor` 與 `Extracted`
+
+```rust,ignore
+pub trait Extractor: Send + Sync + 'static {
+    type Output: Send + 'static;
+
+    fn extract(
+        &self,
+        parts: &mut Parts,
+    ) -> impl Future<Output = Result<Self::Output, HttpError>> + Send;
+}
+
+pub struct Extracted<E: Extractor>(pub E::Output);
+```
+
+需要 provider 的 extractor。`Extracted<E>` 是 handler 參數，內容是 `E::Output`，並且 `Deref` 到它。
+
+| 項目 | 說明 |
+|---|---|
+| 解析 | 路由從 handler 的簽名得知 `E`，在 controller 的模組裡解析：看得到 provider 就用那個實例，否則建立私有的，和 guard 相同。依賴缺少是 `BootError`，手寫路由與 type alias 也一樣 |
+| 執行 | 在 guard 與 interceptor 之後，依參數順序，每個參數一次；沒有這個參數的 handler 不會執行它 |
+| 錯誤 | `Err` 就是回應，會經過 exception filter |
+| body | 不會讀取，後面的參數仍然可以是 `Json<T>` |
+| 限制 | `Extracted<E>` 沒有實作 `FromRequestParts`，只能用在 controller handler，也不能包在 `Option` 裡 |
+| 替換 | `override_extractor::<E>` 替換 `Extracted<E>` 參數，不影響注入 `E` 的 provider |
+
+見 [需要 provider 的 extractor](../guide/06-scopes.md#需要-provider-的-extractor)。
 
 ### `trait Guard` 與 `GuardContext`
 
@@ -783,13 +812,14 @@ pub struct EnhancerInfo { /* ... */ }
 | `fn module(&self) -> &str` | 註冊這個 controller 的模組名稱 |
 | `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | 型別為 `T` 的 metadata，與 guard 在 `RouteContext::meta` 看到的相同：handler 層級優先於 controller 層級 |
 | `fn guards(&self) -> &[EnhancerInfo]` | 這條路由會執行的 guard，依執行順序：全域的（先 `Hornero::guard`，再模組宣告的 `AppGuard`）、controller 的、handler 的 |
+| `fn extractors(&self) -> &[EnhancerInfo]` | handler 要求的 `Extractor`，依參數順序，重複的只列一次 |
 
 | `EnhancerInfo` 的方法 | 說明 |
 |---|---|
 | `fn name(&self) -> &str` | enhancer 名稱（不含路徑的型別名稱） |
 | `fn type_id(&self) -> TypeId` | enhancer 型別的 `TypeId` |
 | `fn is<T: 'static>(&self) -> bool` | enhancer 是否為 `T` |
-| `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | enhancer 用 [`Injectable::describe`](#trait-injectable) 描述自己的 metadata，例如 `hornero-openapi` 從實作 `ApiSecurity` 的 guard 取得的 security scheme |
+| `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | enhancer 用 [`Injectable::describe`](#trait-injectable) 描述自己的 metadata，例如 `hornero-openapi` 從實作 `ApiSecurity` 的 guard 或 extractor 取得的 security scheme |
 
 ```rust
 use hornero::prelude::*;

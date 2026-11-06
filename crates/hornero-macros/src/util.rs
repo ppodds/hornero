@@ -21,6 +21,12 @@ impl InjectOptions {
             let scope: Ident = meta.value()?.parse()?;
             match scope.to_string().as_str() {
                 "singleton" | "transient" => self.scope = Some(scope),
+                "request" => {
+                    return Err(syn::Error::new_spanned(
+                        scope,
+                        "there is no request scope; a provider cannot hold request data. Read it in a handler with an axum extractor, or with a `hornero::Extractor` if that needs a provider",
+                    ));
+                }
                 _ => {
                     return Err(syn::Error::new_spanned(
                         scope,

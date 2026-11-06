@@ -24,6 +24,7 @@ pub use lifecycle::{Hook, Lifecycle, Shutdown};
 pub use util::{BoxError, BoxFuture};
 pub use web::controller::{Controller, ControllerAttrs, ControllerDef, RouteDef};
 pub use web::enhancer::{AppFilter, AppGuard, AppInterceptor};
+pub use web::extractor::{Extracted, Extractor};
 pub use web::filter::ExceptionFilter;
 pub use web::guard::{Guard, GuardContext};
 pub use web::handler::RouteHandler;

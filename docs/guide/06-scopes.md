@@ -206,7 +206,173 @@ assert_eq!(client.get("/greet").await.status(), StatusCode::UNAUTHORIZED);
 
 - **handler 簽名就是依賴宣告**：`user: CurrentUser` 表示這個 handler 需要已驗證的使用者，型別本身就證明資料存在。
 - **service 用參數接收 request 資料**：呼叫鏈上每一層都看得到自己依賴什麼。如果很多方法都要同一份資料，把它們包成一個 context struct 傳遞，一樣不需要進依賴圖。
-- **需要 DI 的工作放在 guard、interceptor 或 middleware**：它們是 provider，可以注入依賴。extractor 拿不到 provider（handler 的 state 是 `()`），所以它只負責從 extensions 讀出已經準備好的資料。上例的 `Directory` 查詢就是這樣分工的。
+- **guard 負責擋下 request**：`IdentityGuard` 是 provider，可以注入 `Directory`；驗證失敗的 request 不會進 handler，通過時把結果寫進 extensions，extractor 只負責讀出來。結果只有 handler 需要，或不是每條路由都需要時，改用下一節的 `Extractor`。
+
+### 需要 provider 的 extractor
+
+axum extractor 只看得到 request：handler 的 state 是 `()`，所以它拿不到 provider。需要依賴時實作 `Extractor`：它是 provider，看得到 request，handler 用 `Extracted<E>` 參數取得結果。
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+
+#[derive(Clone)]
+struct User {
+    name: String,
+}
+
+/// 假裝是資料庫
+struct Users;
+
+impl Users {
+    async fn by_token(&self, token: &str) -> Option<User> {
+        (token == "ada-token").then(|| User { name: "ada".into() })
+    }
+}
+
+/// 依 token 載入目前的使用者
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<User, HttpError> {
+        let token = parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| HttpError::unauthorized("missing token"))?;
+        self.users
+            .by_token(token)
+            .await
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    fn me(&self, Extracted(user): Extracted<CurrentUser>) -> String {
+        user.name
+    }
+
+    /// 沒有這個參數，所以不會查資料庫
+    #[get("/ping")]
+    fn ping(&self) -> &'static str {
+        "pong"
+    }
+}
+
+#[module(controllers = [MeController], providers = [value(Users)])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+let client = app.client();
+assert_eq!(client.get("/me").header("x-token", "ada-token").await.text(), "ada");
+assert_eq!(client.get("/me").await.status(), StatusCode::UNAUTHORIZED);
+assert_eq!(client.get("/me/ping").await.text(), "pong");
+# }
+```
+
+幾個重點：
+
+- **參數本身就是宣告**：路由從 handler 的簽名得知 `CurrentUser`，和 `#[guards]` 一樣在 controller 的模組裡解析：看得到 provider 就用那個實例，否則建立一個私有的。依賴缺少是 bootstrap 錯誤，不會等到 request。宣告來自型別而不是 macro，所以 `type Me = Extracted<CurrentUser>` 這種 alias 與手寫路由一樣會被驗證。
+- **只有要求它的 handler 才執行**：上例的 `/me/ping` 不會查資料庫。放在 guard 裡的話，每個經過 guard 的 request 都會查。
+- **在 guard 與 interceptor 之後執行**：看得到它們寫進 extensions 的資料。回傳的 `Err` 就是回應，和 guard 的錯誤一樣會經過 exception filter。
+- **不讀 body**：後面的參數仍然可以是 `Json<T>`。
+- **只能用在 controller handler**：`Extracted<E>` 不是 axum extractor，所以不能放進 mount 的 axum router，也不能包在 `Option` 裡。資料可有可無時，把 `Output` 設成 `Option<User>`。
+
+需要 state 的 axum extractor 不能直接當參數，把它包進 `Extractor` 就能用，例如 axum-extra 的 `PrivateCookieJar` 可以注入 `Key`，再呼叫 `PrivateCookieJar::from_headers(&parts.headers, key)`。
+
+### 同一個 request 共用的資源
+
+`Extractor` 每個參數執行一次，實例也由所有 request 共用，所以不能把 request 的狀態存在 `self`。要在同一個 request 內重複使用結果，把它放進 extensions；要建立在另一個 extractor 之上，就直接注入它：
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+
+#[derive(Clone)]
+struct User {
+    tenant: u64,
+}
+
+/// 假裝是資料庫
+struct Users;
+
+impl Users {
+    async fn load(&self) -> User {
+        User { tenant: 7 }
+    }
+}
+
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<User, HttpError> {
+        if let Some(user) = parts.extensions.get::<User>() {
+            return Ok(user.clone());
+        }
+        let user = self.users.load().await;
+        parts.extensions.insert(user.clone());
+        Ok(user)
+    }
+}
+
+/// 它依賴 CurrentUser，所以 CurrentUser 要註冊在 providers 裡
+#[derive(Injectable)]
+struct CurrentTenant {
+    user: Arc<CurrentUser>,
+}
+
+impl Extractor for CurrentTenant {
+    type Output = u64;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<u64, HttpError> {
+        Ok(self.user.extract(parts).await?.tenant)
+    }
+}
+
+#[controller("/report")]
+struct ReportController;
+
+#[routes]
+impl ReportController {
+    /// 兩個參數只查一次資料庫
+    #[get("/")]
+    fn report(
+        &self,
+        Extracted(user): Extracted<CurrentUser>,
+        Extracted(tenant): Extracted<CurrentTenant>,
+    ) -> String {
+        format!("{} {tenant}", user.tenant)
+    }
+}
+
+#[module(controllers = [ReportController], providers = [value(Users), CurrentUser])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+assert_eq!(app.client().get("/report").await.text(), "7 7");
+# }
+```
+
+extensions 裡的值必須是 `Clone`。交易這類不能複製的資源，讓 `Output` 就是它本身：handler 取得所有權，用 `&mut` 傳給 service，最後自己 commit。
 
 ### 依 request 資料呈現錯誤
 
@@ -271,3 +437,5 @@ assert_eq!(problem["detail"], "order 7 not found");
 | middleware | 所有錯誤，包括 guard 的 401 / 403 | guard 寫入的資料：request 在 middleware 交出去之後才經過 guard |
 
 像上例這樣原地修改 response，`HttpError` 會留在 response 上，5xx 的 log 照常記錄。回傳全新的 response 則會連 `HttpError` 一起丟掉，這筆 5xx 就不會被 hornero 記錄。interceptor 在 filter 內層，所以錯誤還留在 response 上時，route 上的 filter 仍會接手渲染。
+
+有一種情況兩邊都不夠：前一個 guard 寫入了使用者，後一個 guard 拒絕 request，而回應又要用到使用者。interceptor 看不到這個拒絕，middleware 看不到使用者。這時由拒絕的 guard 把需要的資料放進錯誤，例如 `HttpError::forbidden("...").with_details(...)`。

@@ -58,8 +58,8 @@ use hornero::prelude::*;
 |---|---|
 | `std` | `Arc` |
 | `axum` | `Json`、`Extension`、`Path`、`Query`、`StatusCode`、`IntoResponse`、`Response` |
-| hornero 型別 | `App`、`Hornero`、`Module`、`ModuleDef`、`Scope`、`Qualified`、`RouteContext`、`GuardContext`、`HttpError`、`BoxError`、`Shutdown`、`AppGuard`、`AppInterceptor`、`AppFilter` |
-| hornero trait | `Injectable`、`Controller`、`Guard`、`Interceptor`、`ExceptionFilter`、`Middleware`、`Lifecycle` |
+| hornero 型別 | `App`、`Hornero`、`Module`、`ModuleDef`、`Scope`、`Qualified`、`RouteContext`、`GuardContext`、`HttpError`、`BoxError`、`Shutdown`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Extracted` |
+| hornero trait | `Injectable`、`Controller`、`Extractor`、`Guard`、`Interceptor`、`ExceptionFilter`、`Middleware`、`Lifecycle` |
 | macro | `Injectable`（derive）、`injectable`、`module`、`controller`、`routes`、`guards`、`interceptors`、`filters`、`meta`、`api_response`、`api_body`、`api_tags`、`api_exclude`、`bind` |
 
 `prelude` 刻意不包含較少用到的項目，例如 `ProviderDef`、`Key`、`Dependency`、`Resolver`、`Metadata`、`BootError`、`Problem`；需要時以 `hornero::ProviderDef` 等路徑使用。

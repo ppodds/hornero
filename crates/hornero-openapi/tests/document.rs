@@ -1,6 +1,7 @@
 //! The document `hornero-openapi` infers from the route table, handler signatures, attributes and
 //! guards.
 
+use hornero::axum::http::request::Parts;
 use hornero::openapi::{
     ApiSecurity, IntoParams, OpenApiConfig, SecurityScheme, ToSchema, document, warnings,
 };
@@ -563,6 +564,57 @@ fn global_and_module_guards_secure_every_route_together() {
         doc["components"]["securitySchemes"]["api_key"],
         json!({ "type": "apiKey", "in": "header", "name": "x-api-key", "description": "Issued per client" })
     );
+}
+
+// --- security from extractors ------------------------------------------------------------------
+
+/// Authenticates by itself, so the routes that take it need no guard to be documented as secured.
+#[derive(Injectable)]
+struct Caller;
+
+impl Extractor for Caller {
+    type Output = String;
+
+    async fn extract(&self, _: &mut Parts) -> Result<String, HttpError> {
+        Ok("ada".to_owned())
+    }
+}
+
+impl ApiSecurity for Caller {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    async fn me(&self, Extracted(name): Extracted<Caller>) -> String {
+        name
+    }
+
+    #[get("/public")]
+    async fn public(&self) -> &'static str {
+        ""
+    }
+}
+
+#[module(controllers = [MeController])]
+struct MeModule;
+
+#[test]
+fn extractors_implementing_api_security_secure_the_routes_that_take_them() {
+    let routes = Hornero::new(MeModule).routes().unwrap();
+    let doc = json_of(&document(&routes, &config()));
+    assert_eq!(
+        doc["paths"]["/me"]["get"]["security"],
+        json!([{ "bearer": [] }])
+    );
+    assert!(doc["paths"]["/me/public"]["get"]["security"].is_null());
+    assert!(warnings(&routes, &config()).is_empty());
 }
 
 // --- what cannot be inferred -------------------------------------------------------------------

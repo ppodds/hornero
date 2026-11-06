@@ -30,6 +30,7 @@ use crate::lifecycle::{ErasedLifecycle, Hook, Shutdown};
 use crate::util::BoxError;
 use crate::web::cancel::{self, Cancellable};
 use crate::web::enhancer::{self, EnhancerKind, EnhancerRef};
+use crate::web::extractor::{Extractor, RouteExtractors};
 use crate::web::filter::ExceptionFilter;
 use crate::web::guard::Guard;
 use crate::web::interceptor::Interceptor;
@@ -182,6 +183,17 @@ impl Hornero {
     /// [`ExceptionFilter`].
     pub fn override_filter<F: 'static>(mut self, filter: impl ExceptionFilter) -> Self {
         self.overrides.push(enhancer::filter_override::<F>(filter));
+        self
+    }
+
+    /// Replaces every use of the extractor `E` with `extractor`, which may be any [`Extractor`]
+    /// with the same output.
+    pub fn override_extractor<E: Extractor>(
+        mut self,
+        extractor: impl Extractor<Output = E::Output>,
+    ) -> Self {
+        self.overrides
+            .push(enhancer::extractor_override::<E>(extractor));
         self
     }
 
@@ -732,7 +744,22 @@ fn assemble(
                                 .chain(global_filters.iter().cloned()),
                         );
 
+                        let extractors: Vec<(Key, Instance)> = route
+                            .extractors
+                            .iter()
+                            .map(|enhancer| {
+                                let slot = graph.modules[module].slots[&enhancer.slot_key];
+                                (enhancer.slot_key, singleton(rt, slot).clone())
+                            })
+                            .collect();
+
                         let mut method_router = (route.build)(singleton(rt, node), filter);
+                        if !extractors.is_empty() {
+                            method_router = pipeline::with_extractors(
+                                method_router,
+                                RouteExtractors::new(extractors),
+                            );
+                        }
                         for interceptor in interceptors.into_iter().rev() {
                             method_router =
                                 pipeline::with_interceptor(method_router, interceptor, ctx.clone());

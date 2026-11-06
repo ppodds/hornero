@@ -224,6 +224,7 @@ async fn lists_todos() {
 | `override_guard::<G>(guard)` | 所有用到 guard `G` 的地方；替換品可以是任何實作 `Guard` 的型別 |
 | `override_interceptor::<I>(interceptor)` | 同上，interceptor |
 | `override_filter::<F>(filter)` | 同上，exception filter |
+| `override_extractor::<E>(extractor)` | 所有 `Extracted<E>` 參數；替換品可以是任何 `Output` 相同的 `Extractor`，不影響注入 `E` 的 provider（那要用 `override_value`） |
 | `configure(\|hornero\| ...)` | 其他 `Hornero` 設定：全域 enhancer、layer、global prefix |
 
 override 的規則：
@@ -249,6 +250,73 @@ async fn overrides_must_replace_something() {
 
     assert!(err.to_string().contains("unused override"));
 }
+```
+
+## 替換 request 資料
+
+`override_guard` 的替換品只決定放不放行。handler 要讀 guard 寫入的資料時（`AuthUser` 這類 proof extractor），替換品也要寫入同樣的資料，否則 proof extractor 會回 401。
+
+`Extractor` 則是直接替換 handler 收到的值，原本的依賴也不再需要：
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+use hornero_testing::TestApp;
+
+struct User {
+    name: String,
+}
+
+struct Users;
+
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, _: &mut Parts) -> Result<User, HttpError> {
+        Err(HttpError::unauthorized("no session"))
+    }
+}
+
+/// 固定的使用者
+struct Ada;
+
+impl Extractor for Ada {
+    type Output = User;
+
+    async fn extract(&self, _: &mut Parts) -> Result<User, HttpError> {
+        Ok(User { name: "ada".into() })
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    fn me(&self, Extracted(user): Extracted<CurrentUser>) -> String {
+        user.name
+    }
+}
+
+// 沒有註冊 Users：替換之後就不需要它了
+#[module(controllers = [MeController])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = TestApp::new(AppModule)
+    .override_extractor::<CurrentUser>(Ada)
+    .build()
+    .await
+    .unwrap();
+assert_eq!(app.client().get("/me").await.text(), "ada");
+# }
 ```
 
 ## 測試真正的 guard

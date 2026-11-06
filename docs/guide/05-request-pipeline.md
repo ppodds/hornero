@@ -354,7 +354,7 @@ Rust 沒有 exception。handler 回傳 `Result<_, HttpError>`，`HttpError` 轉�
 
 - **每個錯誤由一個 filter 處理**：依序查看 handler 層、controller 層、全域的 filter（同一層依註冊順序；全域的先看 `Hornero::filter::<F>()`，再看模組 `providers` 裡的 `AppFilter<F>`，即 Nest 的 `APP_FILTER`），第一個 `catches` 回傳 `true` 的處理它。沒有 filter 接住時，錯誤以預設格式回應。
 - **依錯誤型別接住**：用 `?` 拋出的 domain error 會變成 500，原始錯誤保留為 source。`catches` 裡用 `err.is::<TodoError>()` 判斷，`catch` 裡用 `err.downcast_ref::<TodoError>()` 取出，就能把它轉成 404、409 等回應。完整範例見 [錯誤處理](08-errors.md#domain-error)。
-- **filter 看得到**：handler、guard、interceptor 回傳的 `HttpError`；`Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）。
+- **filter 看得到**：handler、guard、interceptor 回傳的 `HttpError`；`Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）；`Extractor` 回傳的錯誤。
 - **filter 看不到**：axum 內建 extractor 的 rejection（純文字，例如格式錯誤的 `Json`）、404 fallback、panic。要讓輸入錯誤也走 filter，請使用 `Valid<Json<T>>` 或 `Rejection = HttpError` 的自訂 extractor。
 - **filter 也看不到 request**：它執行時 request 已經被 handler 消耗了，手上只有錯誤與路由。回應要依 request 內容變化時，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
 
@@ -495,6 +495,7 @@ let _hornero = Hornero::new(AppModule)
 |---|---|
 | 擋下沒有權限的 request | Guard |
 | handler 需要已驗證的使用者 | Guard 寫入 extensions，加上 proof extractor |
+| handler 需要的資料要靠 provider 取得 | [`Extractor`](06-scopes.md#需要-provider-的-extractor)，只有要求它的 handler 才執行 |
 | 依路由 metadata 決定行為（快取、權限、速率） | Guard 或 Interceptor |
 | 計時、log handler 名稱、修改回應 | Interceptor |
 | 統一錯誤格式、把 domain error 轉成狀態碼 | Exception filter |

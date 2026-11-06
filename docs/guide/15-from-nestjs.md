@@ -24,7 +24,7 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 | `ModuleRef.get()` / `app.get()` | `App::get::<T>()`、`App::get_qualified::<T, Q>()`，只給測試與啟動程式碼使用 | 一般程式碼請宣告依賴 |
 | `Scope.TRANSIENT` | `#[inject(scope = transient)]` | 在啟動時為每個依賴它的元件建構一個 |
 | `Scope.REQUEST` | 不支援 | request 資料走 extractor，見 [Request 資料](06-scopes.md#request-資料) |
-| `@Inject(REQUEST)` | `HeaderMap`、`Extension<T>` 等 extractor | guard 與 interceptor 直接拿得到 request |
+| `@Inject(REQUEST)` | `HeaderMap`、`Extension<T>` 等 extractor | guard 與 interceptor 直接拿得到 request；同時需要依賴時用 [`Extractor`](06-scopes.md#需要-provider-的-extractor) |
 | `OnModuleInit` 等介面 | `impl Lifecycle`，加上 `#[inject(hooks)]` 啟用 | 只支援 singleton |
 | `app.enableShutdownHooks()` | 總是啟用（`listen` / `serve`） | |
 
@@ -38,6 +38,7 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 | `@Query()` | `Query(q): Query<ListQuery>` | |
 | `@Body()` | `Json(body): Json<CreateTodo>` | |
 | `@Headers()`、`@Req()` | `HeaderMap`、任何 axum extractor | |
+| `createParamDecorator` | 自訂 extractor；需要依賴時用 `Extractor` 與 `Extracted<E>` | |
 | `@HttpCode(201)` | 回傳 `(StatusCode::CREATED, Json(..))` | |
 | `ParseIntPipe` 等 pipe | extractor 的型別（`Path<u64>`） | 解析失敗就拒絕 |
 | `ValidationPipe` + class-validator | `Valid<Json<T>>` + garde | 見 [驗證](11-validation.md) |
@@ -86,7 +87,7 @@ proc macro 一次只看得到一個 item，跨模組、跨 crate 的檢查只能
 `async fn` 在 trait 裡無法透過 `dyn` 呼叫。讓方法回傳 `hornero::BoxFuture<'_, T>`，見 [Provider](02-providers.md#trait-object-與-async-方法)。
 
 **可以用 axum 的 `State` 嗎？**
-controller 不使用 `State`，依賴透過 DI 注入。mount 進來的 axum router 可以照常使用 `State`，見 [L0](13-without-macros.md#l0掛進既有的-axum-router)。
+controller 不使用 `State`，依賴透過 DI 注入。需要 state 的 extractor 要包進 [`Extractor`](06-scopes.md#需要-provider-的-extractor)。mount 進來的 axum router 可以照常使用 `State`，見 [L0](13-without-macros.md#l0掛進既有的-axum-router)。
 
 **深層的 service 要怎麼拿到目前的使用者？**
 handler 用 extractor 取得使用者，再當參數傳給 service，見 [Request 資料](06-scopes.md#request-資料)。hornero 沒有 Nest 的 request scope：這樣每一層的依賴都寫在簽名上，也不會讓整條依賴鏈變成每個 request 重建。取捨見 [ADR-0007](../adr/0007-no-request-scope.md)。

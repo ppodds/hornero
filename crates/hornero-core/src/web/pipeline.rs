@@ -7,14 +7,15 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::HttpBody;
 use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
+use axum::{Extension, Router};
 
+use super::extractor::RouteExtractors;
 use super::filter::ErasedFilter;
 use super::guard::{ErasedGuard, GuardContext};
 use super::interceptor::ErasedInterceptor;
@@ -72,6 +73,11 @@ pub(crate) fn root_fallback(root_mounts: Vec<Router>) -> Router {
         }
         HttpError::not_found("no route matches the request").into_response()
     }))
+}
+
+/// The innermost layer, so nothing outside it can drop the extractors from the request.
+pub(crate) fn with_extractors(route: MethodRouter, extractors: RouteExtractors) -> MethodRouter {
+    route.route_layer(Extension(extractors))
 }
 
 pub(crate) fn with_guards(

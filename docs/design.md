@@ -115,7 +115,8 @@ slot 以 `Arc<dyn ErasedGuard>` 儲存，因此 `override_guard::<AuthGuard>(All
 
 - `Scope::{Singleton, Transient}`。scope 只決定實例數量：所有 provider 都在啟動時建構，request 期間不碰容器，handler 與 enhancer 直接持有 `Arc`。
 - 啟動期限制：有 lifecycle hooks 的 provider 與 controller 不得是 transient（`ScopeViolation`）。
-- 沒有 request scope。request 資料放在 request 的 extensions：guard、interceptor 與 middleware 寫入，handler 用 extractor 讀取，再用參數傳給 service。需要 DI 的工作放在前者，因為 handler 的 state 是 `()`，extractor 拿不到 provider。
+- 沒有 request scope。request 資料放在 request 的 extensions：guard、interceptor 與 middleware 寫入，handler 用 extractor 讀取，再用參數傳給 service。
+- handler 的 state 是 `()`，所以 axum extractor 拿不到 provider。需要依賴的工作寫成 `Extractor`：它是 provider，handler 用 `Extracted<E>` 參數取得結果。參數本身就是宣告：`RouteHandler` 在型別層分辨 axum extractor 與 `Extracted<E>`，路由據此建立 slot，手寫路由與 type alias 也一樣在啟動時驗證。slot 經由 request extensions 交給參數，所以 `Extracted<E>` 只能用在 controller handler。
 - exception filter 在 request 被消耗之後才執行，只看得到錯誤與路由。依 request 呈現錯誤由 interceptor 或 middleware 負責，用 `HttpError::in_response` 取得錯誤。
 
 ## 6. Request pipeline
@@ -128,7 +129,7 @@ request
   → exception filter（handler > controller > global 中，第一個 catches 該錯誤的）
   → guards（global → controller → handler，依序；第一個失敗即回應）
   → interceptors（global 包 controller 包 handler）
-  → extractors（≈ Nest 的 Pipe；Valid<Json<T>> 做驗證）
+  → extractors（≈ Nest 的 Pipe；Valid<Json<T>> 做驗證；Extracted<E> 注入 provider）
   → handler（&self + extractors）
 ```
 
@@ -142,6 +143,7 @@ route 層（filter、guard、interceptor）以 `route_layer` 掛載，只對該 
 | `Interceptor` | `intercept(&self, &RouteContext, Request, Next) -> Response` | RxJS Observable 換成 async around-advice |
 | `ExceptionFilter` | `catches(&self, &HttpError) -> bool`（預設 `true`）與 `catch(&self, &HttpError, &RouteContext) -> Response` | 看得到 handler、guard、interceptor、extractor 產生的 `HttpError`，看不到 request（它已被消耗）；`?` 拋出的 domain error 以 `err.is::<T>()` 依型別接住 |
 | `Middleware` | `handle(&self, Request, Next) -> Response` | 需要 DI 時才用；否則直接用 tower layer |
+| `Extractor` | `extract(&self, &mut Parts) -> Result<Self::Output, HttpError>` | 需要 provider 的 extractor；handler 用 `Extracted<E>` 取得 `Output`，只有要求它的 handler 才執行 |
 
 `RouteContext::meta::<T>()` 提供型別化 metadata（handler 層覆蓋 controller 層），取代 `SetMetadata` + `Reflector` 的字串 key。
 

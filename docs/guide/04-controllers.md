@@ -224,7 +224,7 @@ assert!(err.to_string().contains(
 
 - **receiver**：`&self`，或 `self: Arc<Self>`（要把 controller 移進 `tokio::spawn` 時使用）。不支援 `&mut self`，因為同一個 controller 實例會同時服務多個 request。
 - **同步或非同步都可以**：沒有 `.await` 的 handler 可以寫成一般的 `fn`。
-- **其餘參數都是 axum extractor**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。
+- **其餘參數都是 axum extractor 或 `Extracted<E>`**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。handler 的 state 是 `()`，所以需要 state 的 extractor 不能當參數。
 - **回傳值是任何 `IntoResponse`**。
 - handler 不能有泛型參數。
 
@@ -331,6 +331,8 @@ assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 ```
 
 需要「已驗證身分」這類資料時，把它做成 extractor：handler 參數裡出現 `user: AuthUser`，本身就證明這個 request 已經通過驗證。做法見 [Request pipeline](05-request-pipeline.md#guard)。
+
+extractor 的工作需要 provider 時（查資料庫、讀設定），實作 `Extractor` 並用 `Extracted<E>` 當參數，見 [需要 provider 的 extractor](06-scopes.md#需要-provider-的-extractor)。
 
 ## 回傳值
 

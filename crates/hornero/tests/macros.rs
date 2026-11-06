@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderValue;
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use hornero::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -728,6 +729,97 @@ async fn openapi_attributes_do_not_change_routing() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+// --- extractors that are providers ---------------------------------------------------------
+
+pub struct Accounts;
+
+impl Accounts {
+    fn name_of(&self, token: &str) -> Option<String> {
+        (token == "ada-token").then(|| "ada".to_owned())
+    }
+}
+
+#[derive(Injectable)]
+pub struct CurrentAccount {
+    accounts: Arc<Accounts>,
+}
+
+impl Extractor for CurrentAccount {
+    type Output = String;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<String, HttpError> {
+        parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.accounts.name_of(token))
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+/// Declares the extractor as well as `Extracted<CurrentAccount>` does: no macro reads the name.
+type Account = Extracted<CurrentAccount>;
+
+#[controller("/accounts")]
+pub struct AccountController;
+
+#[routes]
+impl AccountController {
+    #[get("/me")]
+    fn me(&self, Extracted(name): Extracted<CurrentAccount>) -> String {
+        name
+    }
+
+    #[post("/me")]
+    async fn rename(&self, account: Account, Json(name): Json<String>) -> String {
+        format!("{} is now {name}", account.as_str())
+    }
+}
+
+#[module(controllers = [AccountController], providers = [value(Accounts)])]
+pub struct AccountModule;
+
+#[tokio::test]
+async fn handlers_receive_extractors_by_type_or_alias() {
+    let router = Hornero::new(AccountModule).build().await.unwrap().router();
+
+    let request = Request::get("/accounts/me")
+        .header("x-token", "ada-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada");
+
+    let request = Request::post("/accounts/me")
+        .header("x-token", "ada-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#""lovelace""#))
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada is now lovelace");
+
+    let request = Request::get("/accounts/me").body(Body::empty()).unwrap();
+    let res = router.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[module(controllers = [AccountController])]
+pub struct AccountModuleWithoutAccounts;
+
+#[test]
+fn an_alias_does_not_hide_a_missing_dependency() {
+    let err = Hornero::new(AccountModuleWithoutAccounts)
+        .validate()
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("CurrentAccount (in AccountModuleWithoutAccounts) requires `Accounts`")
+    );
 }
 
 #[test]

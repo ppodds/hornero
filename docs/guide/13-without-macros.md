@@ -191,7 +191,7 @@ impl Controller for UserController {
     fn routes(c: &mut ControllerDef<Self>) {
         c.prefix("/users").guard::<AdminGuard>();
 
-        // handler 是 closure：第一個參數是 Arc<Self>，其餘是 axum extractor
+        // handler 是 closure：第一個參數是 Arc<Self>，其餘是 axum extractor 或 Extracted<E>
         c.get("/{id}", "find_one", |this: Arc<Self>, Path(id): Path<u64>| async move {
             this.find_one(id).await
         });

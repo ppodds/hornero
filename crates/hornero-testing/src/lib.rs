@@ -25,7 +25,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use bytes::Bytes;
 use hornero::{
-    App, BootError, ExceptionFilter, Guard, Hornero, Interceptor, Module, ProviderDef,
+    App, BootError, ExceptionFilter, Extractor, Guard, Hornero, Interceptor, Module, ProviderDef,
     ShutdownError,
 };
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -147,6 +147,15 @@ impl TestAppBuilder {
     /// Replaces every use of the exception filter `F` with `filter`.
     pub fn override_filter<F: 'static>(mut self, filter: impl ExceptionFilter) -> Self {
         self.hornero = self.hornero.override_filter::<F>(filter);
+        self
+    }
+
+    /// Replaces every use of the extractor `E` with `extractor`, which outputs the same type.
+    pub fn override_extractor<E: Extractor>(
+        mut self,
+        extractor: impl Extractor<Output = E::Output>,
+    ) -> Self {
+        self.hornero = self.hornero.override_extractor::<E>(extractor);
         self
     }
 

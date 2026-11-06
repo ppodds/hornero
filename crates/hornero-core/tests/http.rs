@@ -7,6 +7,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Request};
+use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -15,9 +16,9 @@ use common::domain::DomainApp;
 use common::{get, send};
 use hornero_core::{
     AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ControllerDef, ExceptionFilter,
-    Guard, GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor, Key, Lifecycle,
-    LifecycleFn, Middleware, Module, ModuleDef, Problem, Resolver, RouteContext, Scope, Shutdown,
-    hooks,
+    Extracted, Extractor, Guard, GuardContext, Hornero, HttpError, Identity, Injectable,
+    Interceptor, Key, Lifecycle, LifecycleFn, Middleware, Module, ModuleDef, Problem, ProviderDef,
+    Resolver, RouteContext, Scope, Shutdown, hooks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2659,4 +2660,338 @@ async fn an_unbounded_shutdown_timeout_does_not_overflow() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+// --- extractors that are providers ----------------------------------------------------------
+
+struct Directory;
+
+impl Directory {
+    fn find(&self, token: &str) -> Option<String> {
+        (token == "ada-token").then(|| "ada".to_owned())
+    }
+}
+
+struct Caller(Arc<Directory>);
+
+impl Injectable for Caller {
+    fn dependencies() -> Vec<Key> {
+        vec![Key::of::<Directory>()]
+    }
+    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
+        Ok(Self(r.get()?))
+    }
+}
+
+impl Extractor for Caller {
+    type Output = String;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<String, HttpError> {
+        parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.0.find(token))
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+fn with_token(uri: &str) -> Request<Body> {
+    Request::get(uri)
+        .header("x-token", "ada-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+unit_injectable!(MeController);
+
+impl Controller for MeController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        // Nothing but the parameter declares the extractor.
+        c.get(
+            "/me",
+            "me",
+            |_: Arc<Self>, Extracted(name): Extracted<Caller>| async move { name },
+        );
+    }
+}
+
+struct MeModule;
+
+impl Module for MeModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.provider(ProviderDef::value(Directory))
+            .controller::<MeController>();
+    }
+}
+
+#[tokio::test]
+async fn extractors_combine_a_provider_with_the_request() {
+    let router = Hornero::new(MeModule).build().await.unwrap().router();
+
+    let res = send(&router, with_token("/me")).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body, "ada");
+
+    let res = get(&router, "/me").await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json()["detail"], "invalid token");
+}
+
+#[test]
+fn an_extractor_without_its_dependency_fails_at_bootstrap() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<MeController>();
+        }
+    }
+    let err = Hornero::new(App).validate().unwrap_err();
+    insta::assert_snapshot!(err.to_string());
+}
+
+#[tokio::test]
+async fn extractors_can_be_overridden_with_any_extractor() {
+    struct Anyone;
+    impl Extractor for Anyone {
+        type Output = String;
+        async fn extract(&self, _: &mut Parts) -> Result<String, HttpError> {
+            Ok("anyone".to_owned())
+        }
+    }
+    // Without `Directory`: the replacement does not need the original's dependencies.
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<MeController>();
+        }
+    }
+    let router = Hornero::new(App)
+        .override_extractor::<Caller>(Anyone)
+        .build()
+        .await
+        .unwrap()
+        .router();
+    assert_eq!(get(&router, "/me").await.body, "anyone");
+
+    let err = Hornero::new(TodoModule)
+        .override_extractor::<Caller>(Anyone)
+        .validate()
+        .unwrap_err();
+    assert!(
+        matches!(err.problems(), [Problem::UnusedOverride { provider }] if provider == "Caller")
+    );
+}
+
+#[test]
+fn the_route_table_lists_extractors() {
+    let routes = Hornero::new(MeModule).routes().unwrap();
+    let route = routes.iter().next().unwrap();
+    assert_eq!(route.extractors().len(), 1);
+    assert!(route.extractors()[0].is::<Caller>());
+}
+
+/// Counts its runs, so a test can tell which requests reached it.
+#[derive(Default)]
+struct Visits(AtomicUsize);
+
+impl Injectable for Visits {
+    fn dependencies() -> Vec<Key> {
+        Vec::new()
+    }
+    async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+        Ok(Self::default())
+    }
+}
+
+impl Extractor for Visits {
+    type Output = usize;
+
+    async fn extract(&self, _: &mut Parts) -> Result<usize, HttpError> {
+        Ok(self.0.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+}
+
+unit_injectable!(VisitsController);
+
+impl Controller for VisitsController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.get(
+            "/counted",
+            "counted",
+            |_: Arc<Self>, visit: Extracted<Visits>| async move { visit.to_string() },
+        );
+        c.get("/skipped", "skipped", |_: Arc<Self>| async { "skipped" });
+        c.get(
+            "/twice",
+            "twice",
+            |_: Arc<Self>, a: Extracted<Visits>, b: Extracted<Visits>| async move {
+                format!("{} {}", a.0, b.0)
+            },
+        );
+    }
+}
+
+#[tokio::test]
+async fn extractors_run_once_per_parameter_of_the_handlers_that_ask() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provide::<Visits>().controller::<VisitsController>();
+        }
+    }
+    let app = Hornero::new(App).build().await.unwrap();
+    let router = app.router();
+
+    assert_eq!(get(&router, "/skipped").await.body, "skipped");
+    assert_eq!(get(&router, "/counted").await.body, "1");
+    assert_eq!(get(&router, "/twice").await.body, "2 3");
+
+    // The route reached the provider the module registered, not a copy of its own.
+    assert_eq!(app.get::<Visits>().unwrap().0.load(Ordering::SeqCst), 3);
+
+    let routes = Hornero::new(App).routes().unwrap();
+    let twice = routes.iter().find(|route| route.handler() == "twice");
+    assert_eq!(twice.unwrap().extractors().len(), 1);
+}
+
+struct Stamped;
+
+impl Injectable for Stamped {
+    fn dependencies() -> Vec<Key> {
+        Vec::new()
+    }
+    async fn construct(_: &Resolver) -> Result<Self, BoxError> {
+        Ok(Self)
+    }
+}
+
+/// Reads what the guard and the interceptor below left on the request.
+impl Extractor for Stamped {
+    type Output = String;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<String, HttpError> {
+        let guard = parts.extensions.get::<GuardStamp>();
+        let interceptor = parts.extensions.get::<InterceptorStamp>();
+        match (guard, interceptor) {
+            (Some(guard), Some(interceptor)) => Ok(format!("{} {}", guard.0, interceptor.0)),
+            _ => Err(HttpError::forbidden("ran before the pipeline")),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GuardStamp(&'static str);
+#[derive(Clone)]
+struct InterceptorStamp(&'static str);
+
+unit_injectable!(
+    StampGuard,
+    StampInterceptor,
+    StampedController,
+    RenderRejection
+);
+
+impl Guard for StampGuard {
+    async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        ctx.parts.extensions.insert(GuardStamp("guard"));
+        Ok(())
+    }
+}
+
+impl Interceptor for StampInterceptor {
+    async fn intercept(&self, _: &RouteContext, mut req: Request, next: Next) -> Response {
+        req.extensions_mut().insert(InterceptorStamp("interceptor"));
+        next.run(req).await
+    }
+}
+
+impl ExceptionFilter for RenderRejection {
+    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
+        (StatusCode::IM_A_TEAPOT, err.message().to_owned()).into_response()
+    }
+}
+
+impl Controller for StampedController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.get(
+            "/stamped",
+            "stamped",
+            |_: Arc<Self>, stamps: Extracted<Stamped>| async move { stamps.0 },
+        )
+        .guard::<StampGuard>()
+        .interceptor::<StampInterceptor>();
+        // No guard or interceptor here, so the extractor rejects.
+        c.get(
+            "/rejected",
+            "rejected",
+            |_: Arc<Self>, stamps: Extracted<Stamped>| async move { stamps.0 },
+        )
+        .filter::<RenderRejection>();
+    }
+}
+
+struct StampedModule;
+
+impl Module for StampedModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.controller::<StampedController>();
+    }
+}
+
+#[tokio::test]
+async fn extractors_run_after_guards_and_interceptors() {
+    let router = Hornero::new(StampedModule).build().await.unwrap().router();
+    assert_eq!(get(&router, "/stamped").await.body, "guard interceptor");
+}
+
+#[tokio::test]
+async fn extractor_rejections_reach_exception_filters() {
+    let router = Hornero::new(StampedModule).build().await.unwrap().router();
+    let res = get(&router, "/rejected").await;
+    assert_eq!(res.status, StatusCode::IM_A_TEAPOT);
+    assert_eq!(res.body, "ran before the pipeline");
+}
+
+unit_injectable!(MixedController);
+
+impl Controller for MixedController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.post(
+            "/todos/{id}",
+            "with_body",
+            |_: Arc<Self>,
+             Path(id): Path<u32>,
+             Extracted(owner): Extracted<Caller>,
+             Json(todo): Json<Todo>| async move { format!("{owner} {id} {}", todo.title) },
+        );
+        c.get(
+            "/todos/{id}",
+            "last",
+            |_: Arc<Self>, Path(id): Path<u32>, Extracted(owner): Extracted<Caller>| async move {
+                format!("{owner} {id}")
+            },
+        );
+    }
+}
+
+#[tokio::test]
+async fn extractors_mix_with_axum_extractors_in_any_position() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.provider(ProviderDef::value(Directory))
+                .controller::<MixedController>();
+        }
+    }
+    let router = Hornero::new(App).build().await.unwrap().router();
+
+    assert_eq!(send(&router, with_token("/todos/7")).await.body, "ada 7");
+
+    let request = Request::post("/todos/7")
+        .header("x-token", "ada-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"id":7,"title":"write"}"#))
+        .unwrap();
+    assert_eq!(send(&router, request).await.body, "ada 7 write");
 }

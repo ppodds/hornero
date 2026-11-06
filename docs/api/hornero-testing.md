@@ -58,6 +58,7 @@ pub struct TestAppBuilder { /* ... */ }
 | `fn override_guard<G>(self, guard: impl Guard) -> Self` | 以 `guard` 取代所有用到 guard `G` 的地方 |
 | `fn override_interceptor<I>(self, interceptor: impl Interceptor) -> Self` | 同上，interceptor |
 | `fn override_filter<F>(self, filter: impl ExceptionFilter) -> Self` | 同上，exception filter |
+| `fn override_extractor<E: Extractor>(self, extractor: impl Extractor<Output = E::Output>) -> Self` | 以 `Output` 相同的 `extractor` 取代所有 `Extracted<E>` 參數 |
 | `fn configure(self, f: impl FnOnce(Hornero) -> Hornero) -> Self` | 任何其他 `Hornero` 設定：全域 enhancer、layer、`global_prefix` |
 | `async fn build(self) -> Result<TestApp, BootError>` | 驗證並啟動應用 |
 

@@ -80,10 +80,10 @@ pub mod prelude {
     pub use axum::response::{IntoResponse, Response};
 
     pub use crate::{
-        App, AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ExceptionFilter, Guard,
-        GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor, Lifecycle, Middleware,
-        Module, ModuleDef, Qualified, RouteContext, Scope, Shutdown, api_body, api_exclude,
-        api_response, api_tags, bind, controller, filters, guards, injectable, interceptors, meta,
-        module, routes,
+        App, AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ExceptionFilter, Extracted,
+        Extractor, Guard, GuardContext, Hornero, HttpError, Identity, Injectable, Interceptor,
+        Lifecycle, Middleware, Module, ModuleDef, Qualified, RouteContext, Scope, Shutdown,
+        api_body, api_exclude, api_response, api_tags, bind, controller, filters, guards,
+        injectable, interceptors, meta, module, routes,
     };
 }

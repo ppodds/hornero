@@ -145,6 +145,8 @@ assert_eq!(body, json!({ "data": ["apple", "pear"] }));
 2. **`AuthUser` extractor** 從 extensions 取出使用者，讓 handler 以型別宣告「我需要已登入的使用者」。
 3. **`RolesGuard` 搭配 `#[meta(Roles(&["admin"]))]`** 檢查權限。
 
+只有部分路由需要完整的使用者資料時，把查詢放進 [`Extractor`](06-scopes.md#需要-provider-的-extractor)，其他路由就不必付出查詢的成本。
+
 完整程式碼見 [Request pipeline](05-request-pipeline.md#guard) 與 `examples/todo/src/auth/mod.rs`。若大多數路由都需要登入，在 `AuthModule` 的 `providers` 加上 `AppGuard<AuthGuard>` 讓它成為全域 guard（Nest 的 `APP_GUARD`），再用 `Public` metadata 標出公開路由：
 
 ```rust

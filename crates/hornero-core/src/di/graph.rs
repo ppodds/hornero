@@ -273,6 +273,7 @@ impl Graph {
                             .chain(controller_guards.iter().cloned())
                             .chain(route.guards.iter().map(EnhancerRef::info))
                             .collect(),
+                        extractors: route.extractors.iter().map(EnhancerRef::info).collect(),
                     });
                 }
             }
