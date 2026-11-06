@@ -20,11 +20,17 @@ impl InjectOptions {
         if meta.path.is_ident("scope") {
             let scope: Ident = meta.value()?.parse()?;
             match scope.to_string().as_str() {
-                "singleton" | "request" | "transient" => self.scope = Some(scope),
+                "singleton" | "transient" => self.scope = Some(scope),
+                "request" => {
+                    return Err(syn::Error::new_spanned(
+                        scope,
+                        "there is no request scope; a provider cannot hold request data. Read it in a handler with an axum extractor, or with a `hornero::Extractor` if that needs a provider",
+                    ));
+                }
                 _ => {
                     return Err(syn::Error::new_spanned(
                         scope,
-                        "expected `singleton`, `request` or `transient`",
+                        "expected `singleton` or `transient`",
                     ));
                 }
             }
@@ -42,14 +48,11 @@ impl InjectOptions {
         let mut out = TokenStream::new();
         if let Some(scope) = &self.scope {
             let variant = match scope.to_string().as_str() {
-                "request" => quote!(Request),
                 "transient" => quote!(Transient),
                 _ => quote!(Singleton),
             };
             out.extend(quote! {
                 const SCOPE: ::hornero::Scope = ::hornero::Scope::#variant;
-                // An explicit scope is a promise: bubbling into request scope becomes an error.
-                const SCOPE_PINNED: bool = true;
             });
         }
         if self.hooks {

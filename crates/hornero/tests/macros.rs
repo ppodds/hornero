@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderValue;
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use hornero::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -98,12 +99,12 @@ impl Shouter {
     }
 }
 
-static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static STAMPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Request-scoped through the struct form of `#[injectable]`.
-#[injectable(scope = request)]
-pub struct RequestStamp {
-    #[inject(with = REQUESTS.fetch_add(1, Ordering::SeqCst))]
+/// Transient through the struct form of `#[injectable]`.
+#[injectable(scope = transient)]
+pub struct Stamp {
+    #[inject(with = STAMPS.fetch_add(1, Ordering::SeqCst))]
     number: usize,
 }
 
@@ -252,9 +253,9 @@ impl NoteController {
 }
 
 #[controller]
-#[injectable(scope = request)]
+#[injectable(scope = singleton)]
 pub struct StampController {
-    stamp: Arc<RequestStamp>,
+    stamp: Arc<Stamp>,
 }
 
 #[routes]
@@ -291,7 +292,7 @@ pub struct CoreModule;
 )]
 pub struct NotesModule;
 
-#[module(controllers = [StampController], providers = [RequestStamp])]
+#[module(controllers = [StampController], providers = [Stamp])]
 pub struct StampModule;
 
 #[module(imports = [ConfigModule, NotesModule, StampModule])]
@@ -318,10 +319,7 @@ fn request(method: &str, uri: &str) -> axum::http::request::Builder {
 
 #[test]
 fn the_macro_built_graph_is_valid() {
-    let report = Hornero::new(AppModule).validate().unwrap();
-    assert!(report.find("RequestStamp").unwrap().declared);
-    assert!(report.find("StampController").unwrap().declared);
-    assert!(report.find("NoteController").is_none());
+    Hornero::new(AppModule).validate().unwrap();
 }
 
 #[tokio::test]
@@ -416,10 +414,7 @@ async fn macro_built_application_serves_requests() {
         request("GET", "/stamp").body(Body::empty()).unwrap(),
     )
     .await;
-    assert_ne!(
-        first, second,
-        "request-scoped controller sees a new stamp per request"
-    );
+    assert_eq!(first, second, "a controller is built once, at bootstrap");
 
     assert!(app.get::<Counter>().unwrap().0.load(Ordering::SeqCst) >= 6);
 }
@@ -458,23 +453,6 @@ async fn macro_built_providers_can_be_overridden() {
     assert_eq!(status, StatusCode::CREATED);
     let note: Note = serde_json::from_str(&body).unwrap();
     assert_eq!((note.created_at, note.text.as_str()), (42, "t (by tester)"));
-}
-
-#[test]
-fn explicit_scopes_are_pinned() {
-    #[injectable(scope = singleton)]
-    pub struct Pinned {
-        #[allow(dead_code)]
-        stamp: Arc<RequestStamp>,
-    }
-    #[module(providers = [RequestStamp, Pinned])]
-    pub struct App;
-    let err = Hornero::new(App).validate().unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Pinned (in App) is pinned to singleton scope"),
-        "{err}"
-    );
 }
 
 #[test]
@@ -751,6 +729,97 @@ async fn openapi_attributes_do_not_change_routing() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+// --- extractors that are providers ---------------------------------------------------------
+
+pub struct Accounts;
+
+impl Accounts {
+    fn name_of(&self, token: &str) -> Option<String> {
+        (token == "ada-token").then(|| "ada".to_owned())
+    }
+}
+
+#[derive(Injectable)]
+pub struct CurrentAccount {
+    accounts: Arc<Accounts>,
+}
+
+impl Extractor for CurrentAccount {
+    type Output = String;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<String, HttpError> {
+        parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.accounts.name_of(token))
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+/// Declares the extractor as well as `Extracted<CurrentAccount>` does: no macro reads the name.
+type Account = Extracted<CurrentAccount>;
+
+#[controller("/accounts")]
+pub struct AccountController;
+
+#[routes]
+impl AccountController {
+    #[get("/me")]
+    fn me(&self, Extracted(name): Extracted<CurrentAccount>) -> String {
+        name
+    }
+
+    #[post("/me")]
+    async fn rename(&self, account: Account, Json(name): Json<String>) -> String {
+        format!("{} is now {name}", account.as_str())
+    }
+}
+
+#[module(controllers = [AccountController], providers = [value(Accounts)])]
+pub struct AccountModule;
+
+#[tokio::test]
+async fn handlers_receive_extractors_by_type_or_alias() {
+    let router = Hornero::new(AccountModule).build().await.unwrap().router();
+
+    let request = Request::get("/accounts/me")
+        .header("x-token", "ada-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada");
+
+    let request = Request::post("/accounts/me")
+        .header("x-token", "ada-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#""lovelace""#))
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada is now lovelace");
+
+    let request = Request::get("/accounts/me").body(Body::empty()).unwrap();
+    let res = router.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[module(controllers = [AccountController])]
+pub struct AccountModuleWithoutAccounts;
+
+#[test]
+fn an_alias_does_not_hide_a_missing_dependency() {
+    let err = Hornero::new(AccountModuleWithoutAccounts)
+        .validate()
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("CurrentAccount (in AccountModuleWithoutAccounts) requires `Accounts`")
+    );
 }
 
 #[test]

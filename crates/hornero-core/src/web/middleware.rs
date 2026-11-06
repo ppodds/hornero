@@ -10,8 +10,7 @@ use crate::util::BoxFuture;
 /// a tower layer (`m.layer(...)`, `Hornero::layer(...)`), which keeps the whole tower-http
 /// ecosystem usable as-is.
 ///
-/// Middleware runs before guards and is not route-aware. It must stay a singleton; the bootstrap
-/// fails if it would become request-scoped.
+/// Middleware runs before guards and is not route-aware.
 pub trait Middleware: Send + Sync + 'static {
     /// Handles the request; call `next.run(req).await` to continue.
     fn handle(&self, req: Request, next: Next) -> impl Future<Output = Response> + Send;

@@ -34,12 +34,11 @@ pub struct TestApp { /* ... */ }
 | `fn get<T: ?Sized>(&self) -> Arc<T>` | 依型別取得 singleton；找不到時 panic，訊息會說明原因 |
 | `fn try_get<T: ?Sized>(&self) -> Option<Arc<T>>` | 同上，找不到時回傳 `None` |
 | `fn get_qualified<T: ?Sized, Q>(&self) -> Arc<T>` | 取得以 qualifier `Q` 註冊的 `T`；找不到時 panic |
-| `fn scope_report(&self) -> &ScopeReport` | 哪些元件是 request-scoped，以及原因 |
 | `fn app(&self) -> &App` | 底下的 `App` |
 | `fn router(&self) -> Router` | 組好的 axum `Router`，可以用 `oneshot` 送任意 request |
 | `async fn close(self) -> Result<(), ShutdownError>` | 執行關閉 hook（`on_module_destroy`、`on_application_shutdown`） |
 
-`get`、`try_get` 與 `get_qualified` 只找得到 singleton：根模組看得到的那個，或整個應用唯一的那個。request-scoped 與 transient 的 provider 無法這樣取得。
+`get`、`try_get` 與 `get_qualified` 只找得到 singleton：根模組看得到的那個，或整個應用唯一的那個。transient 的 provider 無法這樣取得。
 
 ---
 
@@ -59,6 +58,7 @@ pub struct TestAppBuilder { /* ... */ }
 | `fn override_guard<G>(self, guard: impl Guard) -> Self` | 以 `guard` 取代所有用到 guard `G` 的地方 |
 | `fn override_interceptor<I>(self, interceptor: impl Interceptor) -> Self` | 同上，interceptor |
 | `fn override_filter<F>(self, filter: impl ExceptionFilter) -> Self` | 同上，exception filter |
+| `fn override_extractor<E: Extractor>(self, extractor: impl Extractor<Output = E::Output>) -> Self` | 以 `Output` 相同的 `extractor` 取代所有 `Extracted<E>` 參數 |
 | `fn configure(self, f: impl FnOnce(Hornero) -> Hornero) -> Self` | 任何其他 `Hornero` 設定：全域 enhancer、layer、`global_prefix` |
 | `async fn build(self) -> Result<TestApp, BootError>` | 驗證並啟動應用 |
 

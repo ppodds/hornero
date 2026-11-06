@@ -6,4 +6,3 @@ pub(crate) mod module;
 pub(crate) mod provider;
 pub(crate) mod resolver;
 pub(crate) mod runtime;
-pub(crate) mod scope;

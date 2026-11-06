@@ -14,7 +14,7 @@ hornero 會輸出：
 
 | 層級 | 內容 |
 |---|---|
-| `info` | 開始 listen 的位址、scope report、收到關閉訊號 |
+| `info` | 開始 listen 的位址、收到關閉訊號 |
 | `error` | 5xx 錯誤（含完整的 source chain）、handler panic、失敗的生命週期 hook |
 
 每個 request 的 log 請用 `tower_http::trace::TraceLayer`（見下一節）。需要 handler 名稱時，可以寫一個 interceptor（見 [Request pipeline](05-request-pipeline.md#interceptor)）。
@@ -42,7 +42,7 @@ let _hornero = Hornero::new(AppModule)
 
 ## Request ID
 
-用 tower-http 產生 request id，並在 handler 或 request-scoped provider 裡讀取：
+用 tower-http 產生 request id，並在 handler 裡讀取：
 
 ```rust
 use hornero::prelude::*;
@@ -75,7 +75,7 @@ assert_eq!(res.header("x-request-id"), Some("abc-123"));
 # }
 ```
 
-request-scoped provider 可以用 `ctx.get::<RequestId>()`（`ctx` 是注入的 `Arc<RequestContext>`）取得同一個值，例如替 audit log 加上 request id。
+service 需要 request id 時（例如替 audit log 加上它），由 handler 當參數傳進去。
 
 ## 統一回應格式（envelope）
 
@@ -144,6 +144,8 @@ assert_eq!(body, json!({ "data": ["apple", "pear"] }));
 1. **`AuthGuard`** 驗證 token，把使用者寫進 extensions。
 2. **`AuthUser` extractor** 從 extensions 取出使用者，讓 handler 以型別宣告「我需要已登入的使用者」。
 3. **`RolesGuard` 搭配 `#[meta(Roles(&["admin"]))]`** 檢查權限。
+
+只有部分路由需要完整的使用者資料時，把查詢放進 [`Extractor`](06-scopes.md#需要-provider-的-extractor)，其他路由就不必付出查詢的成本。
 
 完整程式碼見 [Request pipeline](05-request-pipeline.md#guard) 與 `examples/todo/src/auth/mod.rs`。若大多數路由都需要登入，在 `AuthModule` 的 `providers` 加上 `AppGuard<AuthGuard>` 讓它成為全域 guard（Nest 的 `APP_GUARD`），再用 `Public` metadata 標出公開路由：
 

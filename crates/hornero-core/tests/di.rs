@@ -948,88 +948,6 @@ async fn absent_optional_dependencies_cannot_be_required() {
     );
 }
 
-// --- scopes --------------------------------------------------------------------------------
-
-service!(AuditLog; scope = Scope::Request);
-service!(TodoService: Database, AuditLog);
-service!(TodoFacade: TodoService);
-
-#[test]
-fn request_scope_bubbles_up_and_is_reported() {
-    module!(App, |m| {
-        m.provide::<Database>()
-            .provide::<AuditLog>()
-            .provide::<TodoService>()
-            .provide::<TodoFacade>();
-    });
-    let report = Hornero::new(App).validate().unwrap();
-    insta::assert_snapshot!(report.to_string());
-    let facade = report.find("TodoFacade").unwrap();
-    assert!(!facade.declared);
-    assert_eq!(
-        facade.chain,
-        ["TodoFacade", "TodoService", "AuditLog [request]"]
-    );
-    assert!(report.find("AuditLog").unwrap().declared);
-    assert!(report.find("Database").is_none());
-}
-
-#[test]
-fn pinned_providers_reject_bubbling() {
-    service!(PinnedService: AuditLog; scope = Scope::Singleton, pinned = true);
-    module!(App, |m| {
-        m.provide::<AuditLog>().provide::<PinnedService>();
-    });
-    let err = Hornero::new(App).validate().unwrap_err();
-    insta::assert_snapshot!(err.to_string());
-}
-
-struct Hooked(#[allow(dead_code)] Arc<AuditLog>);
-
-impl Injectable for Hooked {
-    const LIFECYCLE: Option<LifecycleFn<Self>> = hooks::<Self>();
-
-    fn dependencies() -> Vec<Key> {
-        vec![Key::of::<AuditLog>()]
-    }
-
-    async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-        Ok(Hooked(r.get::<AuditLog>()?))
-    }
-}
-
-impl Lifecycle for Hooked {}
-
-#[test]
-fn lifecycle_hooks_require_singletons() {
-    module!(App, |m| {
-        m.provide::<AuditLog>().provide::<Hooked>();
-    });
-    let err = Hornero::new(App).validate().unwrap_err();
-    insta::assert_snapshot!(err.to_string());
-}
-
-#[test]
-fn request_scope_through_request_context() {
-    struct CurrentPath(#[allow(dead_code)] Arc<hornero_core::RequestContext>);
-    impl Injectable for CurrentPath {
-        fn dependencies() -> Vec<Key> {
-            vec![Key::of::<hornero_core::RequestContext>()]
-        }
-        async fn construct(r: &Resolver) -> Result<Self, BoxError> {
-            Ok(CurrentPath(r.get()?))
-        }
-    }
-    module!(App, |m| {
-        m.provide::<CurrentPath>();
-    });
-    let report = Hornero::new(App).validate().unwrap();
-    assert_eq!(
-        report.find("CurrentPath").unwrap().chain,
-        ["CurrentPath", "RequestContext [request]"]
-    );
-}
-
 // --- override precedence, re-exports and registration mistakes ------------------------------------
 
 #[tokio::test]
@@ -1091,6 +1009,8 @@ fn re_exporting_one_imported_provider_is_fine() {
 
 #[test]
 fn with_hooks_on_the_wrong_type_is_a_bootstrap_error() {
+    struct Hooked;
+    impl Lifecycle for Hooked {}
     module!(App, |m| {
         m.provider(ProviderDef::value(Mailer()).with_hooks::<Hooked>());
     });
@@ -1477,11 +1397,7 @@ fn transient_providers_cannot_have_hooks() {
         m.provide::<Ephemeral>();
     });
     let err = Hornero::new(App).validate().unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Ephemeral (in App) has lifecycle hooks but is transient"),
-        "{err}"
-    );
+    insta::assert_snapshot!(err.to_string());
 }
 
 #[tokio::test]
@@ -1505,18 +1421,13 @@ async fn validate_constructs_nothing() {
 
 #[tokio::test]
 async fn app_get_only_returns_singletons() {
+    service!(Nonce; scope = Scope::Transient);
     module!(App, |m| {
-        m.provide::<Database>()
-            .provide::<AuditLog>()
-            .provide::<TodoService>();
+        m.provide::<Database>().provide::<Nonce>();
     });
     let app = Hornero::new(App).build().await.unwrap();
     assert!(app.get::<Database>().is_some());
-    assert!(app.get::<AuditLog>().is_none(), "declared request-scoped");
-    assert!(
-        app.get::<TodoService>().is_none(),
-        "bubbled into request scope"
-    );
+    assert!(app.get::<Nonce>().is_none(), "every consumer has its own");
     assert!(
         app.get::<Shutdown>().is_some(),
         "built-ins are singletons too"

@@ -140,7 +140,7 @@ pub struct TodoController {
 - 這些 attribute 必須寫在 `#[controller]` **下方**（Nest 的慣例也是 `@Controller` 寫在最上面）；寫在上方會得到明確的編譯錯誤。同一種 attribute 可以寫多次，也可以一次列多個：`#[guards(AuthGuard, RolesGuard)]`，依由上到下、由左到右的順序執行。
 - 也可以寫成參數：`#[controller("/todos", guards = [AuthGuard], meta = [Public])]`，效果相同。兩種寫法並用時，參數裡的先執行。
 - struct 的規則和 `#[derive(Injectable)]` 相同：`Arc<T>` 欄位是依賴，其他欄位要加 `#[inject(default)]` 或 `#[inject(with = ...)]`。
-- 要設定 scope 時，在 struct 上加 `#[injectable(scope = request)]` 或 `#[inject(scope = request)]`。通常不需要：controller 會依依賴自動變成 request-scoped（見 [Scope](06-scopes.md)）。
+- controller 是 singleton：只在啟動時建構一次，由所有 request 共用，宣告成 transient 是 bootstrap 錯誤（見 [Scope 的限制](06-scopes.md#scope-的限制)）。request 的資料用 extractor 取得，不要存在 controller 上。
 
 ## `#[routes]`
 
@@ -224,7 +224,7 @@ assert!(err.to_string().contains(
 
 - **receiver**：`&self`，或 `self: Arc<Self>`（要把 controller 移進 `tokio::spawn` 時使用）。不支援 `&mut self`，因為同一個 controller 實例會同時服務多個 request。
 - **同步或非同步都可以**：沒有 `.await` 的 handler 可以寫成一般的 `fn`。
-- **其餘參數都是 axum extractor**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。
+- **其餘參數都是 axum extractor 或 `Extracted<E>`**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。handler 的 state 是 `()`，所以需要 state 的 extractor 不能當參數。
 - **回傳值是任何 `IntoResponse`**。
 - handler 不能有泛型參數。
 
@@ -331,6 +331,8 @@ assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 ```
 
 需要「已驗證身分」這類資料時，把它做成 extractor：handler 參數裡出現 `user: AuthUser`，本身就證明這個 request 已經通過驗證。做法見 [Request pipeline](05-request-pipeline.md#guard)。
+
+extractor 的工作需要 provider 時（查資料庫、讀設定），實作 `Extractor` 並用 `Extracted<E>` 當參數，見 [需要 provider 的 extractor](06-scopes.md#需要-provider-的-extractor)。
 
 ## 回傳值
 

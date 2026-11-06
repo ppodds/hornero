@@ -50,7 +50,7 @@ pub trait Module: Any + Send + Sync {
         Identity::Auto
     }
 
-    /// Name used in diagnostics and the scope report; the short type name by default.
+    /// Name used in diagnostics and the route table; the short type name by default.
     fn name(&self) -> String {
         short_type_name(type_name::<Self>())
     }

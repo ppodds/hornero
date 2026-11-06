@@ -268,6 +268,7 @@ assert_eq!(doc["components"]["securitySchemes"]["bearer"]["bearerFormat"], "JWT"
 
 - `scheme()` 回傳 scheme 的名稱與內容。名稱相同的 guard 共用一個 scheme。
 - 一條路由經過好幾個實作 `ApiSecurity` 的 guard 時，全部都是必要條件。
+- 自己驗證身分的 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 也可以實作 `ApiSecurity`：handler 有這個參數的路由就會要求它的 scheme。
 - `scopes(route)` 回傳 OAuth2 / OpenID Connect 需要的 scope，預設沒有。
 - `SecurityScheme` 提供 `bearer()`、`bearer_jwt()`、`basic()`、`api_key_header(name)`、`api_key_query(name)`、`api_key_cookie(name)`；OAuth2 這類較複雜的 scheme，從 utoipa 的 `SecurityScheme` 轉換即可。
 

@@ -1,14 +1,15 @@
-# 6. Scope：singleton、request、transient
+# 6. Scope 與 request 資料
 
-scope 決定一個 provider 實例活多久：
+scope 決定一個 provider 有幾個實例：
 
-| Scope | 實例數量 | 何時建構 |
-|---|---|---|
-| `Singleton`（預設） | 整個應用一個 | 啟動時 |
-| `Request` | 每個 HTTP request 一個 | 該 request 第一次需要它時（lazy），之後在同一個 request 內共用 |
-| `Transient` | 每個使用者（consumer）一個 | 每次有元件依賴它時 |
+| Scope | 實例數量 |
+|---|---|
+| `Singleton`（預設） | 整個應用一個 |
+| `Transient` | 每個使用者（consumer）一個 |
 
-大多數 provider 都應該是 singleton。request scope 用來承載「這個 request 的」資料，例如目前的使用者、租戶或交易。
+不論哪一種，**所有實例都在啟動時建構**。request 期間不會建構任何 provider，所以建構失敗一定發生在 bind port 之前，不會變成某個 request 的 500。
+
+hornero 沒有 Nest 的 `Scope.REQUEST`：request 的資料不進依賴圖，而是走 axum 的 extractor，見 [Request 資料](#request-資料)。為什麼這樣取捨，記錄在 [ADR-0007](../adr/0007-no-request-scope.md)。
 
 ## 宣告 scope
 
@@ -19,14 +20,14 @@ use hornero::ProviderDef;
 # async fn make_trace_id() -> Result<TraceId, BoxError> { Ok(TraceId(7)) }
 
 #[derive(Injectable)]
-#[inject(scope = request)]
-struct AuditLog { /* ... */ }
+#[inject(scope = transient)]
+struct Scratchpad { /* ... */ }
 
-struct CurrentUser;
+struct Nonce;
 
-#[injectable(scope = request)]
-impl CurrentUser {
-    fn new(ctx: Arc<RequestContext>) -> Result<Self, BoxError> { /* ... */ Ok(CurrentUser) }
+#[injectable(scope = transient)]
+impl Nonce {
+    fn new() -> Result<Self, BoxError> { /* ... */ Ok(Nonce) }
 }
 
 // 手寫或 factory provider
@@ -40,159 +41,6 @@ m.provider(ProviderDef::factory(make_trace_id).scope(Scope::Transient));
 #[module(providers = [provider(ProviderDef::factory(make_trace_id).scope(Scope::Transient))])]
 struct TraceModule;
 ```
-
-## `RequestContext`
-
-`Arc<RequestContext>` 是內建的 request-scoped provider，相當於 Nest 的 `REQUEST`。它是 request head 的快照：
-
-| 方法 | 回傳 |
-|---|---|
-| `method()` | `&Method` |
-| `uri()` | `&Uri` |
-| `version()` | `Version` |
-| `headers()` | `&HeaderMap` |
-| `extensions()` | `&Extensions` |
-| `get::<T>()` | `extensions().get::<T>()` 的簡寫 |
-
-每個元件看到的是**它被建構當下**的 request：快照在 request-scoped 的 guard、interceptor 或 handler 建構前建立，並在每個 guard 與 interceptor 之後作廢，下一個需要的元件會重新拍一份；已建構的元件保留自己拿到的快照。因此 **guard 寫進 extensions 的資料，對排在它後面建構的元件（包含 controller 及其依賴）可見**。
-
-## Scope 會傳染
-
-依賴 request-scoped provider 的元件，自己也會變成 request-scoped（和 Nest 相同），一路往上傳到 controller：
-
-```rust
-use hornero::prelude::*;
-
-#[derive(Clone)]
-struct UserId(String);
-
-#[derive(Injectable)]
-struct IdentityGuard;
-
-impl Guard for IdentityGuard {
-    async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
-        let user = ctx
-            .parts
-            .headers
-            .get("x-user")
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| HttpError::unauthorized("missing x-user header"))?;
-        ctx.parts.extensions.insert(UserId(user.to_owned()));
-        Ok(())
-    }
-}
-
-/// 每個 request 一個：目前的使用者
-struct CurrentUser {
-    id: String,
-}
-
-#[injectable(scope = request)]
-impl CurrentUser {
-    fn new(ctx: Arc<RequestContext>) -> Result<Self, BoxError> {
-        let id = ctx.get::<UserId>().ok_or("no user in the request")?;
-        Ok(Self { id: id.0.clone() })
-    }
-}
-
-/// 沒有宣告 scope，但依賴 CurrentUser，所以被傳染成 request-scoped
-#[derive(Injectable)]
-struct Greeter {
-    user: Arc<CurrentUser>,
-}
-
-impl Greeter {
-    fn greet(&self) -> String {
-        format!("hello, {}", self.user.id)
-    }
-}
-
-#[controller("/greet")]
-#[guards(IdentityGuard)]
-struct GreetController {
-    greeter: Arc<Greeter>,
-}
-
-#[routes]
-impl GreetController {
-    #[get("/")]
-    fn greet(&self) -> String {
-        self.greeter.greet()
-    }
-}
-
-#[module(controllers = [GreetController], providers = [CurrentUser, Greeter, IdentityGuard])]
-struct AppModule;
-
-# #[tokio::main(flavor = "current_thread")]
-# async fn main() {
-// 不用啟動就能看到哪些東西變成了 request-scoped，以及原因
-let report = Hornero::new(AppModule).validate().unwrap();
-assert_eq!(
-    report.to_string(),
-    "  CurrentUser (in AppModule): declared request-scoped
-  Greeter (in AppModule): request-scoped via Greeter -> CurrentUser [request]
-  GreetController (in AppModule): request-scoped via GreetController -> Greeter -> CurrentUser [request]
-"
-);
-
-let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
-let client = app.client();
-assert_eq!(client.get("/greet").header("x-user", "ada").await.text(), "hello, ada");
-assert_eq!(client.get("/greet").header("x-user", "bob").await.text(), "hello, bob");
-# }
-```
-
-傳染很方便：深層的 service 可以直接拿到目前的使用者，不必一層層傳參數。但它也是隱性的效能懸崖：一個深層依賴改成 request scope，整條鏈都會在每個 request 重建。所以 hornero 讓傳染**看得見**：
-
-- **scope report**：啟動時用 `tracing::info!` 輸出每個 request-scoped 元件與傳染鏈。
-- **可斷言**：`Hornero::validate()` 與 `App::scope_report()` 回傳 `ScopeReport`，可以在測試中檢查，例如 `assert!(report.find("TodoController").is_none())`，避免 controller 意外變成 request-scoped。
-
-## 傳染的限制
-
-以下情況會在啟動時回報 `scope violation`：
-
-**middleware 與 mount 不能變成 request-scoped**：它們在啟動時就要實例化。
-
-```text
-[1] scope violation
-    middleware ScopedMiddleware (in App) cannot be request-scoped.
-    chain: ScopedMiddleware -> RequestId [request]
-```
-
-**有生命週期 hook 的 provider 必須是 singleton**：Nest 會靜默地不呼叫 hook，hornero 改為直接報錯。
-
-```text
-[1] scope violation
-    Hooked (in App) has lifecycle hooks but is request-scoped; hooks only run on singletons.
-    chain: Hooked -> AuditLog [request]
-```
-
-**明確宣告了 scope 的 provider 不會被傳染**：寫了 `scope = ...` 就是一個承諾。如果它依賴 request-scoped 的東西，啟動會失敗，而不是悄悄改變 scope。這是讓你自選的防護欄：
-
-```rust
-use hornero::prelude::*;
-
-#[derive(Injectable)]
-#[inject(scope = request)]
-struct AuditLog;
-
-#[derive(Injectable)]
-#[inject(scope = singleton)] // 承諾：這個 service 永遠是 singleton
-struct ReportService {
-    audit: Arc<AuditLog>,
-}
-
-#[module(providers = [AuditLog, ReportService])]
-struct AppModule;
-
-let err = Hornero::new(AppModule).validate().unwrap_err();
-assert!(err.to_string().contains(
-    "ReportService (in AppModule) is pinned to singleton scope but depends on a request-scoped provider."
-));
-```
-
-手寫的 provider 用 `ProviderDef::pinned()` 或 `const SCOPE_PINNED: bool = true` 達到相同效果。
 
 ## Transient
 
@@ -236,15 +84,358 @@ assert_ne!(orders.trace.0, billing.trace.0);
 # }
 ```
 
-transient 不會讓依賴它的元件改變 scope；但 transient provider 本身若依賴 request-scoped 的東西，就會被傳染成 request-scoped。
+依賴 transient provider 的元件不會改變 scope：它們各自持有一個實例，在啟動時建構好。
 
-## Runtime 行為與成本
+## Scope 的限制
 
-- **純 singleton 的路由零成本**：只有路由鏈上確實有 request-scoped 元件時，hornero 才會為該路由加上 request scope。
-- **lazy 建構**：request-scoped 元件在該 request 第一次需要時才建構，之後在同一個 request 內共用。
-- **建構失敗會變成 500**：request-scoped 元件在 request 期間建構失敗時，client 會收到不透露細節的 `500 failed to construct a request-scoped component`，真正的原因寫在 log。這個錯誤也會經過 exception filter。
-- **request-scoped guard 依賴 `RequestContext` 時**，它拿到的是執行前的快照，看不到排在它後面的 guard 寫入的資料；但這不影響其他元件，它們各自在建構時重新取得快照，所以後面的 guard 與 handler 端的元件仍然看得到。
+以下情況需要唯一的實例，宣告成 transient 會在啟動時回報 `scope violation`：
 
-## 什麼時候不該用 request scope
+**有生命週期 hook 的 provider 必須是 singleton**：Nest 會靜默地不呼叫 hook，hornero 改為直接報錯。
 
-如果只有 handler 需要 request 資料，**extractor 通常是更好的選擇**：它不會傳染、沒有額外成本，而且型別本身就證明資料存在（例如 `user: AuthUser`）。等到很多深層 service 都需要同一份 request 資料、層層傳參數已經變得痛苦時，再改用 request-scoped provider。
+```text
+[1] scope violation
+    Ephemeral (in App) has lifecycle hooks but is transient; hooks only run on singletons.
+```
+
+**controller 必須是 singleton**：路由在啟動時組裝，controller 只建構一次，由所有 request 共用。
+
+```text
+[1] scope violation
+    Ephemeral (in App) cannot be transient; a controller is built once, during bootstrap.
+```
+
+guard、interceptor、filter 與 middleware 可以是 transient：每個用到它的模組各有一個實例，同樣在啟動時建構。
+
+## Request 資料
+
+request 的資料放在 request 自己身上：guard、interceptor 與 middleware 把資料寫進 extensions，handler 用 extractor 讀取。
+
+### 在 handler 讀取，再傳給 service
+
+```rust
+use hornero::axum::extract::FromRequestParts;
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+
+/// 已驗證的呼叫者。handler 參數裡有它，就證明 request 通過了 IdentityGuard。
+#[derive(Clone)]
+struct CurrentUser {
+    name: String,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
+    type Rejection = HttpError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, HttpError> {
+        parts
+            .extensions
+            .get::<CurrentUser>()
+            .cloned()
+            .ok_or_else(|| HttpError::unauthorized("not authenticated"))
+    }
+}
+
+/// 假裝是資料庫
+struct Directory;
+
+impl Directory {
+    fn find(&self, token: &str) -> Option<CurrentUser> {
+        (token == "ada-token").then(|| CurrentUser { name: "ada".into() })
+    }
+}
+
+#[derive(Injectable)]
+struct IdentityGuard {
+    directory: Arc<Directory>,
+}
+
+impl Guard for IdentityGuard {
+    async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        let user = ctx
+            .parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.directory.find(token))
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))?;
+        ctx.parts.extensions.insert(user);
+        Ok(())
+    }
+}
+
+/// 不保存 request 的狀態：使用者由參數傳入，所以一個實例可以服務所有 request
+#[derive(Injectable)]
+struct Greeter;
+
+impl Greeter {
+    fn greet(&self, user: &CurrentUser) -> String {
+        format!("hello, {}", user.name)
+    }
+}
+
+#[controller("/greet")]
+#[guards(IdentityGuard)]
+struct GreetController {
+    greeter: Arc<Greeter>,
+}
+
+#[routes]
+impl GreetController {
+    #[get("/")]
+    fn greet(&self, user: CurrentUser) -> String {
+        self.greeter.greet(&user)
+    }
+}
+
+#[module(
+    controllers = [GreetController],
+    providers = [Greeter, IdentityGuard, value(Directory)],
+)]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+let client = app.client();
+assert_eq!(client.get("/greet").header("x-token", "ada-token").await.text(), "hello, ada");
+assert_eq!(client.get("/greet").await.status(), StatusCode::UNAUTHORIZED);
+# }
+```
+
+幾個重點：
+
+- **handler 簽名就是依賴宣告**：`user: CurrentUser` 表示這個 handler 需要已驗證的使用者，型別本身就證明資料存在。
+- **service 用參數接收 request 資料**：呼叫鏈上每一層都看得到自己依賴什麼。如果很多方法都要同一份資料，把它們包成一個 context struct 傳遞，一樣不需要進依賴圖。
+- **guard 負責擋下 request**：`IdentityGuard` 是 provider，可以注入 `Directory`；驗證失敗的 request 不會進 handler，通過時把結果寫進 extensions，extractor 只負責讀出來。結果只有 handler 需要，或不是每條路由都需要時，改用下一節的 `Extractor`。
+
+### 需要 provider 的 extractor
+
+axum extractor 只看得到 request：handler 的 state 是 `()`，所以它拿不到 provider。需要依賴時實作 `Extractor`：它是 provider，看得到 request，handler 用 `Extracted<E>` 參數取得結果。
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+
+#[derive(Clone)]
+struct User {
+    name: String,
+}
+
+/// 假裝是資料庫
+struct Users;
+
+impl Users {
+    async fn by_token(&self, token: &str) -> Option<User> {
+        (token == "ada-token").then(|| User { name: "ada".into() })
+    }
+}
+
+/// 依 token 載入目前的使用者
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<User, HttpError> {
+        let token = parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| HttpError::unauthorized("missing token"))?;
+        self.users
+            .by_token(token)
+            .await
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    fn me(&self, Extracted(user): Extracted<CurrentUser>) -> String {
+        user.name
+    }
+
+    /// 沒有這個參數，所以不會查資料庫
+    #[get("/ping")]
+    fn ping(&self) -> &'static str {
+        "pong"
+    }
+}
+
+#[module(controllers = [MeController], providers = [value(Users)])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+let client = app.client();
+assert_eq!(client.get("/me").header("x-token", "ada-token").await.text(), "ada");
+assert_eq!(client.get("/me").await.status(), StatusCode::UNAUTHORIZED);
+assert_eq!(client.get("/me/ping").await.text(), "pong");
+# }
+```
+
+幾個重點：
+
+- **參數本身就是宣告**：路由從 handler 的簽名得知 `CurrentUser`，和 `#[guards]` 一樣在 controller 的模組裡解析：看得到 provider 就用那個實例，否則建立一個私有的。依賴缺少是 bootstrap 錯誤，不會等到 request。宣告來自型別而不是 macro，所以 `type Me = Extracted<CurrentUser>` 這種 alias 與手寫路由一樣會被驗證。
+- **只有要求它的 handler 才執行**：上例的 `/me/ping` 不會查資料庫。放在 guard 裡的話，每個經過 guard 的 request 都會查。
+- **在 guard 與 interceptor 之後執行**：看得到它們寫進 extensions 的資料。回傳的 `Err` 就是回應，和 guard 的錯誤一樣會經過 exception filter。
+- **不讀 body**：後面的參數仍然可以是 `Json<T>`。
+- **只能用在 controller handler**：`Extracted<E>` 不是 axum extractor，所以不能放進 mount 的 axum router，也不能包在 `Option` 裡。資料可有可無時，把 `Output` 設成 `Option<User>`。
+
+需要 state 的 axum extractor 不能直接當參數，把它包進 `Extractor` 就能用，例如 axum-extra 的 `PrivateCookieJar` 可以注入 `Key`，再呼叫 `PrivateCookieJar::from_headers(&parts.headers, key)`。
+
+### 同一個 request 共用的資源
+
+`Extractor` 每個參數執行一次，實例也由所有 request 共用，所以不能把 request 的狀態存在 `self`。要在同一個 request 內重複使用結果，把它放進 extensions；要建立在另一個 extractor 之上，就直接注入它：
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+
+#[derive(Clone)]
+struct User {
+    tenant: u64,
+}
+
+/// 假裝是資料庫
+struct Users;
+
+impl Users {
+    async fn load(&self) -> User {
+        User { tenant: 7 }
+    }
+}
+
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<User, HttpError> {
+        if let Some(user) = parts.extensions.get::<User>() {
+            return Ok(user.clone());
+        }
+        let user = self.users.load().await;
+        parts.extensions.insert(user.clone());
+        Ok(user)
+    }
+}
+
+/// 它依賴 CurrentUser，所以 CurrentUser 要註冊在 providers 裡
+#[derive(Injectable)]
+struct CurrentTenant {
+    user: Arc<CurrentUser>,
+}
+
+impl Extractor for CurrentTenant {
+    type Output = u64;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<u64, HttpError> {
+        Ok(self.user.extract(parts).await?.tenant)
+    }
+}
+
+#[controller("/report")]
+struct ReportController;
+
+#[routes]
+impl ReportController {
+    /// 兩個參數只查一次資料庫
+    #[get("/")]
+    fn report(
+        &self,
+        Extracted(user): Extracted<CurrentUser>,
+        Extracted(tenant): Extracted<CurrentTenant>,
+    ) -> String {
+        format!("{} {tenant}", user.tenant)
+    }
+}
+
+#[module(controllers = [ReportController], providers = [value(Users), CurrentUser])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+assert_eq!(app.client().get("/report").await.text(), "7 7");
+# }
+```
+
+extensions 裡的值必須是 `Clone`。交易這類不能複製的資源，讓 `Output` 就是它本身：handler 取得所有權，用 `&mut` 傳給 service，最後自己 commit。
+
+### 依 request 資料呈現錯誤
+
+exception filter 只看得到錯誤與路由：它執行時 request 已經被 handler 消耗了。回應要依 request 的內容變化時，改用手上還有 request 的 interceptor 或 middleware：在 `next.run` 之前讀好需要的資料，之後用 `HttpError::in_response` 取得錯誤。
+
+```rust
+use hornero::axum::body::Body;
+use hornero::axum::extract::Request;
+use hornero::axum::http::HeaderValue;
+use hornero::axum::http::header::{ACCEPT, CONTENT_TYPE};
+use hornero::axum::middleware::Next;
+use hornero::prelude::*;
+
+/// 瀏覽器要 HTML 時，把錯誤渲染成頁面
+#[derive(Injectable)]
+struct HtmlErrors;
+
+impl Middleware for HtmlErrors {
+    async fn handle(&self, req: Request, next: Next) -> Response {
+        let wants_html = req.headers().get(ACCEPT).is_some_and(|value| value == "text/html");
+        let mut response = next.run(req).await;
+        if wants_html && let Some(err) = HttpError::in_response(&response) {
+            let page = format!("<h1>{}</h1>", err.message());
+            response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            *response.body_mut() = Body::from(page);
+        }
+        response
+    }
+}
+
+#[controller("/orders")]
+struct OrderController;
+
+#[routes]
+impl OrderController {
+    #[get("/{id}")]
+    fn find(&self, Path(id): Path<u64>) -> Result<String, HttpError> {
+        Err(HttpError::not_found(format!("order {id} not found")))
+    }
+}
+
+#[module(controllers = [OrderController], middlewares = [HtmlErrors])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
+let client = app.client();
+
+let page = client.get("/orders/7").header("accept", "text/html").await;
+assert_eq!(page.status(), StatusCode::NOT_FOUND);
+assert_eq!(page.text(), "<h1>order 7 not found</h1>");
+
+let problem: serde_json::Value = client.get("/orders/7").await.json();
+assert_eq!(problem["detail"], "order 7 not found");
+# }
+```
+
+| 用 | 看得到 | 看不到 |
+|---|---|---|
+| interceptor | guard 寫入的資料（例如已驗證的使用者） | guard 的拒絕：被擋下的 request 不會經過 interceptor |
+| middleware | 所有錯誤，包括 guard 的 401 / 403 | guard 寫入的資料：request 在 middleware 交出去之後才經過 guard |
+
+像上例這樣原地修改 response，`HttpError` 會留在 response 上，5xx 的 log 照常記錄。回傳全新的 response 則會連 `HttpError` 一起丟掉，這筆 5xx 就不會被 hornero 記錄。interceptor 在 filter 內層，所以錯誤還留在 response 上時，route 上的 filter 仍會接手渲染。
+
+有一種情況兩邊都不夠：前一個 guard 寫入了使用者，後一個 guard 拒絕 request，而回應又要用到使用者。interceptor 看不到這個拒絕，middleware 看不到使用者。這時由拒絕的 guard 把需要的資料放進錯誤，例如 `HttpError::forbidden("...").with_details(...)`。

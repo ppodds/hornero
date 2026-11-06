@@ -159,11 +159,7 @@ impl Guard for AllowAll {
 // ANCHOR: validate
 #[test]
 fn the_dependency_graph_is_valid() {
-    let report = Hornero::new(AppModule).validate().unwrap();
-    assert!(
-        report.is_empty(),
-        "nothing should be request-scoped:\n{report}"
-    );
+    Hornero::new(AppModule).validate().unwrap();
 }
 // ANCHOR_END: validate
 

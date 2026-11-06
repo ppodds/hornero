@@ -9,6 +9,7 @@ use std::any::type_name;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use super::extractor::{ErasedExtractor, Extractor};
 use super::filter::{ErasedFilter, ExceptionFilter};
 use super::guard::{ErasedGuard, Guard};
 use super::interceptor::{ErasedInterceptor, Interceptor};
@@ -26,6 +27,7 @@ pub(crate) enum EnhancerKind {
     Interceptor,
     Filter,
     Middleware,
+    Extractor,
 }
 
 impl EnhancerKind {
@@ -35,6 +37,7 @@ impl EnhancerKind {
             EnhancerKind::Interceptor => "interceptor",
             EnhancerKind::Filter => "filter",
             EnhancerKind::Middleware => "middleware",
+            EnhancerKind::Extractor => "extractor",
         }
     }
 }
@@ -65,11 +68,16 @@ pub(crate) struct GuardSlot<G>(PhantomData<fn() -> G>);
 pub(crate) struct InterceptorSlot<I>(PhantomData<fn() -> I>);
 pub(crate) struct FilterSlot<F>(PhantomData<fn() -> F>);
 pub(crate) struct MiddlewareSlot<M>(PhantomData<fn() -> M>);
+pub(crate) struct ExtractorSlot<E>(PhantomData<fn() -> E>);
 
 /// The key of the slot `S` for the enhancer `E`, named after `E` in diagnostics (an unused
 /// `override_guard::<E>()` reports `E`, not the slot type).
 fn slot_key<S: 'static, E: 'static>() -> Key {
     Key::of::<S>().displayed_as::<E>()
+}
+
+pub(crate) fn extractor_slot_key<E: 'static>() -> Key {
+    slot_key::<ExtractorSlot<E>, E>()
 }
 
 /// A reference to an enhancer type, resolved into a slot node during bootstrap.
@@ -179,6 +187,28 @@ impl EnhancerRef {
             describe: <M as Injectable>::describe,
         }
     }
+
+    pub(crate) fn extractor<E: Extractor + Injectable>() -> Self {
+        Self {
+            kind: EnhancerKind::Extractor,
+            name: short_type_name(type_name::<E>()),
+            token: "Extractor",
+            slot_key: extractor_slot_key::<E>(),
+            target_key: Key::of::<E>(),
+            make_slot: || {
+                ProviderDef::from_fn::<dyn ErasedExtractor<E::Output>, _, _>(
+                    vec![Key::of::<E>()],
+                    |r| {
+                        let extractor = r.get::<E>();
+                        async move { Ok(extractor? as Arc<dyn ErasedExtractor<E::Output>>) }
+                    },
+                )
+                .with_key(extractor_slot_key::<E>())
+            },
+            make_target: ProviderDef::injectable::<E>,
+            describe: <E as Injectable>::describe,
+        }
+    }
 }
 
 /// A replacement for an enhancer slot, registered through `Hornero::override_guard` and friends.
@@ -199,5 +229,13 @@ pub(crate) fn interceptor_override<I: 'static>(
 pub(crate) fn filter_override<F: 'static>(filter: impl ExceptionFilter) -> (Key, ProviderDef) {
     let key = slot_key::<FilterSlot<F>, F>();
     let erased: Arc<dyn ErasedFilter> = Arc::new(filter);
+    (key, ProviderDef::from_arc(erased).with_key(key))
+}
+
+pub(crate) fn extractor_override<E: Extractor>(
+    extractor: impl Extractor<Output = E::Output>,
+) -> (Key, ProviderDef) {
+    let key = extractor_slot_key::<E>();
+    let erased: Arc<dyn ErasedExtractor<E::Output>> = Arc::new(extractor);
     (key, ProviderDef::from_arc(erased).with_key(key))
 }

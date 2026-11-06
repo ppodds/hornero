@@ -262,13 +262,13 @@ impl Builder {
         )
     }
 
-    /// The security requirement of every guard on `route` that describes a scheme and requires
-    /// it there: all of them must be met.
+    /// The security requirement of every guard and extractor on `route` that describes a scheme
+    /// and requires it there: all of them must be met.
     fn security(&mut self, route: &RouteInfo) -> Option<Vec<SecurityRequirement>> {
         let mut requirement: Option<SecurityRequirement> = None;
         let mut names: Vec<&str> = Vec::new();
-        for guard in route.guards() {
-            let Some(security) = guard.meta::<SecurityDoc>() else {
+        for enhancer in route.guards().iter().chain(route.extractors()) {
+            let Some(security) = enhancer.meta::<SecurityDoc>() else {
                 continue;
             };
             if !(security.required)(route) {
@@ -282,8 +282,8 @@ impl Builder {
                 Some(existing) if *existing == scheme => {}
                 Some(_) => {
                     let message = format!(
-                        "guard `{}` describes a security scheme named `{name}` that differs from the one already registered under that name; the first one is kept",
-                        guard.name()
+                        "`{}` describes a security scheme named `{name}` that differs from the one already registered under that name; the first one is kept",
+                        enhancer.name()
                     );
                     self.push_warning(message);
                 }

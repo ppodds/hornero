@@ -9,10 +9,13 @@ use crate::util::BoxFuture;
 /// Re-renders [`HttpError`] responses, Nest's exception filters.
 ///
 /// Rust has no exceptions: handlers return `Result<_, HttpError>`, and filters see every
-/// response that carries an `HttpError` (from handlers, guards, or failed request-scoped
-/// construction). One filter handles each error: the most specific one that
-/// [`catches`](ExceptionFilter::catches) it, looking at handler, then controller, then global
-/// filters, each level in registration order. When none does, the error renders as is.
+/// response that carries an `HttpError`, whichever stage produced it. One filter handles each
+/// error: the most specific one that [`catches`](ExceptionFilter::catches) it, looking at handler,
+/// then controller, then global filters, each level in registration order. When none does, the
+/// error renders as is.
+///
+/// A filter runs after the request is gone, so it only sees the error and the route. To render an
+/// error from request data, see [`HttpError::in_response`].
 ///
 /// Domain errors raised with `?` arrive as 500s whose source is the original error, so a filter
 /// that catches them by type turns them into proper responses:

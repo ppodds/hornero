@@ -14,7 +14,7 @@ NestJS 風格的框架很容易長出自己的 `Request` / `Response` / `Context
 - 不需要 DI 的 middleware 直接用 tower layer（`Hornero::layer`、`ModuleDef::layer`），例如 `TraceLayer`、`CorsLayer`。
 - 所有 enhancer 最終都編譯成 `axum::middleware::from_fn` 或 tower layer；hornero 不引入另一套執行模型。
 - 任何既有的 axum `Router` 都能掛進模組（`mount_router`、可注入依賴的 `mount`），作為 L0 遷移路徑。
-- Controller 不使用 axum state（`Router<()>`）：依賴在啟動時注入 controller，handler 閉包持有 controller 的 `Handle`。
+- Controller 不使用 axum state（`Router<()>`）：依賴在啟動時注入 controller，handler 閉包持有 controller 的 `Arc`。
 
 ## 後果
 

@@ -11,26 +11,26 @@ use axum::Router;
 use axum::extract::Request;
 use axum::http::Method;
 use axum::response::{IntoResponse, Response};
-use axum::routing::Route;
+use axum::routing::{Route, on};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_util::sync::CancellationToken;
 use tower::util::MapResponse;
 use tower::{Layer, Service};
 use tower_http::catch_panic::CatchPanicLayer;
 
-use crate::di::graph::{GlobalEnhancers, Graph, ScopeReport};
+use crate::di::graph::{GlobalEnhancers, Graph};
 use crate::di::injectable::{Injectable, Scope};
 use crate::di::key::Instance;
 use crate::di::key::Key;
 use crate::di::module::{LayerFn, Module};
 use crate::di::provider::ProviderDef;
 use crate::di::runtime::Runtime;
-use crate::di::scope::{ErasedHandle, Handle, HandleInner};
 use crate::error::{BootError, HttpError, Problem, ShutdownError};
 use crate::lifecycle::{ErasedLifecycle, Hook, Shutdown};
 use crate::util::BoxError;
 use crate::web::cancel::{self, Cancellable};
 use crate::web::enhancer::{self, EnhancerKind, EnhancerRef};
+use crate::web::extractor::{Extractor, RouteExtractors};
 use crate::web::filter::ExceptionFilter;
 use crate::web::guard::Guard;
 use crate::web::interceptor::Interceptor;
@@ -186,6 +186,17 @@ impl Hornero {
         self
     }
 
+    /// Replaces every use of the extractor `E` with `extractor`, which may be any [`Extractor`]
+    /// with the same output.
+    pub fn override_extractor<E: Extractor>(
+        mut self,
+        extractor: impl Extractor<Output = E::Output>,
+    ) -> Self {
+        self.overrides
+            .push(enhancer::extractor_override::<E>(extractor));
+        self
+    }
+
     /// Validates the module graph without constructing anything: visibility, missing and
     /// ambiguous dependencies, cycles, scope rules and route conflicts.
     ///
@@ -193,13 +204,13 @@ impl Hornero {
     /// for the controller routes and the real routers of `mount_router`, so conflicts axum
     /// itself rejects are caught here as well. Routers from factory `mount(..)` need DI and are
     /// only checked by [`build`](Self::build).
-    pub fn validate(&self) -> Result<ScopeReport, BootError> {
+    pub fn validate(&self) -> Result<(), BootError> {
         let mut graph = self.graph(Shutdown::new())?;
         check_routes(&graph, &self.prefix)?;
         let _dry_run =
             catch_assembly(|| assemble(&mut graph, None, &self.global, Vec::new(), &self.prefix))
                 .map_err(|problem| BootError::new(vec![problem]))?;
-        Ok(graph.report)
+        Ok(())
     }
 
     /// Lists every controller route, like [`validate`](Self::validate) without constructing
@@ -231,14 +242,14 @@ impl Hornero {
         let shutdown = Shutdown::new();
         let mut graph = self.graph(shutdown.clone())?;
         check_routes(&graph, &self.prefix)?;
-        let rt = Arc::new(graph.runtime());
+        let rt = graph.runtime();
 
         let mut lifecycles = Vec::new();
         for &node in &graph.order {
             if rt.nodes[node].scope != Scope::Singleton {
                 continue;
             }
-            let built = match rt.instantiate(node, None).await {
+            let built = match rt.instantiate(node).await {
                 Ok(built) => built,
                 Err(err) => {
                     let problem = Problem::Construction {
@@ -281,9 +292,6 @@ impl Hornero {
             }
         }
 
-        if !graph.report.is_empty() {
-            tracing::info!("request-scoped components:\n{}", graph.report);
-        }
         for (idx, node) in graph.nodes.iter().enumerate() {
             for key in &node.absent {
                 tracing::debug!(consumer = %graph.describe(idx), dependency = %key, "optional dependency is not provided");
@@ -297,7 +305,6 @@ impl Hornero {
             lifecycles,
             shutdown,
             shutdown_timeout: self.shutdown_timeout,
-            report: graph.report,
             routes: graph.routes,
         })
     }
@@ -364,12 +371,11 @@ impl std::error::Error for BindFailed {
 /// A bootstrapped application.
 pub struct App {
     router: Router,
-    rt: Arc<Runtime>,
+    rt: Runtime,
     singletons: HashMap<Key, usize>,
     lifecycles: Vec<(Arc<str>, Arc<dyn ErasedLifecycle>)>,
     shutdown: Shutdown,
     shutdown_timeout: Duration,
-    report: ScopeReport,
     routes: Arc<Routes>,
 }
 
@@ -377,11 +383,6 @@ impl App {
     /// The assembled axum router. Cheap to clone.
     pub fn router(&self) -> Router {
         self.router.clone()
-    }
-
-    /// Every request-scoped component and why it is request-scoped.
-    pub fn scope_report(&self) -> &ScopeReport {
-        &self.report
     }
 
     /// Every controller route; see [`Routes`].
@@ -588,7 +589,7 @@ fn check_routes(graph: &Graph, prefix: &str) -> Result<(), BootError> {
             for route in &controller.routes {
                 let path = join_paths(&[prefix, &controller.prefix, &route.path]);
                 let handler = format!("{}::{}", controller.name, route.name);
-                if !route.method_supported {
+                if route.filter.is_none() {
                     problems.push(Problem::InvalidRoute {
                         handler: handler.clone(),
                         reason: format!(
@@ -630,30 +631,24 @@ fn check_routes(graph: &Graph, prefix: &str) -> Result<(), BootError> {
     }
 }
 
-fn erased_handle(rt: &Arc<Runtime>, node: usize) -> ErasedHandle {
-    if rt.nodes[node].scope == Scope::Singleton {
-        let instance = rt.singletons[node]
-            .get()
-            .expect("singletons are constructed before routes are assembled")
-            .clone();
-        ErasedHandle(HandleInner::Ready(instance))
-    } else {
-        ErasedHandle(HandleInner::Lazy {
-            rt: rt.clone(),
-            node,
-        })
-    }
+/// The instance bootstrap constructed for `node`.
+fn singleton(rt: &Runtime, node: usize) -> &Instance {
+    rt.singletons[node]
+        .get()
+        .expect("singletons are constructed before routes are assembled")
 }
 
-fn slot_handles<T: ?Sized + Send + Sync + 'static>(
+fn slot_instances<T: ?Sized + Send + Sync + 'static>(
     graph: &Graph,
-    rt: &Arc<Runtime>,
+    rt: &Runtime,
     refs: impl IntoIterator<Item = (usize, EnhancerRef)>,
-) -> Vec<Handle<T>> {
+) -> Vec<Arc<T>> {
     refs.into_iter()
         .map(|(module, enhancer)| {
             let node = graph.modules[module].slots[&enhancer.slot_key];
-            Handle::from_erased(erased_handle(rt, node))
+            singleton(rt, node)
+                .downcast::<T>()
+                .expect("a slot holds its enhancer")
         })
         .collect()
 }
@@ -666,13 +661,13 @@ fn catch_assembly(assemble: impl FnOnce() -> Router) -> Result<Router, Problem> 
     })
 }
 
-/// Assembles the route table. With a runtime this is the real router: enhancers, scopes, layers
-/// and the fallback. Without one (`Hornero::validate`) it is a dry run that registers the same
+/// Assembles the route table. With a runtime this is the real router: enhancers, layers and the
+/// fallback. Without one (`Hornero::validate`) it is a dry run that registers the same
 /// paths and methods with placeholder handlers and the real `mount_router` routers, which is all
 /// axum needs to report a conflict.
 fn assemble(
     graph: &mut Graph,
-    rt: Option<&Arc<Runtime>>,
+    rt: Option<&Runtime>,
     global: &GlobalEnhancers,
     layers: Vec<LayerFn>,
     prefix: &str,
@@ -706,6 +701,9 @@ fn assemble(
         for (node, controller) in controllers {
             for route in controller.routes {
                 let path = join_paths(&[prefix, &controller.prefix, &route.path]);
+                let filter = route
+                    .filter
+                    .expect("unsupported methods are rejected by check_routes");
                 let method_router = match rt {
                     Some(rt) => {
                         let mut meta = controller.meta.clone();
@@ -718,7 +716,7 @@ fn assemble(
                             meta,
                         });
 
-                        let guards = slot_handles::<dyn crate::web::guard::ErasedGuard>(
+                        let guards = slot_instances::<dyn crate::web::guard::ErasedGuard>(
                             graph,
                             rt,
                             global_guards
@@ -728,7 +726,7 @@ fn assemble(
                                 .chain(tagged(module, &route.guards)),
                         );
                         let interceptors =
-                            slot_handles::<dyn crate::web::interceptor::ErasedInterceptor>(
+                            slot_instances::<dyn crate::web::interceptor::ErasedInterceptor>(
                                 graph,
                                 rt,
                                 global_interceptors
@@ -738,7 +736,7 @@ fn assemble(
                                     .chain(tagged(module, &route.interceptors)),
                             );
                         // Most specific first; the first filter that catches an error handles it.
-                        let filters = slot_handles::<dyn crate::web::filter::ErasedFilter>(
+                        let filters = slot_instances::<dyn crate::web::filter::ErasedFilter>(
                             graph,
                             rt,
                             tagged(module, &route.filters)
@@ -746,14 +744,22 @@ fn assemble(
                                 .chain(global_filters.iter().cloned()),
                         );
 
-                        let controller_handle = erased_handle(rt, node);
-                        let handler_needs_context = controller_handle.0.needs_context();
-                        let needs_scope = controller_handle.0.needs_scope()
-                            || guards.iter().any(Handle::needs_scope)
-                            || interceptors.iter().any(Handle::needs_scope)
-                            || filters.iter().any(Handle::needs_scope);
+                        let extractors: Vec<(Key, Instance)> = route
+                            .extractors
+                            .iter()
+                            .map(|enhancer| {
+                                let slot = graph.modules[module].slots[&enhancer.slot_key];
+                                (enhancer.slot_key, singleton(rt, slot).clone())
+                            })
+                            .collect();
 
-                        let mut method_router = (route.build)(controller_handle);
+                        let mut method_router = (route.build)(singleton(rt, node), filter);
+                        if !extractors.is_empty() {
+                            method_router = pipeline::with_extractors(
+                                method_router,
+                                RouteExtractors::new(extractors),
+                            );
+                        }
                         for interceptor in interceptors.into_iter().rev() {
                             method_router =
                                 pipeline::with_interceptor(method_router, interceptor, ctx.clone());
@@ -766,19 +772,10 @@ fn assemble(
                             method_router =
                                 pipeline::with_filters(method_router, filters, ctx.clone());
                         }
-                        if needs_scope {
-                            method_router = pipeline::with_scope(
-                                method_router,
-                                rt.clone(),
-                                handler_needs_context,
-                            );
-                        }
                         pipeline::with_problem_405(method_router)
                     }
-                    // Dry run: the placeholder handle is never used, handlers only run on requests.
-                    None => (route.build)(ErasedHandle(HandleInner::Ready(Instance::new(
-                        Arc::new(()),
-                    )))),
+                    // Dry run: nothing was constructed, and axum only looks at the path and method.
+                    None => on(filter, || async {}),
                 };
                 router = router.route(&path, method_router);
             }
@@ -807,7 +804,7 @@ fn assemble(
             router = apply_layers(
                 router,
                 std::mem::take(&mut graph.modules[module].layers),
-                slot_handles(
+                slot_instances(
                     graph,
                     rt,
                     tagged(module, &graph.modules[module].middlewares),
@@ -832,7 +829,7 @@ fn assemble(
     app = apply_layers(
         app,
         layers,
-        slot_handles(graph, rt, tagged(root, &global.middlewares)),
+        slot_instances(graph, rt, tagged(root, &global.middlewares)),
     );
     // Outermost, so every 5xx is logged exactly once.
     pipeline::log_server_errors(app)
@@ -846,7 +843,7 @@ fn tagged(module: usize, refs: &[EnhancerRef]) -> impl Iterator<Item = (usize, E
 fn apply_layers(
     mut router: Router,
     layers: Vec<LayerFn>,
-    middlewares: Vec<Handle<dyn crate::web::middleware::ErasedMiddleware>>,
+    middlewares: Vec<Arc<dyn crate::web::middleware::ErasedMiddleware>>,
 ) -> Router {
     for layer in layers.into_iter().rev() {
         router = layer(router);

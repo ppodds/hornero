@@ -11,8 +11,8 @@ use super::handler::RouteHandler;
 use super::interceptor::Interceptor;
 use super::route::Metadata;
 use crate::di::injectable::Injectable;
+use crate::di::key::Instance;
 use crate::di::provider::ProviderDef;
-use crate::di::scope::{ErasedHandle, Handle};
 use crate::util::short_type_name;
 
 /// A group of routes backed by an injectable struct.
@@ -60,6 +60,9 @@ pub struct ControllerDef<C> {
     _controller: PhantomData<fn() -> C>,
 }
 
+/// Builds the method router of a route from the controller instance.
+type BuildRoute = Box<dyn FnOnce(&Instance, MethodFilter) -> MethodRouter + Send>;
+
 /// One route registered on a controller. Handler-level enhancers and metadata go here.
 pub struct RouteDef {
     pub(crate) method: Method,
@@ -68,10 +71,12 @@ pub struct RouteDef {
     pub(crate) guards: Vec<EnhancerRef>,
     pub(crate) interceptors: Vec<EnhancerRef>,
     pub(crate) filters: Vec<EnhancerRef>,
+    /// What the handler's `Extracted` parameters need, declared by its signature.
+    pub(crate) extractors: Vec<EnhancerRef>,
     pub(crate) meta: Metadata,
-    /// `false` for methods axum's router cannot match; reported by the bootstrap.
-    pub(crate) method_supported: bool,
-    pub(crate) build: Box<dyn FnOnce(ErasedHandle) -> MethodRouter + Send>,
+    /// `None` for methods axum's router cannot match; reported by the bootstrap.
+    pub(crate) filter: Option<MethodFilter>,
+    pub(crate) build: BuildRoute,
 }
 
 pub(crate) struct ControllerEntry {
@@ -97,6 +102,7 @@ impl ControllerEntry {
                     .iter()
                     .chain(&route.interceptors)
                     .chain(&route.filters)
+                    .chain(&route.extractors)
             }))
     }
 }
@@ -161,7 +167,8 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
         self
     }
 
-    /// Registers a handler. `handler` receives `Arc<Self>` followed by any axum extractors.
+    /// Registers a handler. `handler` receives `Arc<Self>` followed by any axum extractors or
+    /// [`Extracted`](crate::Extracted) parameters.
     pub fn route<H, Args>(
         &mut self,
         method: Method,
@@ -173,20 +180,25 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
         H: RouteHandler<C, Args>,
     {
         let filter = MethodFilter::try_from(method.clone()).ok();
-        self.routes.push(RouteDef {
+        let mut route = RouteDef {
             method,
             path: path.into(),
             name,
             guards: Vec::new(),
             interceptors: Vec::new(),
             filters: Vec::new(),
+            extractors: Vec::new(),
             meta: Metadata::default(),
-            method_supported: filter.is_some(),
-            build: Box::new(move |handle: ErasedHandle| {
-                let filter = filter.expect("unsupported methods are rejected by the bootstrap");
-                handler.into_method_router(Handle::<C>::from_erased(handle), filter)
+            filter,
+            build: Box::new(move |controller, filter| {
+                let this = controller
+                    .downcast::<C>()
+                    .expect("a controller's node holds the controller");
+                handler.into_method_router(this, filter)
             }),
-        });
+        };
+        H::declare(&mut route);
+        self.routes.push(route);
         self.routes.last_mut().expect("route was just pushed")
     }
 
