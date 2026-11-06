@@ -38,7 +38,7 @@ fn dependency_graph_is_valid() {
         "AuditLog",
         "SeaOrmTodoRepo",
     ] {
-        assert!(report.find(name).is_none(), "{name} stays a singleton");
+        assert!(report.find(name).is_none(), "{name} is not request-scoped");
     }
 }
 
