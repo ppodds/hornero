@@ -7,8 +7,8 @@ use super::error::TodoErrorFilter;
 use super::service::TodoService;
 use crate::auth::{AuthGuard, AuthUser, Roles, RolesGuard};
 
-/// Handlers raise `TodoError` with `?`; `TodoErrorFilter` maps it, other errors reach the global
-/// `ProblemFilter`.
+/// Handlers raise `TodoError` with `?`; `TodoErrorFilter` maps it to a status, and every error
+/// renders through the application's format, `common::problem`.
 ///
 /// The OpenAPI document (`/docs`) is inferred from these signatures: `Path`, `Json` and `Valid`
 /// arguments, `Json` and `Result` return types, and doc comments. `#[api_response]` adds what the

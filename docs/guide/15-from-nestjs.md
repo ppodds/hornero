@@ -49,10 +49,10 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 | `{ provide: APP_GUARD, useClass: G }` | `providers = [AppGuard<G>]` | 在宣告的模組解析，可以依賴該模組私有的 provider；`Hornero::guard` 註冊的先執行，被 import 的模組先於 import 它的模組 |
 | `APP_INTERCEPTOR` / `APP_FILTER` | `AppInterceptor<I>` / `AppFilter<F>` | 同上；`Hornero::filter` 註冊的 filter 先比對 |
 | `@Roles('admin')`（`SetMetadata` + `Reflector`） | `#[meta(Roles(&["admin"]))]`，讀取 `ctx.route.meta::<Roles>()` | 以型別為 key，不需要自訂 decorator |
-| `NestInterceptor`（RxJS） | `Interceptor`：`async fn(ctx, req, next) -> Response` | |
-| `HttpException` | `HttpError` | 預設渲染成 problem+json |
-| `@Catch(TodoError)` + `ExceptionFilter` | `ExceptionFilter`，`catches` 回傳 `err.is::<TodoError>()` | 同一層裡先註冊的先比對，所以具體的 filter 要寫在 catch-all 前面（Nest 相反） |
-| `throw new TodoNotFound()` | `return Err(TodoError::NotFound(id))`，或在 handler 裡 `?` | 沒有 filter 接住就是 500 |
+| `NestInterceptor`（RxJS） | `Interceptor`：`async fn(ctx, req, next: CallHandler) -> Result<Response, HttpError>` | `next.handle(req).await` 回傳 `Result`，錯誤是 `Err` 值，不用 `catchError` |
+| `HttpException` | `HttpError` | 預設渲染成 problem+json；`Hornero::error_renderer` 換成自己的格式 |
+| `@Catch(TodoError)` + `ExceptionFilter` | `ExceptionFilter` 的 `type Error = TodoError` | `catch` 回傳 `HttpError`，格式交給 renderer；handler、controller、global 的順序，越具體越先處理 |
+| `throw new TodoNotFound()` | `return Err(TodoError::NotFound(id))?`，或對回傳 `TodoError` 的呼叫用 `?` | 沒有 filter 處理就是 500，log 會寫出錯誤的型別 |
 | `NestMiddleware` + `configure(consumer)` | `Middleware` + `middlewares = [..]`，或 tower layer | 不需要 DI 時直接用 tower-http |
 | `app.setGlobalPrefix('api')` | `Hornero::global_prefix("/api")` | |
 
@@ -71,9 +71,9 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 - **錯誤在啟動前出現**：缺少的依賴、不可見的 provider、循環、scope 違規、路由衝突，都會在 bind port 之前一次列出。`Hornero::validate()` 可以放進單元測試。
 - **衝突一律是錯誤**：同一模組重複註冊同一個 provider（Nest 會讓後者覆蓋前者），或兩個 import 都 export 同一個 provider（Nest 依 import 順序挑一個），在 hornero 都是 bootstrap 錯誤。
 - **沒有反射**：provider 的依賴寫在型別上（`Arc<T>` 欄位），metadata 以型別為 key。生命週期 hook 需要明確啟用，因為 Rust 沒有 specialization，hornero 無法自動發現 trait 實作。
-- **沒有 exception**：handler 回傳 `Result<_, HttpError>`，`?` 會把任何錯誤變成不透露細節的 500，原始錯誤保留下來，讓 exception filter 依型別轉成其他回應。
+- **沒有 exception**：guard、interceptor、extractor 與 handler 回傳 `Result`，錯誤以值往外傳。`?` 帶著 domain error 交給依型別處理的 exception filter，沒有 filter 時是不透露細節的 500。axum extractor 的 rejection 走同一條路，由同一個 renderer 渲染。
 - **request 期間沒有 DI 成本**：所有 provider 在啟動時建構完畢，request 只是 clone 一個 `Arc`。
-- **不包裝 axum**：extractor、`IntoResponse`、tower layer 都是 axum 原生的東西，可以隨時退回純 axum。
+- **不包裝 axum**：extractor、`IntoResponse`、tower layer 都是 axum 原生的東西，可以隨時退回純 axum。只有路由內的 guard、interceptor 與錯誤處理由 hornero 執行，見 [ADR-0008](../adr/0008-route-pipeline.md)。
 
 ## FAQ
 
@@ -93,13 +93,13 @@ controller 不使用 `State`，依賴透過 DI 注入。需要 state 的 extract
 handler 用 extractor 取得使用者，再當參數傳給 service，見 [Request 資料](06-scopes.md#request-資料)。hornero 沒有 Nest 的 request scope：這樣每一層的依賴都寫在簽名上，也不會讓整條依賴鏈變成每個 request 重建。取捨見 [ADR-0007](../adr/0007-no-request-scope.md)。
 
 **exception filter 怎麼讀取 request？**
-讀不到：filter 執行時 request 已經被 handler 消耗了。請改用 interceptor 或 middleware，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
+讀不到：filter 與 renderer 執行時 request 已經被 handler 消耗了。請改用 middleware 或 interceptor，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
 
 **我的 interceptor 沒有記錄到 401？**
 interceptor 在 guard 裡面執行，被 guard 擋下的 request 不會經過 interceptor。請用 `TraceLayer` 或 middleware 記錄所有 request。
 
-**自訂 exception filter 之後，401 少了 `WWW-Authenticate` header？**
-filter 產生的回應會完全取代預設回應，而 header 是跟著 `HttpError` 走的。從 `err.render()` 開始修改，或自己組回應時把 `err.headers()` 複製進去（`response.headers_mut().extend(err.headers().clone())`）。
+**自訂錯誤格式之後，401 還會帶 `WWW-Authenticate` 嗎？**
+會。header 跟著 `HttpError` 走，hornero 把它加在 renderer 產生的回應上，renderer 不必自己複製。要換掉 challenge，在錯誤上用 `with_header`。
 
 **可以用自訂的 HTTP method 嗎？**
 axum 的路由無法比對自訂 method（例如 `PURGE`），hornero 會在啟動時回報 `invalid route`。

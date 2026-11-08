@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, Path, Request};
+use axum::extract::{Extension, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get as axum_get;
 use common::domain::DomainApp;
 use common::{get, send};
 use hornero_core::{
-    AppFilter, AppGuard, AppInterceptor, BoxError, Controller, ControllerDef, ExceptionFilter,
-    Extracted, Extractor, Guard, GuardContext, Hornero, HttpError, Identity, Injectable,
-    Interceptor, Key, Lifecycle, LifecycleFn, Middleware, Module, ModuleDef, Problem, ProviderDef,
-    Resolver, RouteContext, Scope, Shutdown, hooks,
+    AppFilter, AppGuard, AppInterceptor, BoxError, CallHandler, Controller, ControllerDef,
+    ExceptionFilter, Extracted, Extractor, Guard, GuardContext, Hornero, HttpError, Identity,
+    Injectable, Interceptor, Key, Lifecycle, LifecycleFn, Middleware, Module, ModuleDef, Problem,
+    ProviderDef, Resolver, RouteContext, Scope, Shutdown, hooks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,32 @@ macro_rules! unit_injectable {
         }
     )+};
 }
+
+/// Renders errors as their bare message, so assertions read the text.
+fn plain(err: &HttpError, _: &RouteContext) -> Response {
+    (err.status(), err.message().to_owned()).into_response()
+}
+
+/// Renders errors as `global: <message> at <route>`.
+fn global_format(err: &HttpError, ctx: &RouteContext) -> Response {
+    (
+        err.status(),
+        format!("global: {} at {}", err.message(), ctx.path()),
+    )
+        .into_response()
+}
+
+/// A domain error the tests raise with `?`.
+#[derive(Debug)]
+struct Failed(&'static str);
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Failed {}
 
 /// A layer that tags every response it wraps with `x-{name}: wrapped`.
 macro_rules! tag {
@@ -454,11 +480,11 @@ macro_rules! recording_interceptor {
             async fn construct(r: &Resolver) -> Result<Self, BoxError> { Ok($name(r.get()?)) }
         }
         impl Interceptor for $name {
-            async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
+            async fn intercept(&self, ctx: &RouteContext, req: Request, next: CallHandler) -> Result<Response, HttpError> {
                 self.0.0.lock().unwrap().push(format!("{} > {}", stringify!($name), ctx.handler()));
-                let response = next.run(req).await;
+                let result = next.handle(req).await;
                 self.0.0.lock().unwrap().push(format!("{} <", stringify!($name)));
-                response
+                result
             }
         }
     )+};
@@ -561,15 +587,17 @@ async fn extractors_see_data_written_by_guards() {
 unit_injectable!(UserErrors);
 
 impl Interceptor for UserErrors {
-    async fn intercept(&self, _: &RouteContext, req: Request, next: Next) -> Response {
+    async fn intercept(
+        &self,
+        _: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
         let user = req.extensions().get::<User>().cloned();
-        let mut response = next.run(req).await;
-        if let Some(err) = HttpError::in_response(&response) {
+        next.handle(req).await.map_err(|err| {
             let name = user.map_or("anonymous".into(), |user| user.name);
-            let body = format!("{} for {name}", err.message());
-            *response.body_mut() = Body::from(body);
-        }
-        response
+            HttpError::new(err.status(), format!("{} for {name}", err.message()))
+        })
     }
 }
 
@@ -577,6 +605,7 @@ impl Interceptor for UserErrors {
 async fn interceptors_render_errors_from_what_guards_wrote() {
     let router = Hornero::new(BusyModule)
         .interceptor::<UserErrors>()
+        .error_renderer(plain)
         .build()
         .await
         .unwrap()
@@ -589,16 +618,16 @@ async fn interceptors_render_errors_from_what_guards_wrote() {
 }
 
 #[tokio::test]
-async fn filters_run_after_interceptors_that_keep_the_error() {
+async fn the_renderer_sees_what_interceptors_made_of_the_error() {
     let router = Hornero::new(BusyModule)
         .interceptor::<UserErrors>()
-        .filter::<GlobalFilter>()
+        .error_renderer(global_format)
         .build()
         .await
         .unwrap()
         .router();
     let res = send(&router, bearer("/busy", "bob")).await;
-    assert_eq!(res.body, "global: busy at /busy");
+    assert_eq!(res.body, "global: busy for bob at /busy");
 }
 
 // Names the path in error responses. Middleware wraps the guards too, so it sees their rejections.
@@ -635,8 +664,10 @@ macro_rules! labelled_filter {
     ($($name:ident => $label:literal),+) => {$(
         unit_injectable!($name);
         impl ExceptionFilter for $name {
-            async fn catch(&self, err: &HttpError, ctx: &RouteContext) -> Response {
-                (err.status(), format!("{}: {} at {}", $label, err.message(), ctx.path())).into_response()
+            type Error = Failed;
+
+            async fn catch(&self, err: &Failed, ctx: &RouteContext) -> HttpError {
+                HttpError::conflict(format!("{}: {} at {}", $label, err, ctx.path()))
             }
         }
     )+};
@@ -644,16 +675,24 @@ macro_rules! labelled_filter {
 
 labelled_filter!(GlobalFilter => "global", ControllerFilter => "controller", HandlerFilter => "handler");
 
-unit_injectable!(FilteredController, PlainController);
+unit_injectable!(FilteredController, PlainController, UnfilteredController);
+
+impl Controller for UnfilteredController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.get("/unfiltered", "unfiltered", |_: Arc<Self>| async {
+            HttpError::from(Failed("plain failed"))
+        });
+    }
+}
 
 impl Controller for FilteredController {
     fn routes(c: &mut ControllerDef<Self>) {
         c.prefix("/filtered").filter::<ControllerFilter>();
         c.get("/a", "a", |_: Arc<Self>| async {
-            HttpError::conflict("a failed")
+            HttpError::from(Failed("a failed"))
         });
         c.get("/b", "b", |_: Arc<Self>| async {
-            HttpError::conflict("b failed")
+            HttpError::from(Failed("b failed"))
         })
         .filter::<HandlerFilter>();
         c.get("/ok", "ok", |_: Arc<Self>| async { "fine" });
@@ -674,11 +713,12 @@ async fn the_most_specific_filter_handles_errors() {
     impl Module for App {
         fn define(&self, m: &mut ModuleDef) {
             m.controller::<FilteredController>()
-                .controller::<PlainController>();
+                .controller::<UnfilteredController>();
         }
     }
     let router = Hornero::new(App)
         .filter::<GlobalFilter>()
+        .error_renderer(plain)
         .build()
         .await
         .unwrap()
@@ -692,14 +732,14 @@ async fn the_most_specific_filter_handles_errors() {
         "handler: b failed at /filtered/b"
     );
     assert_eq!(
-        get(&router, "/plain").await.body,
-        "global: plain failed at /plain"
+        get(&router, "/unfiltered").await.body,
+        "global: plain failed at /unfiltered"
     );
     assert_eq!(get(&router, "/filtered/ok").await.body, "fine");
 }
 
 #[tokio::test]
-async fn filters_also_see_guard_rejections() {
+async fn the_renderer_formats_guard_rejections() {
     struct App;
     impl Module for App {
         fn define(&self, m: &mut ModuleDef) {
@@ -707,7 +747,7 @@ async fn filters_also_see_guard_rejections() {
         }
     }
     let router = Hornero::new(App)
-        .filter::<GlobalFilter>()
+        .error_renderer(global_format)
         .build()
         .await
         .unwrap()
@@ -735,8 +775,9 @@ async fn filters_catch_domain_errors_raised_with_the_question_mark() {
     let problem: serde_json::Value = serde_json::from_str(&res.body).unwrap();
     assert_eq!(problem["detail"], "todo 7 not found");
 
+    // An `HttpError` with a status is already an answer: no filter sees it.
     let res = get(&router, "/domain/conflict").await;
-    assert_eq!(res.body, "conflict filter: already exists");
+    assert_eq!(res.status, StatusCode::CONFLICT);
 
     // Caught, but left as a 500 by the filter.
     assert_eq!(
@@ -752,12 +793,22 @@ async fn filters_catch_domain_errors_raised_with_the_question_mark() {
     assert!(!res.body.contains("4242"));
 }
 
+unit_injectable!(TeapotTodos);
+
+impl ExceptionFilter for TeapotTodos {
+    type Error = common::domain::TodoError;
+
+    async fn catch(&self, _: &common::domain::TodoError, _: &RouteContext) -> HttpError {
+        HttpError::new(StatusCode::IM_A_TEAPOT, "teapot")
+    }
+}
+
 #[tokio::test]
-async fn errors_fall_through_to_the_next_filter_that_catches_them() {
-    // Within a level, filters are tried in registration order: specific ones go first.
+async fn the_first_filter_for_the_type_handles_the_error() {
+    // Within a level, filters are tried in registration order.
     let router = Hornero::new(DomainApp)
         .filter::<common::domain::TodoErrorFilter>()
-        .filter::<GlobalFilter>()
+        .filter::<TeapotTodos>()
         .build()
         .await
         .unwrap()
@@ -766,22 +817,279 @@ async fn errors_fall_through_to_the_next_filter_that_catches_them() {
         get(&router, "/domain/todos/7").await.status,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        get(&router, "/domain/billing").await.body,
-        "global: internal server error at /domain/billing"
-    );
 
-    let catch_all_first = Hornero::new(DomainApp)
-        .filter::<GlobalFilter>()
+    let teapot_first = Hornero::new(DomainApp)
+        .filter::<TeapotTodos>()
         .filter::<common::domain::TodoErrorFilter>()
         .build()
         .await
         .unwrap()
         .router();
     assert_eq!(
-        get(&catch_all_first, "/domain/todos/7").await.body,
-        "global: internal server error at /domain/todos/{id}"
+        get(&teapot_first, "/domain/todos/7").await.status,
+        StatusCode::IM_A_TEAPOT
     );
+}
+
+// --- errors travel as values ---------------------------------------------------------------
+
+// Reports, in `x-seen`, the error it received from the inner stages.
+unit_injectable!(SeenError);
+
+impl Interceptor for SeenError {
+    async fn intercept(
+        &self,
+        _: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        next.handle(req).await.map_err(|err| {
+            let seen = format!(
+                "{} {}",
+                err.status().as_u16(),
+                err.is::<common::domain::TodoError>()
+            );
+            err.with_header(
+                HeaderName::from_static("x-seen"),
+                HeaderValue::from_str(&seen).unwrap(),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn interceptors_receive_errors_as_filters_mapped_them() {
+    let router = Hornero::new(DomainApp)
+        .interceptor::<SeenError>()
+        .filter::<common::domain::TodoErrorFilter>()
+        .build()
+        .await
+        .unwrap()
+        .router();
+
+    // The status the client gets, with the domain error still behind it.
+    let res = get(&router, "/domain/todos/7").await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert_eq!(res.headers["x-seen"], "404 true");
+
+    let res = get(&router, "/domain/billing").await;
+    assert_eq!(res.headers["x-seen"], "500 false");
+}
+
+// Copies the status of the error behind a response into `x-error`.
+unit_injectable!(ErrorStatus);
+
+impl Middleware for ErrorStatus {
+    async fn handle(&self, req: Request, next: Next) -> Response {
+        let mut response = next.run(req).await;
+        if let Some(err) = HttpError::in_response(&response) {
+            let status = HeaderValue::from(err.status().as_u16());
+            response.headers_mut().insert("x-error", status);
+        }
+        response
+    }
+}
+
+#[tokio::test]
+async fn middleware_reads_the_error_behind_every_route_error() {
+    let router = Hornero::new(DomainApp)
+        .middleware::<ErrorStatus>()
+        .filter::<common::domain::TodoErrorFilter>()
+        .error_renderer(plain)
+        .build()
+        .await
+        .unwrap()
+        .router();
+    // Mapped by a filter, then rendered by the renderer: the error is still on the response.
+    assert_eq!(
+        get(&router, "/domain/todos/7").await.headers["x-error"],
+        "404"
+    );
+    assert_eq!(
+        get(&router, "/domain/conflict").await.headers["x-error"],
+        "409"
+    );
+}
+
+#[tokio::test]
+async fn the_renderer_keeps_the_headers_an_error_carries() {
+    let router = Hornero::new(BusyModule)
+        .error_renderer(plain)
+        .build()
+        .await
+        .unwrap()
+        .router();
+    let res = get(&router, "/busy").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::UNAUTHORIZED, "missing bearer token")
+    );
+    assert_eq!(res.headers["www-authenticate"], "Bearer");
+}
+
+unit_injectable!(MissingTodoGuard, GuardedTodoController);
+
+impl Guard for MissingTodoGuard {
+    async fn can_activate(&self, _: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        Err(HttpError::from(common::domain::TodoError::NotFound(3)))
+    }
+}
+
+impl Controller for GuardedTodoController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.get("/guarded-todo", "guarded", |_: Arc<Self>| async { "in" })
+            .guard::<MissingTodoGuard>();
+    }
+}
+
+#[tokio::test]
+async fn filters_map_domain_errors_from_guards() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<GuardedTodoController>();
+        }
+    }
+    let router = Hornero::new(App)
+        .filter::<common::domain::TodoErrorFilter>()
+        .build()
+        .await
+        .unwrap()
+        .router();
+    assert_eq!(
+        get(&router, "/guarded-todo").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    n: u32,
+}
+
+// Uses an axum extractor inside and forwards its rejection with `?`.
+unit_injectable!(PageNumber);
+
+impl Extractor for PageNumber {
+    type Output = u32;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<u32, HttpError> {
+        let Query(page) = Query::<PageQuery>::from_request_parts(parts, &()).await?;
+        Ok(page.n)
+    }
+}
+
+/// A third-party extractor whose rejection carries a header.
+struct Bearer;
+
+impl<S: Send + Sync> FromRequestParts<S> for Bearer {
+    type Rejection = (StatusCode, [(HeaderName, &'static str); 1], &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        match parts.headers.get("authorization") {
+            Some(_) => Ok(Bearer),
+            None => Err((
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                "missing bearer token",
+            )),
+        }
+    }
+}
+
+/// Rejects with a redirect: an answer rather than an error.
+struct LoggedIn;
+
+impl<S: Send + Sync> FromRequestParts<S> for LoggedIn {
+    type Rejection = Redirect;
+
+    async fn from_request_parts(_: &mut Parts, _: &S) -> Result<Self, Redirect> {
+        Err(Redirect::to("/login"))
+    }
+}
+
+unit_injectable!(RejectingController);
+
+impl Controller for RejectingController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.post(
+            "/json",
+            "json",
+            |_: Arc<Self>, Json(todo): Json<Todo>| async move { todo.title },
+        );
+        c.get(
+            "/number/{n}",
+            "number",
+            |_: Arc<Self>, Path(n): Path<u32>| async move { n.to_string() },
+        );
+        c.get(
+            "/page",
+            "page",
+            |_: Arc<Self>, Extracted(n): Extracted<PageNumber>| async move { n.to_string() },
+        );
+        c.get("/bearer", "bearer", |_: Arc<Self>, _: Bearer| async {
+            "in"
+        });
+        c.get("/redirect", "redirect", |_: Arc<Self>, _: LoggedIn| async {
+            "in"
+        });
+    }
+}
+
+#[tokio::test]
+async fn axum_rejections_are_errors_the_renderer_formats() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<RejectingController>();
+        }
+    }
+    let router = Hornero::new(App)
+        .error_renderer(plain)
+        .build()
+        .await
+        .unwrap()
+        .router();
+
+    // axum's own rejections keep their status and text.
+    let bad_json = Request::post("/json")
+        .header("content-type", "application/json")
+        .body(Body::from("{"))
+        .unwrap();
+    let res = send(&router, bad_json).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(
+        res.body
+            .starts_with("Failed to parse the request body as JSON"),
+        "{}",
+        res.body
+    );
+    let res = get(&router, "/number/abc").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid URL: Cannot parse `abc` to a `u32`"
+        )
+    );
+
+    // Forwarded with `?` from inside an `Extractor`: still axum's 400, not a 500.
+    let res = get(&router, "/page?n=x").await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(res.body.starts_with("Failed to deserialize query string"));
+
+    // Any other rejection: its status, text and headers.
+    let res = get(&router, "/bearer").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::UNAUTHORIZED, "missing bearer token")
+    );
+    assert_eq!(res.headers["www-authenticate"], "Bearer");
+
+    // Not an error status: sent as is.
+    let res = get(&router, "/redirect").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER);
+    assert_eq!(res.headers["location"], "/login");
 }
 
 // --- global enhancers declared by modules (`AppGuard<G>`, Nest's APP_GUARD) ------------------
@@ -842,12 +1150,17 @@ impl Guard for TokenGuard {
 }
 
 impl Interceptor for AppHeader {
-    async fn intercept(&self, _: &RouteContext, req: Request, next: Next) -> Response {
-        let mut response = next.run(req).await;
+    async fn intercept(
+        &self,
+        _: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        let mut response = next.handle(req).await?;
         response
             .headers_mut()
             .insert("x-app", HeaderValue::from_static("yes"));
-        response
+        Ok(response)
     }
 }
 
@@ -859,7 +1172,7 @@ impl Controller for FeatureController {
             trail.0.join(",")
         });
         c.get("/feature/conflict", "conflict", |_: Arc<Self>| async {
-            HttpError::conflict("taken")
+            HttpError::from(Failed("taken"))
         });
     }
 }
@@ -903,6 +1216,7 @@ fn authorized(uri: &str) -> Request<Body> {
 async fn modules_declare_global_enhancers_with_app_tokens() {
     let router = Hornero::new(GuardedApp)
         .guard::<BuilderGuard>()
+        .error_renderer(plain)
         .build()
         .await
         .unwrap()
@@ -915,8 +1229,10 @@ async fn modules_declare_global_enhancers_with_app_tokens() {
 
     // `TokenGuard` found the private `TokenStore` in its own module.
     let res = get(&router, "/feature").await;
-    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(res.body, "module: missing token at /feature");
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::UNAUTHORIZED, "missing token")
+    );
 
     let res = send(&router, authorized("/feature/conflict")).await;
     assert_eq!(res.body, "module: taken at /feature/conflict");
@@ -926,6 +1242,7 @@ async fn modules_declare_global_enhancers_with_app_tokens() {
 async fn filters_registered_on_hornero_are_tried_before_module_declared_ones() {
     let router = Hornero::new(GuardedApp)
         .filter::<GlobalFilter>()
+        .error_renderer(plain)
         .build()
         .await
         .unwrap()
@@ -2885,12 +3202,7 @@ struct GuardStamp(&'static str);
 #[derive(Clone)]
 struct InterceptorStamp(&'static str);
 
-unit_injectable!(
-    StampGuard,
-    StampInterceptor,
-    StampedController,
-    RenderRejection
-);
+unit_injectable!(StampGuard, StampInterceptor, StampedController);
 
 impl Guard for StampGuard {
     async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
@@ -2900,15 +3212,14 @@ impl Guard for StampGuard {
 }
 
 impl Interceptor for StampInterceptor {
-    async fn intercept(&self, _: &RouteContext, mut req: Request, next: Next) -> Response {
+    async fn intercept(
+        &self,
+        _: &RouteContext,
+        mut req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
         req.extensions_mut().insert(InterceptorStamp("interceptor"));
-        next.run(req).await
-    }
-}
-
-impl ExceptionFilter for RenderRejection {
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        (StatusCode::IM_A_TEAPOT, err.message().to_owned()).into_response()
+        next.handle(req).await
     }
 }
 
@@ -2926,8 +3237,7 @@ impl Controller for StampedController {
             "/rejected",
             "rejected",
             |_: Arc<Self>, stamps: Extracted<Stamped>| async move { stamps.0 },
-        )
-        .filter::<RenderRejection>();
+        );
     }
 }
 
@@ -2946,10 +3256,14 @@ async fn extractors_run_after_guards_and_interceptors() {
 }
 
 #[tokio::test]
-async fn extractor_rejections_reach_exception_filters() {
-    let router = Hornero::new(StampedModule).build().await.unwrap().router();
+async fn extractor_rejections_reach_the_renderer() {
+    let router = Hornero::new(StampedModule)
+        .error_renderer(plain)
+        .build()
+        .await
+        .unwrap()
+        .router();
     let res = get(&router, "/rejected").await;
-    assert_eq!(res.status, StatusCode::IM_A_TEAPOT);
     assert_eq!(res.body, "ran before the pipeline");
 }
 

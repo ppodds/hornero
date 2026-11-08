@@ -47,7 +47,7 @@ where E: FromRequestParts<S> + Validated, <E::Target as Validate>::Context: Defa
 | 驗證失敗 | `422 Unprocessable Entity`，`detail` 為 `validation failed`，`errors` 列出每個欄位錯誤 |
 | 內層 extractor 拒絕（JSON 格式錯誤、缺少 query 參數…） | 原本的狀態碼（400、415、422…），`detail` 為 axum 的錯誤訊息 |
 
-兩者都會渲染成 problem+json，也都帶有 `HttpError`，所以 exception filter 可以重新渲染。`errors` 的每一筆是 `{ "path": "...", "message": "..." }`，巢狀欄位的 path 像 `address.city` 或 `tags[0]`。
+兩者都是 `HttpError`：在 controller 路由上由應用的 [renderer](hornero-core.md#errorrenderer) 渲染（預設 problem+json），在 mount 的 axum router 裡渲染成 problem+json。`errors` 的每一筆是 `{ "path": "...", "message": "..." }`，巢狀欄位的 path 像 `address.city` 或 `tags[0]`。
 
 ---
 

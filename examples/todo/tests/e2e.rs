@@ -83,7 +83,7 @@ async fn crud_round_trip() {
     assert_eq!(missing["detail"], format!("todo {} not found", created.id));
     assert_eq!(
         missing["instance"], "/todos/{id}",
-        "ProblemFilter adds the route"
+        "the error renderer adds the route"
     );
     assert_eq!(missing["handler"], "TodoController::find_one");
 
@@ -115,7 +115,7 @@ async fn requests_without_a_valid_token_are_rejected() {
         .get("/todos")
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
-    // The global ProblemFilter rebuilds the response; the challenge must survive it.
+    // The error renderer builds a new response; hornero keeps the challenge the error carries.
     assert_eq!(response.header("www-authenticate"), Some("Bearer"));
     let problem: Value = response.json();
     assert_eq!(problem["detail"], "missing bearer token");

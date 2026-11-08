@@ -5,7 +5,7 @@
 //! * [`todo`](mod@todo) – a feature module: entity, repository trait, service, controller,
 //!   a domain error mapped by an exception filter, and a singleton audit log fed with the
 //!   caller from the `AuthUser` handler argument.
-//! * [`common`] – global interceptor and exception filter.
+//! * [`common`] – global interceptor and error format.
 
 pub mod app;
 pub mod auth;
@@ -20,5 +20,5 @@ pub fn hornero() -> Hornero {
     Hornero::new(app::AppModule)
         .layer(TraceLayer::new_for_http())
         .interceptor::<common::LoggingInterceptor>()
-        .filter::<common::ProblemFilter>()
+        .error_renderer(common::problem)
 }

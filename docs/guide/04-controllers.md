@@ -112,21 +112,29 @@ use hornero::prelude::*;
 # #[derive(Injectable)]
 # struct Timing;
 # impl Interceptor for Timing {
-#     async fn intercept(&self, _: &RouteContext, req: Request, next: Next) -> Response { next.run(req).await }
+#     async fn intercept(&self, _: &RouteContext, req: Request, next: CallHandler) -> Result<Response, HttpError> {
+#         next.handle(req).await
+#     }
 # }
+# #[derive(Debug)]
+# struct TodoError;
+# impl std::fmt::Display for TodoError {
+#     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("todo error") }
+# }
+# impl std::error::Error for TodoError {}
 # #[derive(Injectable)]
-# struct ProblemFilter;
-# impl ExceptionFilter for ProblemFilter {
-#     async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response { err.render() }
+# struct TodoErrorFilter;
+# impl ExceptionFilter for TodoErrorFilter {
+#     type Error = TodoError;
+#     async fn catch(&self, _: &TodoError, _: &RouteContext) -> HttpError { HttpError::not_found("todo not found") }
 # }
 # struct Public;
 # use hornero::axum::extract::Request;
-# use hornero::axum::middleware::Next;
 
 #[controller("/todos")]
 #[guards(AuthGuard)]
 #[interceptors(Timing)]
-#[filters(ProblemFilter)]
+#[filters(TodoErrorFilter)]
 #[meta(Public)]
 pub struct TodoController {
     todos: Arc<TodoService>,
@@ -282,7 +290,7 @@ handler 參數就是 axum extractor，axum 生態系裡的 extractor 都能直�
 
 hornero **不使用 axum 的 `State`**：controller 需要的東西都透過 DI 注入，router 的 state 型別固定是 `()`。
 
-自訂 extractor 的 `Rejection` 建議用 `HttpError`，錯誤回應才會是一致的 problem+json，也會經過 exception filter：
+自訂 extractor 的 `Rejection` 建議用 `HttpError`：hornero 取回的就是這個 `HttpError`，結構化細節與 header 都保留，在裡面用 `?` 拋出的 domain error 也會交給 exception filter。其他型別的 rejection 只保留狀態碼、文字與 header。不論哪一種，錯誤回應都由應用的 [renderer](05-request-pipeline.md#renderer) 渲染：
 
 ```rust
 use hornero::axum::extract::FromRequestParts;

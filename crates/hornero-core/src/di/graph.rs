@@ -29,6 +29,7 @@ pub(crate) struct GlobalEnhancers {
     pub(crate) interceptors: Vec<EnhancerRef>,
     pub(crate) filters: Vec<EnhancerRef>,
     pub(crate) middlewares: Vec<EnhancerRef>,
+    pub(crate) renderer: Option<crate::web::chain::ErrorRenderer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

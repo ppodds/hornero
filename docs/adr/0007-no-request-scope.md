@@ -1,6 +1,6 @@
 # ADR-0007：移除 request scope，request 資料走 extractor
 
-- 狀態：已採納，取代 [ADR-0002](0002-scope-bubbling.md)
+- 狀態：已採納，取代 [ADR-0002](0002-scope-bubbling.md)；exception filter 與 interceptor 收到錯誤的方式由 [ADR-0008](0008-route-pipeline.md) 修改
 - 日期：2026-11-06
 
 ## 背景

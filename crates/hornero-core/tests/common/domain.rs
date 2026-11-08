@@ -3,8 +3,6 @@
 use std::sync::Arc;
 
 use axum::extract::Path;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use hornero_core::{
     BoxError, Controller, ControllerDef, ExceptionFilter, HttpError, Injectable, Key, Module,
     ModuleDef, Resolver, RouteContext,
@@ -48,31 +46,26 @@ macro_rules! unit_injectable {
     )+};
 }
 
-unit_injectable!(TodoErrorFilter, ConflictOnlyFilter, DomainController);
+unit_injectable!(TodoErrorFilter, FmtErrorFilter, DomainController);
 
 /// Catches `TodoError` only, the way Nest's `@Catch(TodoError)` would.
 impl ExceptionFilter for TodoErrorFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.is::<TodoError>()
-    }
+    type Error = TodoError;
 
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        match err.downcast_ref::<TodoError>() {
-            Some(TodoError::NotFound(id)) => {
-                HttpError::not_found(format!("todo {id} not found")).into_response()
-            }
-            _ => err.render(),
+    async fn catch(&self, err: &TodoError, _: &RouteContext) -> HttpError {
+        match err {
+            TodoError::NotFound(id) => HttpError::not_found(format!("todo {id} not found")),
+            TodoError::Locked => HttpError::internal("internal server error"),
         }
     }
 }
 
-impl ExceptionFilter for ConflictOnlyFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.status() == StatusCode::CONFLICT
-    }
+/// A controller-level filter for an error these handlers never raise.
+impl ExceptionFilter for FmtErrorFilter {
+    type Error = std::fmt::Error;
 
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        (err.status(), format!("conflict filter: {}", err.message())).into_response()
+    async fn catch(&self, _: &std::fmt::Error, _: &RouteContext) -> HttpError {
+        HttpError::conflict("formatting failed")
     }
 }
 
@@ -90,7 +83,7 @@ pub async fn charge() -> Result<(), BillingError> {
 
 impl Controller for DomainController {
     fn routes(c: &mut ControllerDef<Self>) {
-        c.prefix("/domain").filter::<ConflictOnlyFilter>();
+        c.prefix("/domain").filter::<FmtErrorFilter>();
         c.get(
             "/todos/{id}",
             "todo",

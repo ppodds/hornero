@@ -304,7 +304,7 @@ assert_eq!(app.get::<Banner>().unwrap().0, "hello @ 1700000000");
 #[controller("/todos")]                // 路徑前綴，選用：#[controller]
 #[guards(AuthGuard, RolesGuard)]       // 以下都是選用，寫在 #[controller] 下方
 #[interceptors(Logging)]
-#[filters(ProblemFilter)]
+#[filters(TodoErrorFilter)]
 #[meta(Roles(&["admin"]))]
 #[meta(Public)]
 struct TodoController {
@@ -381,7 +381,6 @@ impl TodoController {
 
 ```rust
 use hornero::axum::extract::Request;
-use hornero::axum::middleware::Next;
 use hornero::prelude::*;
 
 struct Audited(&'static str);
@@ -390,11 +389,16 @@ struct Audited(&'static str);
 struct AuditHeader;
 
 impl Interceptor for AuditHeader {
-    async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
+    async fn intercept(
+        &self,
+        ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
         let label = ctx.meta::<Audited>().map_or("none", |audited| audited.0);
-        let mut response = next.run(req).await;
+        let mut response = next.handle(req).await?;
         response.headers_mut().insert("x-audit", label.parse().unwrap());
-        response
+        Ok(response)
     }
 }
 
@@ -447,7 +451,7 @@ assert_eq!(res.header("x-audit"), Some("create"));
 |---|---|---|
 | `#[guards(A, B)]` | 一個或多個 guard 型別 | 全域 → controller → handler，同一層由上到下、由左到右 |
 | `#[interceptors(A, B)]` | 一個或多個 interceptor 型別 | 全域包住 controller，controller 包住 handler；同一層先列的在外層 |
-| `#[filters(A, B)]` | 一個或多個 exception filter 型別 | handler → controller → 全域，第一個 `catches` 錯誤的 filter 處理它 |
+| `#[filters(A, B)]` | 一個或多個 exception filter 型別 | handler → controller → 全域，第一個 `Error` 型別相符的 filter 處理錯誤 |
 | `#[meta(expr)]` | 一個 metadata 值（任何運算式） | 以型別為 key；同型別時 handler 層級優先於 controller 層級 |
 
 同一種 attribute 可以寫多次。列出的型別必須實作對應的 trait 與 `Injectable`。

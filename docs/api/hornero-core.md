@@ -7,7 +7,7 @@
 | [應用程式](#應用程式) | `Hornero`、`App` |
 | [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
-| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Extractor`、`Extracted`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
+| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Extractor`、`Extracted`、`Guard`、`GuardContext`、`Interceptor`、`CallHandler`、`ExceptionFilter`、`ErrorRenderer`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
 | [錯誤](#錯誤) | `HttpError`、`BootError`、`ShutdownError`、`Problem` |
 | [生命週期](#生命週期) | `Lifecycle`、`Hook`、`Shutdown` |
 | [工具型別](#工具型別) | `BoxError`、`BoxFuture` |
@@ -31,7 +31,8 @@ pub struct Hornero { /* ... */ }
 | `fn shutdown_timeout(self, timeout: Duration) -> Self` | `serve`（與 `listen`）在關機開始後等待進行中 request 的上限，預設 10 秒；逾時或收到第二次 SIGINT/SIGTERM 就取消仍在執行的 request（client 收到 503，或串流 body 被切斷），仍會執行關閉 hook。`Duration::MAX` 表示無限等待 |
 | `fn guard<G: Guard + Injectable>(self) -> Self` | 全域 guard，在根模組解析；在模組宣告的 [`AppGuard`](#appguardappinterceptorappfilter) 以及 controller、handler 的 guard 之前執行 |
 | `fn interceptor<I: Interceptor + Injectable>(self) -> Self` | 全域 interceptor，包住模組宣告的 `AppInterceptor` 以及 controller、handler 的 interceptor |
-| `fn filter<F: ExceptionFilter + Injectable>(self) -> Self` | 全域 exception filter；在 handler 與 controller 層級的 filter 都沒有接住錯誤時才比對，比模組宣告的 `AppFilter` 先比對 |
+| `fn filter<F: ExceptionFilter + Injectable>(self) -> Self` | 全域 exception filter；在 handler 與 controller 層級都沒有處理該錯誤型別的 filter 時才比對，比模組宣告的 `AppFilter` 先比對 |
+| `fn error_renderer(self, renderer: ErrorRenderer) -> Self` | 應用的錯誤格式（見 [`ErrorRenderer`](#errorrenderer)），渲染路由上的每一個錯誤；預設 problem+json |
 | `fn middleware<M: Middleware + Injectable>(self) -> Self` | 全域 DI middleware，包住所有路由與 404 fallback |
 | `fn layer<L>(self, layer: L) -> Self` | 包住整個應用的 tower layer；先加的在外層 |
 | `fn override_provider<T: ?Sized>(self, value: Arc<T>) -> Self` | 以 `value` 取代所有 `T` 的 provider；原本的依賴不再需要 |
@@ -578,33 +579,42 @@ pub struct GuardContext<'a> {
 | `GuardContext::route` | 路由資訊與 metadata |
 | `GuardContext::parts` | request head；可以把資料寫進 `parts.extensions` 給後續元件使用 |
 
-### `trait Interceptor`
+### `trait Interceptor` 與 `CallHandler`
 
 ```rust,ignore
 pub trait Interceptor: Send + Sync + 'static {
-    fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> impl Future<Output = Response> + Send;
+    fn intercept(&self, ctx: &RouteContext, req: Request, next: CallHandler)
+        -> impl Future<Output = Result<Response, HttpError>> + Send;
+}
+
+pub struct CallHandler { /* ... */ }
+
+impl CallHandler {
+    pub fn handle(self, req: Request) -> impl Future<Output = Result<Response, HttpError>> + Send;
 }
 ```
 
-包住 handler。呼叫 `next.run(req).await` 執行內層；不呼叫就能直接回應。在 guard 之後執行；全域包住 controller，controller 包住 handler。
+包住 handler。`next.handle(req).await` 執行內層的 interceptor、extractor 與 handler（Nest 的 `CallHandler`），回傳 `Result`：`Err` 是錯誤本身，已經過 exception filter 轉換，原始錯誤仍是 source。`?` 把錯誤原樣往外傳，`map_err` 換掉它；不呼叫 `next` 就能直接回應或拒絕。在 guard 之後執行；全域包住 controller，controller 包住 handler。
+
+錯誤到 [renderer](#errorrenderer) 才變成回應，所以只修改 `Ok` 回應的 interceptor 不會影響錯誤回應；要讓錯誤也帶上 header，用 `err.with_header(..)`。
 
 ### `trait ExceptionFilter`
 
 ```rust,ignore
 pub trait ExceptionFilter: Send + Sync + 'static {
-    fn catches(&self, err: &HttpError) -> bool { true }
-    fn catch(&self, err: &HttpError, ctx: &RouteContext) -> impl Future<Output = Response> + Send;
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn catch(&self, err: &Self::Error, ctx: &RouteContext) -> impl Future<Output = HttpError> + Send;
 }
 ```
 
-重新渲染帶有 `HttpError` 的回應（來自 handler、guard、interceptor 或 `Rejection = HttpError` 的 extractor）。filter 執行時 request 已經被消耗，只看得到錯誤與路由；要依 request 呈現錯誤，見 [`HttpError::in_response`](#httperror)。
+把一種 domain error 轉成 `HttpError`，相當於 Nest 的 `@Catch(TodoError)`。domain error 由 guard、interceptor、extractor 或 handler 用 `?`（或 `HttpError::from`）拋出；用狀態碼建構的 `HttpError` 與 axum extractor 的 rejection 已經是回答，filter 看不到。filter 執行時 request 已經被消耗，只看得到錯誤與路由；要依 request 呈現錯誤，見 [`HttpError::in_response`](#httperror)。
 
-| 方法 | 說明 |
+| 項目 | 說明 |
 |---|---|
-| `catches` | 這個 filter 是否處理 `err`，相當於 Nest 的 `@Catch(Type)`。預設 `true`（接住所有錯誤）；用 `err.is::<TodoError>()` 只接某種 domain error |
-| `catch` | 產生回應。從 `err.render()` 開始修改可以保留預設內容；回傳 `HttpError::not_found(..).into_response()` 這類回應則把錯誤轉成另一個狀態碼 |
+| `type Error` | 這個 filter 處理的錯誤型別。hornero 以 `downcast_ref` 比對 `?` 轉換的那個錯誤本身，不往 source chain 裡找 |
+| `catch` | 回傳 HTTP 錯誤：狀態碼、訊息、細節與 header。原始錯誤保留為它的 source，所以之後 `err.is::<Self::Error>()` 仍成立、5xx 的 log 仍寫出原因。格式交給 renderer |
 
-**選擇規則**：依序查看 handler、controller、全域的 filter（先 `Hornero::filter`，再模組宣告的 `AppFilter`），同一層依註冊順序，第一個 `catches` 回傳 `true` 的 filter 處理錯誤，其他 filter 不會執行。沒有任何 filter 接住時，回應維持原樣。filter 回應的狀態碼仍是 5xx 時，原本的錯誤會被寫進 log。
+**選擇規則**：錯誤離開 handler、extractor 或 interceptor 時（guard 的錯誤在渲染前），依序查看 handler、controller、全域的 filter（先 `Hornero::filter`，再模組宣告的 `AppFilter`），同一層依註冊順序，第一個 `Error` 型別相符的 filter 處理錯誤，其他 filter 不會執行。每個錯誤最多轉換一次。沒有任何 filter 相符時，錯誤是不透露細節的 500，log 寫出它的型別與 `add an ExceptionFilter for it to choose the status`。
 
 ```rust
 use hornero::prelude::*;
@@ -624,13 +634,10 @@ impl std::error::Error for OutOfStock {}
 struct OutOfStockFilter;
 
 impl ExceptionFilter for OutOfStockFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.is::<OutOfStock>()
-    }
+    type Error = OutOfStock;
 
-    async fn catch(&self, err: &HttpError, _ctx: &RouteContext) -> Response {
-        let item = err.downcast_ref::<OutOfStock>().map_or(0, |e| e.0);
-        HttpError::conflict(format!("item {item} is out of stock")).into_response()
+    async fn catch(&self, err: &OutOfStock, _ctx: &RouteContext) -> HttpError {
+        HttpError::conflict(err.to_string())
     }
 }
 
@@ -642,7 +649,7 @@ impl CartController {
     #[post("/{item}")]
     fn add(&self, Path(item): Path<u32>) -> Result<StatusCode, HttpError> {
         let reserved: Result<(), OutOfStock> = Err(OutOfStock(item));
-        reserved?; // OutOfStock → 500，再由 filter 轉成 409
+        reserved?; // 拋出 OutOfStock，由 filter 轉成 409
         Ok(StatusCode::NO_CONTENT)
     }
 }
@@ -659,6 +666,14 @@ assert_eq!(res.status(), StatusCode::CONFLICT);
 assert_eq!(res.json::<serde_json::Value>()["detail"], "item 3 is out of stock");
 # }
 ```
+
+### `ErrorRenderer`
+
+```rust,ignore
+pub type ErrorRenderer = fn(&HttpError, &RouteContext) -> Response;
+```
+
+應用的錯誤格式，用 [`Hornero::error_renderer`](#hornero) 設定；沒有設定時是 `HttpError::render`（problem+json）。它渲染路由上的每一個錯誤：guard、interceptor、extractor 與 handler 的錯誤，以及 axum extractor 的 rejection，收到的是 filter 轉換之後的錯誤。hornero 接著把 `err.headers()` 加到它的回應上，並把錯誤放進回應的 extensions（`HttpError::in_response`、5xx log）。不經過路由的回應（404 fallback、405、panic、middleware 的錯誤、關機逾時的 503）不套用 renderer。
 
 ### `AppGuard`、`AppInterceptor`、`AppFilter`
 
@@ -865,7 +880,9 @@ assert!(route.guards()[0].is::<AuthGuard>());
 pub struct HttpError { /* ... */ }
 ```
 
-會變成 HTTP 回應的錯誤，相當於 Nest 的 `HttpException`。預設渲染成 RFC 9457 `application/problem+json`，並附在回應的 extensions 上供 exception filter 使用。exception filter 處理之後，最終回應仍是 5xx 的錯誤會由 hornero 的 router 寫進 log（含 source chain），每個錯誤一次。
+會變成 HTTP 回應的錯誤，相當於 Nest 的 `HttpException`。用狀態碼建構的是**回答**，原樣渲染；`?`（`From<E>`）轉換的是**拋出**的 domain error，由處理它型別的 [exception filter](#trait-exceptionfilter) 轉換，沒有就是 500。
+
+在路由裡錯誤以值往外傳，最後渲染一次：[renderer](#errorrenderer)，預設 RFC 9457 `application/problem+json`。回應會帶上錯誤的 header，並在 extensions 保留錯誤本身（`in_response`）。最終回應仍是 5xx 的錯誤由 hornero 的 router 寫進 log（含 source chain），每個錯誤一次。
 
 | 建構方式 | 說明 |
 |---|---|
@@ -877,14 +894,14 @@ pub struct HttpError { /* ... */ }
 | `fn conflict(message) -> Self` | 409 |
 | `fn unprocessable(message) -> Self` | 422 |
 | `fn internal(message) -> Self` | 500 |
-| `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因 |
-| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | 同 `from_boxed`，讓 `?` 可以用 |
+| `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因。是回答：exception filter 看不到 |
+| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 自己的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等）保留原本的狀態碼與訊息 |
 
 | Builder | 說明 |
 |---|---|
 | `fn with_details(self, details: impl Serialize) -> Self` | 結構化細節，渲染在 `errors` 欄位；序列化失敗時 `details` 維持 `None`，並以 `tracing::warn!` 記錄 |
 | `fn with_source(self, source: impl Into<BoxError>) -> Self` | 內部原因：寫進 log，不會送給 client |
-| `fn with_header(self, name: HeaderName, value: HeaderValue) -> Self` | 設定回應 header（同名會取代）；`render()` 會套用，filter 可從 `headers()` 取得 |
+| `fn with_header(self, name: HeaderName, value: HeaderValue) -> Self` | 設定回應 header（同名會取代）；不論回應由 renderer 或 `render()` 產生都會帶上 |
 
 | 存取與渲染 | 說明 |
 |---|---|
@@ -894,8 +911,8 @@ pub struct HttpError { /* ... */ }
 | `fn headers(&self) -> &HeaderMap` | 隨錯誤攜帶的回應 header（401 預設含 `WWW-Authenticate: Bearer`） |
 | `fn source(&self) -> Option<&(dyn Error + Send + Sync + 'static)>` | 內部原因 |
 | `fn downcast_ref<E: Error + 'static>(&self) -> Option<&E>` | 內部原因是 `E` 時取得它：`?` 轉換的錯誤，或傳給 `from_boxed` / `with_source` 的錯誤。不會往 source chain 裡找 |
-| `fn is<E: Error + 'static>(&self) -> bool` | 內部原因是否為 `E`，常用在 `ExceptionFilter::catches` |
-| `fn in_response(response: &Response) -> Option<&HttpError>` | `response` 來自哪個 `HttpError`。給手上還有 request 的 interceptor 與 middleware 使用，見 [依 request 資料呈現錯誤](../guide/06-scopes.md#依-request-資料呈現錯誤) |
+| `fn is<E: Error + 'static>(&self) -> bool` | 內部原因是否為 `E`。filter 轉換之後仍成立，interceptor 與 renderer 可以用它分辨原始的 domain error |
+| `fn in_response(response: &Response) -> Option<&HttpError>` | `response` 背後的 `HttpError`（filter 轉換之後的）。給只看得到回應的 middleware 與 tower layer 使用；interceptor 直接收到錯誤。見 [依 request 資料呈現錯誤](../guide/06-scopes.md#依-request-資料呈現錯誤) |
 | `fn to_problem(&self) -> Value` | problem document：`type`、`title`、`status`、`detail`，以及選用的 `errors` |
 | `fn render(&self) -> Response` | 預設的 problem+json 回應，不消耗 `self`、不寫 log、不附加 extension |
 
@@ -912,7 +929,7 @@ assert_eq!(err.source().unwrap().to_string(), "row missing");
 assert_eq!(err.to_problem()["title"], "Not Found");
 
 let err = HttpError::from(std::io::Error::other("disk full")); // `?` 做的轉換
-assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR); // 沒有 filter 處理時
 assert!(err.is::<std::io::Error>());
 assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().to_string(), "disk full");
 

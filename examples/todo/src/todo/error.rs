@@ -3,8 +3,6 @@ use std::fmt;
 use hornero::prelude::*;
 use sea_orm::DbErr;
 
-use crate::common::problem;
-
 /// What can go wrong in the todo feature. The service raises it without knowing about HTTP.
 #[derive(Debug)]
 pub enum TodoError {
@@ -36,22 +34,18 @@ impl From<DbErr> for TodoError {
     }
 }
 
-/// Turns a `TodoError` that a handler raised with `?` into a response, Nest's
+/// Turns a `TodoError` that a handler raised with `?` into an HTTP error, Nest's
 /// `@Catch(TodoError)`. Storage failures stay opaque 500s, logged with their cause.
 #[derive(Injectable)]
 pub struct TodoErrorFilter;
 
 impl ExceptionFilter for TodoErrorFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.is::<TodoError>()
-    }
+    type Error = TodoError;
 
-    async fn catch(&self, err: &HttpError, ctx: &RouteContext) -> Response {
-        match err.downcast_ref::<TodoError>() {
-            Some(TodoError::NotFound(id)) => {
-                problem(&HttpError::not_found(format!("todo {id} not found")), ctx)
-            }
-            _ => problem(err, ctx),
+    async fn catch(&self, err: &TodoError, _: &RouteContext) -> HttpError {
+        match err {
+            TodoError::NotFound(id) => HttpError::not_found(format!("todo {id} not found")),
+            TodoError::Storage(_) => HttpError::internal("internal server error"),
         }
     }
 }

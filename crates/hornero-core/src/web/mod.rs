@@ -1,4 +1,5 @@
 pub(crate) mod cancel;
+pub(crate) mod chain;
 pub(crate) mod controller;
 pub(crate) mod enhancer;
 pub(crate) mod extractor;

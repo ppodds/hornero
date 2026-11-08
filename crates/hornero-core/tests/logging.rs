@@ -51,11 +51,13 @@ async fn only_responses_still_failing_after_filters_are_logged() {
     get(&router, "/domain/todos/7").await;
     assert_eq!(take(&logs), "");
 
-    // Uncaught: logged once, with the source the client never sees.
+    // Unmapped: logged once, with the source the client never sees, named as unhandled.
     get(&router, "/domain/billing").await;
     let logged = take(&logs);
     assert_eq!(logged.matches("card 4242 declined").count(), 1, "{logged}");
     assert!(logged.contains("ERROR"), "{logged}");
+    assert!(logged.contains("unhandled"), "{logged}");
+    assert!(logged.contains("BillingError"), "{logged}");
 
     // Caught but still a 500: the original error is logged.
     get(&router, "/domain/todos/0").await;

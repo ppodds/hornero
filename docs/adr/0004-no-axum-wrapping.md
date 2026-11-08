@@ -1,6 +1,6 @@
 # ADR-0004：不包裝 axum
 
-- 狀態：已採納
+- 狀態：已採納，部分被 [ADR-0008](0008-route-pipeline.md) 取代（interceptor 改用 `CallHandler`；路由內的 pipeline 不再編譯成 `from_fn`）
 - 日期：2026-10-17
 
 ## 背景
