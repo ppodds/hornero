@@ -29,6 +29,7 @@ use crate::error::{BootError, HttpError, Problem, ShutdownError};
 use crate::lifecycle::{ErasedLifecycle, Hook, Shutdown};
 use crate::util::BoxError;
 use crate::web::cancel::{self, Cancellable};
+use crate::web::chain::RouteChain;
 use crate::web::enhancer::{self, EnhancerKind, EnhancerRef};
 use crate::web::extractor::{Extractor, RouteExtractors};
 use crate::web::filter::ExceptionFilter;
@@ -117,6 +118,13 @@ impl Hornero {
         self
     }
 
+    /// The application's error format: renders every error a route answers with, after exception
+    /// filters mapped it. Without one, errors render as problem+json.
+    pub fn error_renderer(mut self, renderer: crate::web::chain::ErrorRenderer) -> Self {
+        self.global.renderer = Some(renderer);
+        self
+    }
+
     /// An exception filter for every route, resolved in the root module. Tried after the route's
     /// handler- and controller-level filters, in registration order, and before the ones modules
     /// declare with [`AppFilter`](crate::AppFilter).
@@ -180,7 +188,7 @@ impl Hornero {
     }
 
     /// Replaces every use of the exception filter `F` with `filter`, which may be any
-    /// [`ExceptionFilter`].
+    /// [`ExceptionFilter`]. It maps the errors of its own `Error` type.
     pub fn override_filter<F: 'static>(mut self, filter: impl ExceptionFilter) -> Self {
         self.overrides.push(enhancer::filter_override::<F>(filter));
         self
@@ -708,13 +716,13 @@ fn assemble(
                     Some(rt) => {
                         let mut meta = controller.meta.clone();
                         meta.extend(&route.meta);
-                        let ctx = Arc::new(RouteContext {
+                        let ctx = RouteContext {
                             controller: controller.name.clone(),
                             handler: route.name,
                             method: route.method.clone(),
                             path: path.clone(),
                             meta,
-                        });
+                        };
 
                         let guards = slot_instances::<dyn crate::web::guard::ErasedGuard>(
                             graph,
@@ -735,7 +743,7 @@ fn assemble(
                                     .chain(tagged(module, &controller.interceptors))
                                     .chain(tagged(module, &route.interceptors)),
                             );
-                        // Most specific first; the first filter that catches an error handles it.
+                        // Most specific first; the first filter for the error's type maps it.
                         let filters = slot_instances::<dyn crate::web::filter::ErasedFilter>(
                             graph,
                             rt,
@@ -753,26 +761,17 @@ fn assemble(
                             })
                             .collect();
 
-                        let mut method_router = (route.build)(singleton(rt, node), filter);
-                        if !extractors.is_empty() {
-                            method_router = pipeline::with_extractors(
-                                method_router,
-                                RouteExtractors::new(extractors),
-                            );
-                        }
-                        for interceptor in interceptors.into_iter().rev() {
-                            method_router =
-                                pipeline::with_interceptor(method_router, interceptor, ctx.clone());
-                        }
-                        if !guards.is_empty() {
-                            method_router =
-                                pipeline::with_guards(method_router, guards, ctx.clone());
-                        }
-                        if !filters.is_empty() {
-                            method_router =
-                                pipeline::with_filters(method_router, filters, ctx.clone());
-                        }
-                        pipeline::with_problem_405(method_router)
+                        let chain = RouteChain {
+                            ctx,
+                            guards,
+                            interceptors,
+                            filters,
+                            renderer: global.renderer,
+                            extractors: (!extractors.is_empty())
+                                .then(|| RouteExtractors::new(extractors)),
+                            endpoint: (route.build)(singleton(rt, node)),
+                        };
+                        pipeline::with_problem_405(chain.into_method_router(filter))
                     }
                     // Dry run: nothing was constructed, and axum only looks at the path and method.
                     None => on(filter, || async {}),

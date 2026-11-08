@@ -141,24 +141,47 @@ pub struct Audited(&'static str);
 pub struct AuditInterceptor;
 
 impl Interceptor for AuditInterceptor {
-    async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
-        let mut response = next.run(req).await;
+    async fn intercept(
+        &self,
+        ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        let mut response = next.handle(req).await?;
         if let Some(Audited(label)) = ctx.meta::<Audited>() {
             response
                 .headers_mut()
                 .insert("x-audited", HeaderValue::from_static(label));
         }
-        response
+        Ok(response)
     }
 }
 
 #[derive(Injectable)]
 pub struct PlainTextErrors;
 
-impl ExceptionFilter for PlainTextErrors {
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        (err.status(), format!("error: {}", err.message())).into_response()
+/// Raised by the note store when a note is missing.
+#[derive(Debug)]
+pub struct NoteMissing(u32);
+
+impl std::fmt::Display for NoteMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "note {} not found", self.0)
     }
+}
+
+impl std::error::Error for NoteMissing {}
+
+impl ExceptionFilter for PlainTextErrors {
+    type Error = NoteMissing;
+
+    async fn catch(&self, err: &NoteMissing, _: &RouteContext) -> HttpError {
+        HttpError::not_found(err.to_string())
+    }
+}
+
+fn plain_text(err: &HttpError, _: &RouteContext) -> Response {
+    (err.status(), format!("error: {}", err.message())).into_response()
 }
 
 #[derive(Injectable)]
@@ -217,7 +240,7 @@ impl NoteController {
             .get(&id)
             .cloned()
             .map(Json)
-            .ok_or_else(|| HttpError::not_found(format!("note {id} not found")))
+            .ok_or_else(|| NoteMissing(id).into())
     }
 
     #[get("/hello/{name}")]
@@ -324,7 +347,11 @@ fn the_macro_built_graph_is_valid() {
 
 #[tokio::test]
 async fn macro_built_application_serves_requests() {
-    let app = Hornero::new(AppModule).build().await.unwrap();
+    let app = Hornero::new(AppModule)
+        .error_renderer(plain_text)
+        .build()
+        .await
+        .unwrap();
     let router = app.router();
 
     // Public route with sync handler, Path + Query extractors, constructor-injected services.

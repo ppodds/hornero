@@ -3,11 +3,13 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter, on};
 
+use super::chain::Endpoint;
 use super::controller::RouteDef;
+use crate::error::HttpError;
 
 /// Closures usable as controller handlers: `Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`,
 /// where `T1..Tn` are axum extractors or [`Extracted`](crate::Extracted) (the last one may consume
@@ -27,7 +29,50 @@ pub trait RouteHandler<C, Args>: Clone + Send + Sync + 'static {
     fn declare(route: &mut RouteDef);
 
     #[doc(hidden)]
-    fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter;
+    fn into_endpoint(self, this: Arc<C>) -> Endpoint;
+}
+
+/// Why a parameter could not be extracted.
+#[doc(hidden)]
+pub enum Rejection {
+    /// An error, for exception filters and the renderer.
+    Error(HttpError),
+    /// An answer that is not an error (a redirect to a login page, say), sent as is.
+    Answer(Response),
+}
+
+impl From<HttpError> for Rejection {
+    fn from(err: HttpError) -> Self {
+        Self::Error(err)
+    }
+}
+
+impl Rejection {
+    /// Reads an axum rejection: the `HttpError` it carries, else its status, text and headers.
+    async fn read(mut response: Response) -> Self {
+        if let Some(err) = HttpError::take_from(&mut response) {
+            return Self::Error(err);
+        }
+        let status = response.status();
+        if !(status.is_client_error() || status.is_server_error()) {
+            return Self::Answer(response);
+        }
+        let (parts, body) = response.into_parts();
+        let message = match axum::body::to_bytes(body, 64 * 1024).await {
+            Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+            _ => status
+                .canonical_reason()
+                .unwrap_or("invalid request")
+                .to_owned(),
+        };
+        let mut err = HttpError::new(status, message);
+        for (name, value) in &parts.headers {
+            if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
+                err = err.with_header(name.clone(), value.clone());
+            }
+        }
+        Self::Error(err)
+    }
 }
 
 /// A parameter axum extracts.
@@ -55,14 +100,17 @@ pub struct ViaParts<V>(PhantomData<V>);
 pub trait HandlerParam<Via>: Sized {
     fn declare(_route: &mut RouteDef) {}
 
-    fn extract(parts: &mut Parts) -> impl Future<Output = Result<Self, Response>> + Send;
+    fn extract(parts: &mut Parts) -> impl Future<Output = Result<Self, Rejection>> + Send;
 }
 
 impl<T: FromRequestParts<()>> HandlerParam<ViaAxum> for T {
-    async fn extract(parts: &mut Parts) -> Result<Self, Response> {
-        T::from_request_parts(parts, &())
-            .await
-            .map_err(IntoResponse::into_response)
+    async fn extract(parts: &mut Parts) -> Result<Self, Rejection> {
+        // Turn the rejection into a `Response` before awaiting: `T::Rejection` need not be `Send`.
+        let rejection = match T::from_request_parts(parts, &()).await {
+            Ok(value) => return Ok(value),
+            Err(rejection) => rejection.into_response(),
+        };
+        Err(Rejection::read(rejection).await)
     }
 }
 
@@ -71,7 +119,7 @@ impl<T: FromRequestParts<()>> HandlerParam<ViaAxum> for T {
 pub trait LastHandlerParam<Via>: Sized {
     fn declare(_route: &mut RouteDef) {}
 
-    fn extract(request: Request) -> impl Future<Output = Result<Self, Response>> + Send;
+    fn extract(request: Request) -> impl Future<Output = Result<Self, Rejection>> + Send;
 }
 
 impl<T: HandlerParam<V>, V> LastHandlerParam<ViaParts<V>> for T {
@@ -79,39 +127,28 @@ impl<T: HandlerParam<V>, V> LastHandlerParam<ViaParts<V>> for T {
         <T as HandlerParam<V>>::declare(route);
     }
 
-    async fn extract(request: Request) -> Result<Self, Response> {
+    async fn extract(request: Request) -> Result<Self, Rejection> {
         let (mut parts, _) = request.into_parts();
         <T as HandlerParam<V>>::extract(&mut parts).await
     }
 }
 
 impl<T: FromRequest<()>> LastHandlerParam<ViaBody> for T {
-    async fn extract(request: Request) -> Result<Self, Response> {
-        T::from_request(request, &())
-            .await
-            .map_err(IntoResponse::into_response)
+    async fn extract(request: Request) -> Result<Self, Rejection> {
+        let rejection = match T::from_request(request, &()).await {
+            Ok(value) => return Ok(value),
+            Err(rejection) => rejection.into_response(),
+        };
+        Err(Rejection::read(rejection).await)
     }
 }
 
-/// Presents a [`HandlerParam`] to axum.
-struct Param<T, V>(T, PhantomData<fn() -> V>);
-
-impl<T: HandlerParam<V>, V> FromRequestParts<()> for Param<T, V> {
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, _: &()) -> Result<Self, Response> {
-        Ok(Self(T::extract(parts).await?, PhantomData))
-    }
-}
-
-/// Presents a [`LastHandlerParam`] to axum.
-struct LastParam<T, V>(T, PhantomData<fn() -> V>);
-
-impl<T: LastHandlerParam<V>, V> FromRequest<()> for LastParam<T, V> {
-    type Rejection = Response;
-
-    async fn from_request(request: Request, _: &()) -> Result<Self, Response> {
-        Ok(Self(T::extract(request).await?, PhantomData))
+/// The handler's answer: an `HttpError` it returned stays an error, for filters and interceptors.
+fn output(answer: impl IntoResponse) -> Result<Response, HttpError> {
+    let mut response = answer.into_response();
+    match HttpError::take_from(&mut response) {
+        Some(err) => Err(err),
+        None => Ok(response),
     }
 }
 
@@ -124,8 +161,12 @@ where
 {
     fn declare(_route: &mut RouteDef) {}
 
-    fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter {
-        on(filter, move || (self)(this.clone()))
+    fn into_endpoint(self, this: Arc<C>) -> Endpoint {
+        Arc::new(move |_req: Request| {
+            let handler = self.clone();
+            let this = this.clone();
+            Box::pin(async move { output(handler(this).await) })
+        })
     }
 }
 
@@ -148,9 +189,28 @@ macro_rules! impl_route_handler {
                 <$last as LastHandlerParam<$last_via>>::declare(route);
             }
 
-            fn into_method_router(self, this: Arc<C>, filter: MethodFilter) -> MethodRouter {
-                on(filter, move |$($ty: Param<$ty, $via>,)* $last: LastParam<$last, $last_via>| {
-                    (self)(this.clone(), $($ty.0,)* $last.0)
+            fn into_endpoint(self, this: Arc<C>) -> Endpoint {
+                Arc::new(move |req: Request| {
+                    let handler = self.clone();
+                    let this = this.clone();
+                    Box::pin(async move {
+                        let args = async {
+                            #[allow(unused_mut)]
+                            let (mut parts, body) = req.into_parts();
+                            $(let $ty = <$ty as HandlerParam<$via>>::extract(&mut parts).await?;)*
+                            let $last = <$last as LastHandlerParam<$last_via>>::extract(
+                                Request::from_parts(parts, body),
+                            )
+                            .await?;
+                            Ok::<_, Rejection>(($($ty,)* $last,))
+                        }
+                        .await;
+                        match args {
+                            Ok(($($ty,)* $last,)) => output(handler(this, $($ty,)* $last).await),
+                            Err(Rejection::Error(err)) => Err(err),
+                            Err(Rejection::Answer(response)) => Ok(response),
+                        }
+                    })
                 })
             }
         }

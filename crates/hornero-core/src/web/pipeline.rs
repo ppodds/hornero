@@ -1,26 +1,17 @@
-//! Turns guards, interceptors, filters and DI middleware into axum layers.
-//!
-//! Per route, from the outside in: filter → guards → interceptors → handler.
-//! The layers use `route_layer`, so they only run for the methods a route registered: a request
-//! that ends in the 405 fallback never reaches another route's guards, interceptors or filters.
-//! Everything compiles down to `axum::middleware::from_fn`; there is no separate execution model.
+//! The axum layers around routes: 405 and 404 answers, DI middleware and the 5xx log. A route's
+//! own guards, interceptors and filters run in [`chain`](super::chain).
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::HttpBody;
 use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
-use axum::{Extension, Router};
 
-use super::extractor::RouteExtractors;
-use super::filter::ErasedFilter;
-use super::guard::{ErasedGuard, GuardContext};
-use super::interceptor::ErasedInterceptor;
 use super::middleware::ErasedMiddleware;
-use super::route::RouteContext;
 use crate::error::{ErrorExtension, HttpError};
 
 /// Whether `response` is axum's own answer with `status`: no body, no content type and no
@@ -72,86 +63,6 @@ pub(crate) fn root_fallback(root_mounts: Vec<Router>) -> Router {
             return response;
         }
         HttpError::not_found("no route matches the request").into_response()
-    }))
-}
-
-/// The innermost layer, so nothing outside it can drop the extractors from the request.
-pub(crate) fn with_extractors(route: MethodRouter, extractors: RouteExtractors) -> MethodRouter {
-    route.route_layer(Extension(extractors))
-}
-
-pub(crate) fn with_guards(
-    route: MethodRouter,
-    guards: Vec<Arc<dyn ErasedGuard>>,
-    ctx: Arc<RouteContext>,
-) -> MethodRouter {
-    let guards: Arc<[Arc<dyn ErasedGuard>]> = guards.into();
-    route.route_layer(from_fn(move |req: Request, next: Next| {
-        let guards = guards.clone();
-        let ctx = ctx.clone();
-        async move { run_guards(&guards, &ctx, req, next).await }
-    }))
-}
-
-async fn run_guards(
-    guards: &[Arc<dyn ErasedGuard>],
-    ctx: &RouteContext,
-    req: Request,
-    next: Next,
-) -> Response {
-    let (mut parts, body) = req.into_parts();
-    for guard in guards {
-        let mut guard_ctx = GuardContext {
-            route: ctx,
-            parts: &mut parts,
-        };
-        if let Err(err) = guard.can_activate(&mut guard_ctx).await {
-            return err.into_response();
-        }
-    }
-    next.run(Request::from_parts(parts, body)).await
-}
-
-pub(crate) fn with_interceptor(
-    route: MethodRouter,
-    interceptor: Arc<dyn ErasedInterceptor>,
-    ctx: Arc<RouteContext>,
-) -> MethodRouter {
-    route.route_layer(from_fn(move |req: Request, next: Next| {
-        let interceptor = interceptor.clone();
-        let ctx = ctx.clone();
-        async move { interceptor.intercept(&ctx, req, next).await }
-    }))
-}
-
-/// `filters` are ordered most specific first; the first one that catches the error handles it.
-pub(crate) fn with_filters(
-    route: MethodRouter,
-    filters: Vec<Arc<dyn ErasedFilter>>,
-    ctx: Arc<RouteContext>,
-) -> MethodRouter {
-    let filters: Arc<[Arc<dyn ErasedFilter>]> = filters.into();
-    route.route_layer(from_fn(move |req: Request, next: Next| {
-        let filters = filters.clone();
-        let ctx = ctx.clone();
-        async move {
-            let response = next.run(req).await;
-            let Some(ErrorExtension(err)) = response.extensions().get::<ErrorExtension>().cloned()
-            else {
-                return response;
-            };
-            let Some(filter) = filters.iter().find(|filter| filter.catches(&err)) else {
-                return response;
-            };
-            let mut caught = filter.catch(&err, &ctx).await;
-            // A filter that still answers 5xx without an error of its own: log the original.
-            if caught.status().is_server_error()
-                && caught.extensions().get::<ErrorExtension>().is_none()
-            {
-                caught.extensions_mut().insert(ErrorExtension(err));
-            }
-            caught
-        }
     }))
 }
 

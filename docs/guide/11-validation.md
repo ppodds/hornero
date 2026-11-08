@@ -131,7 +131,7 @@ impl<T: Validate> Validated for MyExtractor<T> {
 
 ## 錯誤格式
 
-所有輸入錯誤都會變成 problem+json 的 `HttpError`，因此也會經過 exception filter：
+所有輸入錯誤都會變成 `HttpError`，由應用的 [renderer](05-request-pipeline.md#renderer) 渲染（預設是 problem+json）：
 
 | 情況 | 狀態碼 | `detail` | `errors` |
 |---|---|---|---|
@@ -143,7 +143,7 @@ impl<T: Validate> Validated for MyExtractor<T> {
 
 要分辨「格式錯誤」與「規則不通過」，看回應裡有沒有 `errors` 欄位即可。
 
-不用 `Valid` 的 axum extractor（例如單純的 `Json<T>`）被拒絕時，回應是 axum 的純文字，不會經過 filter。要讓所有輸入錯誤都長得一樣，請一律使用 `Valid`，或 `Rejection = HttpError` 的自訂 extractor。
+不用 `Valid` 的 axum extractor（例如單純的 `Json<T>`）被拒絕時，hornero 保留 axum 的狀態碼與訊息，同樣交給 renderer，所以格式一致。`Valid` 多做的是檢查規則，並把欄位錯誤放在 `errors`。
 
 ## 常用的 garde 規則
 

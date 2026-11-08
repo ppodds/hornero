@@ -2,8 +2,9 @@ use std::any::type_name;
 use std::marker::PhantomData;
 
 use axum::http::Method;
-use axum::routing::{MethodFilter, MethodRouter};
+use axum::routing::MethodFilter;
 
+use super::chain::Endpoint;
 use super::enhancer::EnhancerRef;
 use super::filter::ExceptionFilter;
 use super::guard::Guard;
@@ -60,8 +61,8 @@ pub struct ControllerDef<C> {
     _controller: PhantomData<fn() -> C>,
 }
 
-/// Builds the method router of a route from the controller instance.
-type BuildRoute = Box<dyn FnOnce(&Instance, MethodFilter) -> MethodRouter + Send>;
+/// Builds the handler of a route from the controller instance.
+type BuildRoute = Box<dyn FnOnce(&Instance) -> Endpoint + Send>;
 
 /// One route registered on a controller. Handler-level enhancers and metadata go here.
 pub struct RouteDef {
@@ -190,11 +191,11 @@ impl<C: Send + Sync + 'static> ControllerDef<C> {
             extractors: Vec::new(),
             meta: Metadata::default(),
             filter,
-            build: Box::new(move |controller, filter| {
+            build: Box::new(move |controller| {
                 let this = controller
                     .downcast::<C>()
                     .expect("a controller's node holds the controller");
-                handler.into_method_router(this, filter)
+                handler.into_endpoint(this)
             }),
         };
         H::declare(&mut route);

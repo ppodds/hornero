@@ -83,7 +83,7 @@ Rust code in the docs is checked (`cargo test -p hornero-docs`): it is either a 
 
 ## Example
 
-`examples/todo` demonstrates the main concepts: configuration, SeaORM (sqlite), an `AuthModule` that exports a guard, typed route metadata, validation, a singleton audit log, a global interceptor and exception filter, and domain errors raised with `?` and converted by type in the exception filter. `/docs` serves the inferred Swagger UI.
+`examples/todo` demonstrates the main concepts: configuration, SeaORM (sqlite), an `AuthModule` that exports a guard, typed route metadata, validation, a singleton audit log, a global interceptor and error renderer, and domain errors raised with `?` and mapped by type in an exception filter. `/docs` serves the inferred Swagger UI.
 
 ```sh
 # Run from examples/todo: config.toml and the sqlite file todo.db are relative to the working directory

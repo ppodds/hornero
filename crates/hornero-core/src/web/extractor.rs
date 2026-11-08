@@ -10,11 +10,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use axum::http::request::Parts;
-use axum::response::{IntoResponse, Response};
 
 use super::controller::RouteDef;
 use super::enhancer::{EnhancerRef, extractor_slot_key};
-use super::handler::{HandlerParam, ViaExtractor};
+use super::handler::{HandlerParam, Rejection, ViaExtractor};
 use crate::di::injectable::Injectable;
 use crate::di::key::{Instance, Key};
 use crate::error::HttpError;
@@ -83,16 +82,13 @@ impl<E: Extractor + Injectable> HandlerParam<ViaExtractor> for Extracted<E> {
         }
     }
 
-    async fn extract(parts: &mut Parts) -> Result<Self, Response> {
+    async fn extract(parts: &mut Parts) -> Result<Self, Rejection> {
         let extractor = parts
             .extensions
             .get::<RouteExtractors>()
             .expect("a route carries the extractors its handler declares")
             .get::<E::Output>(extractor_slot_key::<E>());
-        match extractor.extract(parts).await {
-            Ok(value) => Ok(Self(value)),
-            Err(err) => Err(err.into_response()),
-        }
+        Ok(Self(extractor.extract(parts).await?))
     }
 }
 

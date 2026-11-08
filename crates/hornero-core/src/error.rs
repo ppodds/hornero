@@ -12,15 +12,16 @@ use crate::util::BoxError;
 
 /// An error that renders as an HTTP response. hornero's replacement for Nest's `HttpException`.
 ///
-/// Any `std::error::Error` converts into a 500 through `?`, with the original error kept as the
-/// source (logged, never sent to the client). An [`ExceptionFilter`](crate::ExceptionFilter) can
-/// turn such an error back into a specific response by checking the source's type with
-/// [`is`](Self::is) or [`downcast_ref`](Self::downcast_ref), Nest's `@Catch(TodoNotFound)`.
-/// Errors no filter catches stay 500s.
+/// Built with a status (`HttpError::not_found`, say), it is an answer and renders as is. Any
+/// `std::error::Error` converts into one through `?`, carrying the original as a domain error: the
+/// [`ExceptionFilter`](crate::ExceptionFilter) for its type maps it, Nest's `@Catch(TodoError)`.
+/// Without one it stays a 500 whose source (logged, never sent to the client) is the original
+/// error. axum's own rejections keep their status.
 ///
-/// The default rendering is RFC 9457 `application/problem+json`. The error is also attached to
-/// the response extensions so an exception filter can re-render it, and so hornero's router can log
-/// it when the final response is a 5xx.
+/// Within a route the error travels as a value, through guards, interceptors and the handler, and
+/// becomes a response once: through the application's [`ErrorRenderer`](crate::ErrorRenderer), or
+/// as RFC 9457 `application/problem+json` by default. The response keeps the error in its
+/// extensions, for [`in_response`](Self::in_response) and for logging the final 5xx.
 pub struct HttpError {
     status: StatusCode,
     message: Cow<'static, str>,
@@ -28,6 +29,8 @@ pub struct HttpError {
     source: Option<BoxError>,
     // Boxed: a `HeaderMap` inline would make every `Result<_, HttpError>` large.
     headers: Box<HeaderMap>,
+    /// The type of the domain error `?` converted, until an exception filter maps it.
+    raised: Option<&'static str>,
 }
 
 impl HttpError {
@@ -39,6 +42,7 @@ impl HttpError {
             details: None,
             source: None,
             headers: Box::default(),
+            raised: None,
         }
     }
 
@@ -79,7 +83,8 @@ impl HttpError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
-    /// Wraps an arbitrary error as a 500, keeping it as the (private) source.
+    /// Wraps an arbitrary error as a 500, keeping it as the (private) source. Unlike `?`, this is
+    /// the answer: exception filters do not see it.
     pub fn from_boxed(source: BoxError) -> Self {
         Self::internal("internal server error").with_source(source)
     }
@@ -98,8 +103,7 @@ impl HttpError {
     }
 
     /// Sets a response header, replacing any existing value for `name`. Headers travel with the
-    /// error, so an [`ExceptionFilter`](crate::ExceptionFilter) that builds its own response can
-    /// copy them from [`headers`](Self::headers).
+    /// error: hornero adds them to whatever response the renderer builds.
     pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
         self
@@ -150,10 +154,9 @@ impl HttpError {
 
     /// The error `response` was rendered from, if any.
     ///
-    /// An [`ExceptionFilter`](crate::ExceptionFilter) runs after the request is gone. An error
-    /// response that depends on the request belongs in an
-    /// [`Interceptor`](crate::Interceptor) or [`Middleware`](crate::Middleware) instead: read what
-    /// it needs before `next.run`, then look up the error here.
+    /// For [`Middleware`](crate::Middleware), which wraps routes and only sees their responses:
+    /// every error a route answers with is here, after filters mapped it. An
+    /// [`Interceptor`](crate::Interceptor) receives the error itself from `next.handle`.
     pub fn in_response(response: &Response) -> Option<&HttpError> {
         let ErrorExtension(err) = response.extensions().get::<ErrorExtension>()?;
         Some(err)
@@ -173,9 +176,47 @@ impl HttpError {
         problem
     }
 
+    /// Whether this carries a domain error no exception filter has mapped yet.
+    pub(crate) fn is_raised(&self) -> bool {
+        self.raised.is_some()
+    }
+
+    /// A filter's answer for `origin`: keeps the original error as the source, for the log.
+    pub(crate) fn caused_by(mut self, mut origin: HttpError) -> Self {
+        if self.source.is_none() {
+            self.source = origin.source.take();
+        }
+        self
+    }
+
+    /// Takes back the error a response was rendered from, so it travels as a value again.
+    pub(crate) fn take_from(response: &mut Response) -> Option<HttpError> {
+        let ErrorExtension(err) = response.extensions_mut().remove::<ErrorExtension>()?;
+        match Arc::try_unwrap(err) {
+            Ok(err) => Some(err),
+            Err(shared) => {
+                response.extensions_mut().insert(ErrorExtension(shared));
+                None
+            }
+        }
+    }
+
     /// Logs the error with its source chain. hornero's router calls this for responses that are
     /// still 5xx after exception filters ran.
     pub(crate) fn log(&self) {
+        if let Some(raised) = self.raised {
+            let source = self
+                .source
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            tracing::error!(
+                status = %self.status,
+                error = %source,
+                "unhandled {raised}: add an ExceptionFilter for it to choose the status",
+            );
+            return;
+        }
         match &self.source {
             Some(source) => {
                 let mut chain = source.to_string();
@@ -192,9 +233,45 @@ impl HttpError {
     }
 }
 
+/// What `?` does: carries `err` to the exception filter for its type, as a 500 until one maps it.
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
     fn from(err: E) -> Self {
-        Self::from_boxed(Box::new(err))
+        let mut this = Self::axum_rejection(&err)
+            .unwrap_or_else(|| Self::internal("internal server error"))
+            .with_source(err);
+        this.raised = Some(std::any::type_name::<E>());
+        this
+    }
+}
+
+impl HttpError {
+    /// axum's own rejections know their status: `Query::from_request_parts(..).await?` inside an
+    /// `Extractor` answers 400, as the same extractor in a handler does.
+    fn axum_rejection<E: 'static>(err: &E) -> Option<Self> {
+        use axum::extract::rejection::*;
+        macro_rules! known {
+            ($($ty:ty),* $(,)?) => {
+                let any = err as &dyn std::any::Any;
+                $(if let Some(rejection) = any.downcast_ref::<$ty>() {
+                    return Some(Self::new(rejection.status(), rejection.body_text()));
+                })*
+            };
+        }
+        known!(
+            JsonRejection,
+            QueryRejection,
+            FormRejection,
+            RawFormRejection,
+            PathRejection,
+            RawPathParamsRejection,
+            ExtensionRejection,
+            MatchedPathRejection,
+            NestedPathRejection,
+            BytesRejection,
+            StringRejection,
+            FailedToBufferBody,
+        );
+        None
     }
 }
 
@@ -215,7 +292,8 @@ impl fmt::Display for HttpError {
     }
 }
 
-/// Attached to responses produced from an [`HttpError`], so filters can find the original error.
+/// Attached to responses produced from an [`HttpError`], so the error can be taken back as a value
+/// (a handler's answer, an axum rejection), read by middleware and logged.
 #[derive(Clone)]
 pub(crate) struct ErrorExtension(pub(crate) Arc<HttpError>);
 

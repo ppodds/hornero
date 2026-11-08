@@ -286,7 +286,7 @@ assert_eq!(client.get("/me/ping").await.text(), "pong");
 
 - **參數本身就是宣告**：路由從 handler 的簽名得知 `CurrentUser`，和 `#[guards]` 一樣在 controller 的模組裡解析：看得到 provider 就用那個實例，否則建立一個私有的。依賴缺少是 bootstrap 錯誤，不會等到 request。宣告來自型別而不是 macro，所以 `type Me = Extracted<CurrentUser>` 這種 alias 與手寫路由一樣會被驗證。
 - **只有要求它的 handler 才執行**：上例的 `/me/ping` 不會查資料庫。放在 guard 裡的話，每個經過 guard 的 request 都會查。
-- **在 guard 與 interceptor 之後執行**：看得到它們寫進 extensions 的資料。回傳的 `Err` 就是回應，和 guard 的錯誤一樣會經過 exception filter。
+- **在 guard 與 interceptor 之後執行**：看得到它們寫進 extensions 的資料。回傳的 `Err` 和 handler 的錯誤一樣：用 `?` 拋出的 domain error 交給 exception filter，最後由 renderer 渲染。對 axum extractor 的 rejection 用 `?` 會保留它的狀態碼，例如 `Query::<Page>::from_request_parts(parts, &()).await?` 解析失敗是 400。
 - **不讀 body**：後面的參數仍然可以是 `Json<T>`。
 - **只能用在 controller handler**：`Extracted<E>` 不是 axum extractor，所以不能放進 mount 的 axum router，也不能包在 `Option` 裡。資料可有可無時，把 `Output` 設成 `Option<User>`。
 
@@ -376,7 +376,7 @@ extensions 裡的值必須是 `Clone`。交易這類不能複製的資源，讓 
 
 ### 依 request 資料呈現錯誤
 
-exception filter 只看得到錯誤與路由：它執行時 request 已經被 handler 消耗了。回應要依 request 的內容變化時，改用手上還有 request 的 interceptor 或 middleware：在 `next.run` 之前讀好需要的資料，之後用 `HttpError::in_response` 取得錯誤。
+exception filter 與 renderer 只看得到錯誤與路由：它們執行時 request 已經被 handler 消耗了。回應要依 request 的內容變化時，改用手上還有 request 的 middleware 或 interceptor，在呼叫 `next` 之前讀好需要的資料。middleware 之後用 `HttpError::in_response` 取得回應背後的錯誤；interceptor 收到的就是錯誤本身。
 
 ```rust
 use hornero::axum::body::Body;
@@ -433,9 +433,9 @@ assert_eq!(problem["detail"], "order 7 not found");
 
 | 用 | 看得到 | 看不到 |
 |---|---|---|
-| interceptor | guard 寫入的資料（例如已驗證的使用者） | guard 的拒絕：被擋下的 request 不會經過 interceptor |
-| middleware | 所有錯誤，包括 guard 的 401 / 403 | guard 寫入的資料：request 在 middleware 交出去之後才經過 guard |
+| interceptor | guard 寫入的資料（例如已驗證的使用者）；錯誤本身，可以用 `map_err` 改寫 | guard 的拒絕：被擋下的 request 不會經過 interceptor |
+| middleware | 所有錯誤，包括 guard 的 401 / 403 與 axum extractor 的 rejection | guard 寫入的資料：request 在 middleware 交出去之後才經過 guard |
 
-像上例這樣原地修改 response，`HttpError` 會留在 response 上，5xx 的 log 照常記錄。回傳全新的 response 則會連 `HttpError` 一起丟掉，這筆 5xx 就不會被 hornero 記錄。interceptor 在 filter 內層，所以錯誤還留在 response 上時，route 上的 filter 仍會接手渲染。
+像上例這樣原地修改 response，`HttpError` 會留在 response 上，5xx 的 log 照常記錄。回傳全新的 response 則會連 `HttpError` 一起丟掉，這筆 5xx 就不會被 hornero 記錄。interceptor 改寫後回傳的 `Err` 仍由 renderer 渲染，所以它適合改訊息或加 header；要依 request 換掉整個格式，用上面的 middleware。
 
 有一種情況兩邊都不夠：前一個 guard 寫入了使用者，後一個 guard 拒絕 request，而回應又要用到使用者。interceptor 看不到這個拒絕，middleware 看不到使用者。這時由拒絕的 guard 把需要的資料放進錯誤，例如 `HttpError::forbidden("...").with_details(...)`。

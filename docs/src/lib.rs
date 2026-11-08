@@ -123,6 +123,9 @@ pub mod adr {
     pub mod no_request_scope {
         #![doc = include_str!(concat!(env!("OUT_DIR"), "/adr/0007-no-request-scope.md"))]
     }
+    pub mod route_pipeline {
+        #![doc = include_str!(concat!(env!("OUT_DIR"), "/adr/0008-route-pipeline.md"))]
+    }
 }
 
 /// The repository root `README.md`: only its code blocks matter, so that the sample on the

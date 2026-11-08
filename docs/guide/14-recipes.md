@@ -85,7 +85,6 @@ Nest 的 `TransformInterceptor` 在 hornero 裡是一個會改寫 body 的 inter
 use hornero::axum::body::{Body, to_bytes};
 use hornero::axum::extract::Request;
 use hornero::axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use hornero::axum::middleware::Next;
 use hornero::prelude::*;
 use serde_json::{Value, json};
 
@@ -93,22 +92,27 @@ use serde_json::{Value, json};
 struct Envelope;
 
 impl Interceptor for Envelope {
-    async fn intercept(&self, _ctx: &RouteContext, req: Request, next: Next) -> Response {
-        let response = next.run(req).await;
+    async fn intercept(
+        &self,
+        _ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        let response = next.handle(req).await?; // 錯誤原樣往外傳，由 renderer 渲染
         let is_json = response
             .headers()
             .get(CONTENT_TYPE)
             .is_some_and(|value| value == "application/json");
         if !response.status().is_success() || !is_json {
-            return response; // 錯誤與非 JSON 回應保持原樣
+            return Ok(response); // 非 2xx 與非 JSON 的回應保持原樣
         }
         let (mut parts, body) = response.into_parts();
-        let data: Value = match to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-            Err(err) => return HttpError::from_boxed(err.into()).into_response(),
-        };
+        let bytes = to_bytes(body, 10 * 1024 * 1024)
+            .await
+            .map_err(|err| HttpError::from_boxed(err.into()))?;
+        let data: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         parts.headers.remove(CONTENT_LENGTH);
-        Response::from_parts(parts, Body::from(json!({ "data": data }).to_string()))
+        Ok(Response::from_parts(parts, Body::from(json!({ "data": data }).to_string())))
     }
 }
 
