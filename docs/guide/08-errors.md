@@ -30,7 +30,7 @@ hornero 有兩種錯誤：
 | `.with_source(err)` | 內部原因：寫進 log，不會出現在回應裡 |
 | `.with_header(name, value)` | 回應 header（同名會取代），例如 `HttpError::unauthorized(msg).with_header(WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"hornero\""))` |
 
-header 跟著錯誤本身走：不論回應由預設格式或自訂的 [renderer](#統一錯誤格式) 產生，hornero 都會加上它們。`with_details` 的值序列化失敗時，`details` 維持空白並以 `tracing::warn!` 記錄。
+header 跟著錯誤本身走：不論回應由預設格式或自訂的 [renderer](#統一錯誤格式) 產生，hornero 都會加上它們。handler 用 tuple 包住錯誤時也一樣：`([(SET_COOKIE, "session=; Max-Age=0")], HttpError::unauthorized(..))` 的 `Set-Cookie`、`(StatusCode::SERVICE_UNAVAILABLE, err)` 的狀態碼都會保留，和 axum 的行為相同。`with_details` 的值序列化失敗時，`details` 維持空白並以 `tracing::warn!` 記錄。
 
 預設渲染成 [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) 的 `application/problem+json`：
 
@@ -225,7 +225,8 @@ assert_eq!(res.json::<serde_json::Value>()["detail"], "internal server error"); 
 
 - `?` 把 `TodoError` 轉成拋出的 `HttpError`，原始錯誤保留為 source。
 - 錯誤離開 handler 時，hornero 依序查看 handler、controller、全域的 filter（同一層依註冊順序），交給**第一個 `Error` 型別相符的 filter**。guard、interceptor 與 extractor 用 `?` 拋出的錯誤也一樣。
-- filter 回傳的 `HttpError` 是回答，原始錯誤仍是它的 source：interceptor 與 renderer 裡，`err.is::<TodoError>()` 與 `err.downcast_ref::<TodoError>()` 依然取得到它。每個錯誤最多轉換一次。
+- filter 回傳的 `HttpError` 是回答，原始錯誤成為它的 source：interceptor、renderer 與 middleware 裡，`err.is::<TodoError>()` 與 `err.downcast_ref::<TodoError>()` 一定取得到它。回傳值自己設的 source 會被原始錯誤取代，所以 filter 自己的失敗（例如查詢翻譯失敗）請在 filter 裡記錄。
+- 每個錯誤最多轉換一次：filter 的回傳值不會再交給 filter，即使它是用 `HttpError::from` 建構的。
 - 型別比對看的是 `?` 轉換的那個錯誤本身，不會往 source chain 裡找：如果 `TodoError` 被包在另一個錯誤型別裡，請替外層的型別寫 filter。
 - 沒有 filter 處理時，錯誤成為不透露細節的 500 並寫進 log（見上一節）。被 filter 轉成 4xx 的錯誤不會留下 error log。
 - filter 只決定**狀態碼與訊息**，回應的格式由 [renderer](#統一錯誤格式) 決定，所以每個 filter 都不必重複格式。
@@ -309,9 +310,9 @@ assert!(body["error"].as_str().unwrap().starts_with("Failed to parse the request
 
 axum 的 rejection 怎麼變成錯誤：
 
-- axum 內建 extractor 的 rejection 保留它的狀態碼與訊息。在 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 裡對它用 `?`（例如 `Query::<Page>::from_request_parts(parts, &()).await?`）也一樣是 400，不會變成 500。
+- axum 內建 extractor 的 rejection 保留它的狀態碼與訊息。在 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 裡對它用 `?`（例如 `Query::<Page>::from_request_parts(parts, &()).await?`）也一樣是 400，不會變成 500；它和 handler 參數的 rejection 一樣是回答，filter 看不到。
 - `Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）回傳的就是那個 `HttpError`。
-- 其他 rejection 取它的狀態碼、文字與 header，例如 `(StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")], "missing bearer token")`。
+- 其他 rejection 取它的狀態碼、文字與 header（同名的多個值都保留），例如 `(StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")], "missing bearer token")`。
 - 不是 4xx / 5xx 的 rejection（例如導向登入頁的 `Redirect`）不是錯誤，原樣送出。
 
 ### 其他做法

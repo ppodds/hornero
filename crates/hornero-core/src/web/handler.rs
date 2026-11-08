@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
-use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 
@@ -65,13 +64,7 @@ impl Rejection {
                 .unwrap_or("invalid request")
                 .to_owned(),
         };
-        let mut err = HttpError::new(status, message);
-        for (name, value) in &parts.headers {
-            if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
-                err = err.with_header(name.clone(), value.clone());
-            }
-        }
-        Self::Error(err)
+        Self::Error(HttpError::new(status, message).with_response_headers(parts.headers))
     }
 }
 
@@ -143,7 +136,8 @@ impl<T: FromRequest<()>> LastHandlerParam<ViaBody> for T {
     }
 }
 
-/// The handler's answer: an `HttpError` it returned stays an error, for filters and interceptors.
+/// The handler's answer: an `HttpError` it returned stays an error, for filters and interceptors,
+/// with the headers and status a tuple around it added.
 fn output(answer: impl IntoResponse) -> Result<Response, HttpError> {
     let mut response = answer.into_response();
     match HttpError::take_from(&mut response) {

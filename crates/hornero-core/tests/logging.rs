@@ -51,10 +51,16 @@ async fn only_responses_still_failing_after_filters_are_logged() {
     get(&router, "/domain/todos/7").await;
     assert_eq!(take(&logs), "");
 
-    // Unmapped: logged once, with the source the client never sees, named as unhandled.
+    // Unmapped: logged once, with the source chain the client never sees, named as unhandled.
     get(&router, "/domain/billing").await;
     let logged = take(&logs);
-    assert_eq!(logged.matches("card 4242 declined").count(), 1, "{logged}");
+    assert_eq!(
+        logged
+            .matches("card 4242 declined: payment gateway timed out")
+            .count(),
+        1,
+        "{logged}"
+    );
     assert!(logged.contains("ERROR"), "{logged}");
     assert!(logged.contains("unhandled"), "{logged}");
     assert!(logged.contains("BillingError"), "{logged}");

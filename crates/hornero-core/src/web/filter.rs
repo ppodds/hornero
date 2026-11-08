@@ -29,7 +29,10 @@ pub trait ExceptionFilter: Send + Sync + 'static {
     /// The error this filter handles.
     type Error: Error + Send + Sync + 'static;
 
-    /// The HTTP answer for `err`. The original error stays its source, for the log.
+    /// The HTTP answer for `err`. The original error becomes its source, for the log and for
+    /// `is` / `downcast_ref` downstream, replacing any source the answer sets: a failure of the
+    /// filter's own (a lookup it needed, say) is for the filter to log. The answer is final, even
+    /// one built with `HttpError::from`: no filter maps it again.
     fn catch(
         &self,
         err: &Self::Error,

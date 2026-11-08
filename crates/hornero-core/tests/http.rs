@@ -775,8 +775,11 @@ async fn filters_catch_domain_errors_raised_with_the_question_mark() {
     let problem: serde_json::Value = serde_json::from_str(&res.body).unwrap();
     assert_eq!(problem["detail"], "todo 7 not found");
 
-    // An `HttpError` with a status is already an answer: no filter sees it.
+    // An `HttpError` with a status is already an answer: no filter sees it, even when its source
+    // is a type a filter catches.
     let res = get(&router, "/domain/conflict").await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    let res = get(&router, "/domain/sourced-conflict").await;
     assert_eq!(res.status, StatusCode::CONFLICT);
 
     // Caught, but left as a 500 by the filter.
@@ -829,6 +832,46 @@ async fn the_first_filter_for_the_type_handles_the_error() {
         get(&teapot_first, "/domain/todos/7").await.status,
         StatusCode::IM_A_TEAPOT
     );
+}
+
+// Answers with another domain error, built the way `?` builds one.
+unit_injectable!(RethrowingBilling);
+
+impl ExceptionFilter for RethrowingBilling {
+    type Error = common::domain::BillingError;
+
+    async fn catch(&self, _: &common::domain::BillingError, _: &RouteContext) -> HttpError {
+        HttpError::from(common::domain::TodoError::NotFound(1))
+    }
+}
+
+/// Renders the status, and whether the error is still the `BillingError` the handler raised.
+fn billing_cause(err: &HttpError, _: &RouteContext) -> Response {
+    let billing = err.is::<common::domain::BillingError>();
+    (
+        err.status(),
+        format!("{} billing={billing}", err.status().as_u16()),
+    )
+        .into_response()
+}
+
+#[tokio::test]
+async fn a_filters_answer_is_final_and_keeps_the_original_error() {
+    // `TodoErrorFilter` would turn the `TodoError` of the answer into a 404, at the handler's exit,
+    // at the interceptor's and at rendering: it sees it at none of them.
+    let router = Hornero::new(DomainApp)
+        .interceptor::<SeenError>()
+        .filter::<RethrowingBilling>()
+        .filter::<common::domain::TodoErrorFilter>()
+        .error_renderer(billing_cause)
+        .build()
+        .await
+        .unwrap()
+        .router();
+    let res = get(&router, "/domain/billing").await;
+    assert_eq!(res.body, "500 billing=true");
+    // The answer's own source gave way to the original error.
+    assert_eq!(res.headers["x-seen"], "500 false");
 }
 
 // --- errors travel as values ---------------------------------------------------------------
@@ -997,6 +1040,25 @@ impl<S: Send + Sync> FromRequestParts<S> for Bearer {
     }
 }
 
+/// Rejects with two challenges, as two `WWW-Authenticate` values.
+struct Challenged;
+
+impl<S: Send + Sync> FromRequestParts<S> for Challenged {
+    type Rejection = Response;
+
+    async fn from_request_parts(_: &mut Parts, _: &S) -> Result<Self, Response> {
+        let mut rejection = (StatusCode::UNAUTHORIZED, "no credentials").into_response();
+        let headers = rejection.headers_mut();
+        let challenge = axum::http::header::WWW_AUTHENTICATE;
+        headers.append(challenge.clone(), HeaderValue::from_static("Bearer"));
+        headers.append(
+            challenge,
+            HeaderValue::from_static("Basic realm=\"hornero\""),
+        );
+        Err(rejection)
+    }
+}
+
 /// Rejects with a redirect: an answer rather than an error.
 struct LoggedIn;
 
@@ -1030,6 +1092,11 @@ impl Controller for RejectingController {
         c.get("/bearer", "bearer", |_: Arc<Self>, _: Bearer| async {
             "in"
         });
+        c.get(
+            "/challenged",
+            "challenged",
+            |_: Arc<Self>, _: Challenged| async { "in" },
+        );
         c.get("/redirect", "redirect", |_: Arc<Self>, _: LoggedIn| async {
             "in"
         });
@@ -1086,10 +1153,98 @@ async fn axum_rejections_are_errors_the_renderer_formats() {
     );
     assert_eq!(res.headers["www-authenticate"], "Bearer");
 
+    // Repeated headers keep every value.
+    let res = get(&router, "/challenged").await;
+    let challenges: Vec<_> = res.headers.get_all("www-authenticate").iter().collect();
+    assert_eq!(challenges, ["Bearer", "Basic realm=\"hornero\""]);
+
     // Not an error status: sent as is.
     let res = get(&router, "/redirect").await;
     assert_eq!(res.status, StatusCode::SEE_OTHER);
     assert_eq!(res.headers["location"], "/login");
+}
+
+unit_injectable!(TeapotQueries);
+
+impl ExceptionFilter for TeapotQueries {
+    type Error = axum::extract::rejection::QueryRejection;
+
+    async fn catch(&self, _: &Self::Error, _: &RouteContext) -> HttpError {
+        HttpError::new(StatusCode::IM_A_TEAPOT, "teapot")
+    }
+}
+
+#[tokio::test]
+async fn filters_do_not_map_axum_rejections() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<RejectingController>();
+        }
+    }
+    let router = Hornero::new(App)
+        .filter::<TeapotQueries>()
+        .build()
+        .await
+        .unwrap()
+        .router();
+
+    // Forwarded with `?` from an `Extractor`, as a handler parameter would answer it.
+    assert_eq!(
+        get(&router, "/page?n=x").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+unit_injectable!(DecoratedErrorController);
+
+impl Controller for DecoratedErrorController {
+    fn routes(c: &mut ControllerDef<Self>) {
+        c.get("/logout", "logout", |_: Arc<Self>| async {
+            (
+                [(axum::http::header::SET_COOKIE, "session=; Max-Age=0")],
+                HttpError::unauthorized("session expired"),
+            )
+        });
+        c.get("/teapot", "teapot", |_: Arc<Self>| async {
+            (
+                StatusCode::IM_A_TEAPOT,
+                HttpError::conflict("short and stout"),
+            )
+        });
+    }
+}
+
+#[tokio::test]
+async fn errors_keep_what_a_tuple_adds_around_them() {
+    struct App;
+    impl Module for App {
+        fn define(&self, m: &mut ModuleDef) {
+            m.controller::<DecoratedErrorController>();
+        }
+    }
+    let router = Hornero::new(App)
+        .error_renderer(plain)
+        .build()
+        .await
+        .unwrap()
+        .router();
+
+    // The renderer's format, the error's own header and the tuple's.
+    let res = get(&router, "/logout").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::UNAUTHORIZED, "session expired")
+    );
+    assert_eq!(res.headers["www-authenticate"], "Bearer");
+    assert_eq!(res.headers["set-cookie"], "session=; Max-Age=0");
+
+    // A status the tuple sets wins, as it does in axum.
+    let res = get(&router, "/teapot").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::IM_A_TEAPOT, "short and stout")
+    );
 }
 
 // --- global enhancers declared by modules (`AppGuard<G>`, Nest's APP_GUARD) ------------------
@@ -2951,7 +3106,13 @@ async fn transient_enhancers_are_built_at_bootstrap() {
             m.controller::<Counting>();
         }
     }
-    let router = Hornero::new(App).build().await.unwrap().router();
+    let app = Hornero::new(App).build().await.unwrap();
+    assert_eq!(
+        BUILDS.load(Ordering::SeqCst),
+        1,
+        "bootstrap builds the guard"
+    );
+    let router = app.router();
     get(&router, "/counted").await;
     get(&router, "/counted").await;
     assert_eq!(

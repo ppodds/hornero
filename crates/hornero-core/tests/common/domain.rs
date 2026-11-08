@@ -25,8 +25,9 @@ impl std::fmt::Display for TodoError {
 
 impl std::error::Error for TodoError {}
 
+/// A domain error with a cause of its own, which no filter catches.
 #[derive(Debug)]
-pub struct BillingError;
+pub struct BillingError(GatewayTimeout);
 
 impl std::fmt::Display for BillingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,7 +35,22 @@ impl std::fmt::Display for BillingError {
     }
 }
 
-impl std::error::Error for BillingError {}
+impl std::error::Error for BillingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayTimeout;
+
+impl std::fmt::Display for GatewayTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("payment gateway timed out")
+    }
+}
+
+impl std::error::Error for GatewayTimeout {}
 
 macro_rules! unit_injectable {
     ($($name:ident),+) => {$(
@@ -78,7 +94,7 @@ pub async fn find_todo(id: u32) -> Result<&'static str, TodoError> {
 }
 
 pub async fn charge() -> Result<(), BillingError> {
-    Err(BillingError)
+    Err(BillingError(GatewayTimeout))
 }
 
 impl Controller for DomainController {
@@ -99,6 +115,14 @@ impl Controller for DomainController {
         c.get("/conflict", "conflict", |_: Arc<Self>| async {
             HttpError::conflict("already exists")
         });
+        // An answer whose source is a type a filter catches: still the answer.
+        c.get(
+            "/sourced-conflict",
+            "sourced_conflict",
+            |_: Arc<Self>| async {
+                HttpError::conflict("already exists").with_source(TodoError::NotFound(7))
+            },
+        );
         c.get("/panic", "panic", |_: Arc<Self>| async {
             if true {
                 panic!("boom");

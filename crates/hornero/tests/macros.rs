@@ -835,17 +835,30 @@ async fn handlers_receive_extractors_by_type_or_alias() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[module(controllers = [AccountController])]
-pub struct AccountModuleWithoutAccounts;
+/// Names the extractor only through the alias, so the alias alone must declare it.
+#[controller("/aliased")]
+pub struct AliasOnlyController;
+
+#[routes]
+impl AliasOnlyController {
+    #[get("/me")]
+    fn me(&self, account: Account) -> String {
+        account.0
+    }
+}
+
+#[module(controllers = [AliasOnlyController])]
+pub struct AliasModuleWithoutAccounts;
 
 #[test]
 fn an_alias_does_not_hide_a_missing_dependency() {
-    let err = Hornero::new(AccountModuleWithoutAccounts)
+    let err = Hornero::new(AliasModuleWithoutAccounts)
         .validate()
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("CurrentAccount (in AccountModuleWithoutAccounts) requires `Accounts`")
+            .contains("CurrentAccount (in AliasModuleWithoutAccounts) requires `Accounts`"),
+        "{err}"
     );
 }
 

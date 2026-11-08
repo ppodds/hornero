@@ -181,19 +181,27 @@ impl HttpError {
         self.raised.is_some()
     }
 
-    /// A filter's answer for `origin`: keeps the original error as the source, for the log.
+    /// A filter's answer for `origin`. The original error becomes its source, replacing any the
+    /// answer set, so `is` and `downcast_ref` find it whatever the filter returned; and the answer
+    /// is never mapped again, even when the filter built it with `HttpError::from`.
     pub(crate) fn caused_by(mut self, mut origin: HttpError) -> Self {
-        if self.source.is_none() {
-            self.source = origin.source.take();
+        if let Some(source) = origin.source.take() {
+            self.source = Some(source);
         }
+        self.raised = None;
         self
     }
 
-    /// Takes back the error a response was rendered from, so it travels as a value again.
+    /// Takes back the error a response was rendered from, so it travels as a value again, with
+    /// what the response added around it: the headers and status of a `(headers, HttpError)` or
+    /// `(StatusCode, HttpError)` tuple.
     pub(crate) fn take_from(response: &mut Response) -> Option<HttpError> {
         let ErrorExtension(err) = response.extensions_mut().remove::<ErrorExtension>()?;
         match Arc::try_unwrap(err) {
-            Ok(err) => Some(err),
+            Ok(mut err) => {
+                err.status = response.status();
+                Some(err.with_response_headers(std::mem::take(response.headers_mut())))
+            }
             Err(shared) => {
                 response.extensions_mut().insert(ErrorExtension(shared));
                 None
@@ -201,44 +209,57 @@ impl HttpError {
         }
     }
 
+    /// Adds the headers of a response the error is taken from, repeated values included. The
+    /// body's own `Content-Type` and `Content-Length` stay behind: the renderer sets its own.
+    pub(crate) fn with_response_headers(mut self, mut headers: HeaderMap) -> Self {
+        headers.remove(header::CONTENT_TYPE);
+        headers.remove(header::CONTENT_LENGTH);
+        self.headers.extend(headers);
+        self
+    }
+
     /// Logs the error with its source chain. hornero's router calls this for responses that are
     /// still 5xx after exception filters ran.
     pub(crate) fn log(&self) {
+        let chain = self.source.as_deref().map(source_chain);
         if let Some(raised) = self.raised {
-            let source = self
-                .source
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default();
             tracing::error!(
                 status = %self.status,
-                error = %source,
+                error = %chain.unwrap_or_default(),
                 "unhandled {raised}: add an ExceptionFilter for it to choose the status",
             );
             return;
         }
-        match &self.source {
-            Some(source) => {
-                let mut chain = source.to_string();
-                let mut cause = source.source();
-                while let Some(err) = cause {
-                    chain.push_str(": ");
-                    chain.push_str(&err.to_string());
-                    cause = err.source();
-                }
-                tracing::error!(status = %self.status, error = %chain, "{}", self.message);
+        match chain {
+            Some(chain) => {
+                tracing::error!(status = %self.status, error = %chain, "{}", self.message)
             }
             None => tracing::error!(status = %self.status, "{}", self.message),
         }
     }
 }
 
+/// `err` and each of its causes, separated by `: `.
+fn source_chain(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    let mut chain = err.to_string();
+    let mut cause = err.source();
+    while let Some(err) = cause {
+        chain.push_str(": ");
+        chain.push_str(&err.to_string());
+        cause = err.source();
+    }
+    chain
+}
+
 /// What `?` does: carries `err` to the exception filter for its type, as a 500 until one maps it.
+/// axum's own rejections are answers instead, with their status, as when axum extracts them from
+/// a handler parameter: no filter sees them either way.
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
     fn from(err: E) -> Self {
-        let mut this = Self::axum_rejection(&err)
-            .unwrap_or_else(|| Self::internal("internal server error"))
-            .with_source(err);
+        if let Some(answer) = Self::axum_rejection(&err) {
+            return answer.with_source(err);
+        }
+        let mut this = Self::internal("internal server error").with_source(err);
         this.raised = Some(std::any::type_name::<E>());
         this
     }
