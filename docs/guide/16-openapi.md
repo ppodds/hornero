@@ -144,7 +144,7 @@ body 與參數的型別這樣對應到 schema：
 沒有寫 `body` 的 `#[api_response]` 依狀態碼決定 body：
 
 - **2xx**（204 除外）沿用從回傳型別推導的 body，所以 `#[api_response(201)]` 就足以把 `(StatusCode, Json<Todo>)` 說清楚。
-- **4xx、5xx** 是 hornero 的錯誤格式：`application/problem+json` 的 `ProblemDetails` schema（見 [錯誤處理](08-errors.md)）。
+- **4xx、5xx** 是 hornero 的錯誤格式：`application/problem+json` 的 `ProblemDetails` schema（見 [錯誤處理](08-errors.md)）。用 `Hornero::error_renderer` 換掉格式時，文件推導不出新的格式，請用 `.modify` 改寫錯誤回應的 media type 與 schema。
 - 只要宣告了任何 2xx，就不會再自動加上 200。
 - `description` 預設是狀態碼的標準說明，例如 `Not Found`。
 

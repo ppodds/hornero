@@ -382,7 +382,7 @@ exception filter 與 renderer 只看得到錯誤與路由：它們執行時 requ
 use hornero::axum::body::Body;
 use hornero::axum::extract::Request;
 use hornero::axum::http::HeaderValue;
-use hornero::axum::http::header::{ACCEPT, CONTENT_TYPE};
+use hornero::axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use hornero::axum::middleware::Next;
 use hornero::prelude::*;
 
@@ -395,12 +395,23 @@ impl Middleware for HtmlErrors {
         let wants_html = req.headers().get(ACCEPT).is_some_and(|value| value == "text/html");
         let mut response = next.run(req).await;
         if wants_html && let Some(err) = HttpError::in_response(&response) {
-            let page = format!("<h1>{}</h1>", err.message());
-            response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            let page = format!("<h1>{}</h1>", escape_html(err.message()));
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            headers.remove(CONTENT_LENGTH); // 換了 body，原本的長度就不對了
             *response.body_mut() = Body::from(page);
         }
         response
     }
+}
+
+/// 訊息可能含有 request 的內容（例如 axum 無法解析的路徑參數），放進 HTML 前要 escape
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[controller("/orders")]
@@ -425,6 +436,11 @@ let client = app.client();
 let page = client.get("/orders/7").header("accept", "text/html").await;
 assert_eq!(page.status(), StatusCode::NOT_FOUND);
 assert_eq!(page.text(), "<h1>order 7 not found</h1>");
+
+// 路徑參數原樣出現在 axum 的錯誤訊息裡，escape 之後只是文字
+let page = client.get("/orders/%3Cscript%3E").header("accept", "text/html").await;
+assert_eq!(page.status(), StatusCode::BAD_REQUEST);
+assert!(page.text().contains("&lt;script&gt;"), "{}", page.text());
 
 let problem: serde_json::Value = client.get("/orders/7").await.json();
 assert_eq!(problem["detail"], "order 7 not found");
