@@ -617,6 +617,73 @@ fn extractors_implementing_api_security_secure_the_routes_that_take_them() {
     assert!(warnings(&routes, &config()).is_empty());
 }
 
+/// Requires the `todos:read` scope of the bearer scheme.
+#[derive(Injectable)]
+struct Reader;
+
+impl Guard for Reader {
+    async fn can_activate(&self, _: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        Ok(())
+    }
+}
+
+impl ApiSecurity for Reader {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+
+    fn scopes(_: &RouteInfo) -> Vec<String> {
+        vec!["todos:read".to_owned()]
+    }
+}
+
+/// Requires `todos:write` of the same scheme, and `todos:read` again.
+#[derive(Injectable)]
+struct Writer;
+
+impl Extractor for Writer {
+    type Output = String;
+
+    async fn extract(&self, _: &mut Parts) -> Result<String, HttpError> {
+        Ok("ada".to_owned())
+    }
+}
+
+impl ApiSecurity for Writer {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+
+    fn scopes(_: &RouteInfo) -> Vec<String> {
+        vec!["todos:read".to_owned(), "todos:write".to_owned()]
+    }
+}
+
+#[controller("/scoped")]
+#[guards(Reader)]
+struct ScopedController;
+
+#[routes]
+impl ScopedController {
+    #[post("/")]
+    async fn write(&self, Extracted(name): Extracted<Writer>) -> String {
+        name
+    }
+}
+
+#[module(controllers = [ScopedController])]
+struct ScopedModule;
+
+#[test]
+fn enhancers_sharing_a_scheme_require_the_scopes_of_each() {
+    let routes = Hornero::new(ScopedModule).routes().unwrap();
+    let doc = json_of(&document(&routes, &config()));
+    assert_eq!(
+        doc["paths"]["/scoped"]["post"]["security"],
+        json!([{ "bearer": ["todos:read", "todos:write"] }])
+    );
+}
+
 // --- what cannot be inferred -------------------------------------------------------------------
 
 #[derive(Deserialize)]
