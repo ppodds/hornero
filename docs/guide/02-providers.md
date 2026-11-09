@@ -40,12 +40,12 @@ struct 層級可以用 `#[inject(...)]` 設定 scope 與生命週期 hook，分�
 use hornero::prelude::*;
 
 #[derive(Injectable)]
-#[inject(scope = request, hooks)]
+#[inject(scope = singleton, hooks)]
 struct AuditLog { /* ... */ }
 # impl Lifecycle for AuditLog {}
 ```
 
-`#[injectable(scope = request)]` 寫在 struct 上，等同於 `#[derive(Injectable)]` 加上 `#[inject(scope = request)]`。
+`#[injectable(scope = transient)]` 寫在 struct 上，等同於 `#[derive(Injectable)]` 加上 `#[inject(scope = transient)]`。
 
 ## Constructor injection：`#[injectable]` 寫在 `impl` 上
 
@@ -353,7 +353,6 @@ assert_eq!(app.get::<Checkout>().unwrap().pay(), "paid");
 | 型別 | Scope | 用途 |
 |---|---|---|
 | `Arc<Shutdown>` | singleton | 得知應用正在關閉、或主動觸發關閉，見 [生命週期](07-lifecycle.md) |
-| `Arc<RequestContext>` | request | 目前 request 的 method、URI、headers 與 extensions，見 [Scope](06-scopes.md) |
 | `Arc<Routes>` | singleton | 應用所有 controller 路由的清單（method、完整路徑、guard、metadata），產生 API 文件用，見 [OpenAPI](16-openapi.md) |
 
 ## 設計規則

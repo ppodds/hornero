@@ -14,7 +14,7 @@ utoipa = "6"                                                 # derive macro 產�
 | [`OpenApiConfig`](#openapiconfig) | 文件的標題、版本、位置與其他設定 |
 | [`document`](#document-與-warnings) | 從路由表產生文件，不需要啟動 server |
 | [`warnings`](#document-與-warnings) | 推導不出來的地方 |
-| [`ApiSecurity`](#trait-apisecurity) | 讓 guard 在文件中宣告 security scheme |
+| [`ApiSecurity`](#trait-apisecurity) | 讓 guard 或 `Extractor` 在文件中宣告 security scheme |
 | [`SecurityScheme`](#securityscheme) | security scheme 與常見 scheme 的捷徑 |
 | [`describe_security`](#describe_security) | 手寫 `Injectable` 的 guard 用來記錄 scheme |
 | `ToSchema`、`IntoParams` | re-export 的 utoipa derive 與 trait，給 DTO 與 query 型別使用 |

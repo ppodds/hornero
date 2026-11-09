@@ -126,15 +126,11 @@ pub struct AppModule;
 ```rust,ignore
 #[test]
 fn the_dependency_graph_is_valid() {
-    let report = Hornero::new(AppModule).validate().unwrap();
-    assert!(
-        report.is_empty(),
-        "nothing should be request-scoped:\n{report}"
-    );
+    Hornero::new(AppModule).validate().unwrap();
 }
 ```
 
-這個測試不建構任何東西，幾毫秒就跑完，建議每個專案都放一個。它也是檢查 scope 傳染的好地方：上例斷言沒有任何元件變成 request-scoped，所以有人不小心讓 controller 被傳染時，測試就會失敗。
+這個測試不建構任何東西，幾毫秒就跑完，建議每個專案都放一個。
 
 ## `TestApp` 與 override
 
@@ -228,6 +224,7 @@ async fn lists_todos() {
 | `override_guard::<G>(guard)` | 所有用到 guard `G` 的地方；替換品可以是任何實作 `Guard` 的型別 |
 | `override_interceptor::<I>(interceptor)` | 同上，interceptor |
 | `override_filter::<F>(filter)` | 同上，exception filter |
+| `override_extractor::<E>(extractor)` | 所有 `Extracted<E>` 參數；替換品可以是任何 `Output` 相同的 `Extractor`，不影響注入 `E` 的 provider（那要用 `override_value`） |
 | `configure(\|hornero\| ...)` | 其他 `Hornero` 設定：全域 enhancer、layer、global prefix |
 
 override 的規則：
@@ -253,6 +250,73 @@ async fn overrides_must_replace_something() {
 
     assert!(err.to_string().contains("unused override"));
 }
+```
+
+## 替換 request 資料
+
+`override_guard` 的替換品只決定放不放行。handler 要讀 guard 寫入的資料時（`AuthUser` 這類 proof extractor），替換品也要寫入同樣的資料，否則 proof extractor 會回 401。
+
+`Extractor` 則是直接替換 handler 收到的值，原本的依賴也不再需要：
+
+```rust
+use hornero::axum::http::request::Parts;
+use hornero::prelude::*;
+use hornero_testing::TestApp;
+
+struct User {
+    name: String,
+}
+
+struct Users;
+
+#[derive(Injectable)]
+struct CurrentUser {
+    users: Arc<Users>,
+}
+
+impl Extractor for CurrentUser {
+    type Output = User;
+
+    async fn extract(&self, _: &mut Parts) -> Result<User, HttpError> {
+        Err(HttpError::unauthorized("no session"))
+    }
+}
+
+/// 固定的使用者
+struct Ada;
+
+impl Extractor for Ada {
+    type Output = User;
+
+    async fn extract(&self, _: &mut Parts) -> Result<User, HttpError> {
+        Ok(User { name: "ada".into() })
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    fn me(&self, Extracted(user): Extracted<CurrentUser>) -> String {
+        user.name
+    }
+}
+
+// 沒有註冊 Users：替換之後就不需要它了
+#[module(controllers = [MeController])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let app = TestApp::new(AppModule)
+    .override_extractor::<CurrentUser>(Ada)
+    .build()
+    .await
+    .unwrap();
+assert_eq!(app.client().get("/me").await.text(), "ada");
+# }
 ```
 
 ## 測試真正的 guard
@@ -370,7 +434,7 @@ async fn created_todos_reach_the_repository() {
 }
 ```
 
-`get` 找不到時會 panic 並說明原因；`try_get` 則回傳 `Option`。request-scoped 與 transient 的 provider 無法這樣取得。
+`get` 找不到時會 panic 並說明原因；`try_get` 則回傳 `Option`。transient 的 provider 無法這樣取得。
 
 ## 重用正式環境的 builder
 
@@ -423,6 +487,5 @@ async fn service_rejects_blank_titles() {
 ## 其他建議
 
 - **資料庫測試**用 SQLite 的 `sqlite::memory:`（見 [資料庫](12-database.md#測試)），或把 repository 放在 trait 後面，再替換成 in-memory 實作。
-- **request-scoped 元件**也能用 override 替換；用 `app.scope_report()` 斷言哪些元件是 request-scoped。
 - **生命週期**：`app.close().await` 會執行 destroy 與 shutdown hook，可以用來測試清理邏輯。
 - **錯誤訊息**：`BootError` 的 `Display` 輸出很穩定，可以搭配 [insta](https://insta.rs) 做 snapshot 測試。

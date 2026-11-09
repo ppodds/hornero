@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderValue;
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use hornero::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -98,12 +99,12 @@ impl Shouter {
     }
 }
 
-static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static STAMPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Request-scoped through the struct form of `#[injectable]`.
-#[injectable(scope = request)]
-pub struct RequestStamp {
-    #[inject(with = REQUESTS.fetch_add(1, Ordering::SeqCst))]
+/// Transient through the struct form of `#[injectable]`.
+#[injectable(scope = transient)]
+pub struct Stamp {
+    #[inject(with = STAMPS.fetch_add(1, Ordering::SeqCst))]
     number: usize,
 }
 
@@ -140,24 +141,47 @@ pub struct Audited(&'static str);
 pub struct AuditInterceptor;
 
 impl Interceptor for AuditInterceptor {
-    async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
-        let mut response = next.run(req).await;
+    async fn intercept(
+        &self,
+        ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        let mut response = next.handle(req).await?;
         if let Some(Audited(label)) = ctx.meta::<Audited>() {
             response
                 .headers_mut()
                 .insert("x-audited", HeaderValue::from_static(label));
         }
-        response
+        Ok(response)
     }
 }
 
 #[derive(Injectable)]
 pub struct PlainTextErrors;
 
-impl ExceptionFilter for PlainTextErrors {
-    async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-        (err.status(), format!("error: {}", err.message())).into_response()
+/// Raised by the note store when a note is missing.
+#[derive(Debug)]
+pub struct NoteMissing(u32);
+
+impl std::fmt::Display for NoteMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "note {} not found", self.0)
     }
+}
+
+impl std::error::Error for NoteMissing {}
+
+impl ExceptionFilter for PlainTextErrors {
+    type Error = NoteMissing;
+
+    async fn catch(&self, err: &NoteMissing, _: &RouteContext) -> HttpError {
+        HttpError::not_found(err.to_string())
+    }
+}
+
+fn plain_text(err: &HttpError, _: &RouteContext) -> Response {
+    (err.status(), format!("error: {}", err.message())).into_response()
 }
 
 #[derive(Injectable)]
@@ -216,7 +240,7 @@ impl NoteController {
             .get(&id)
             .cloned()
             .map(Json)
-            .ok_or_else(|| HttpError::not_found(format!("note {id} not found")))
+            .ok_or_else(|| NoteMissing(id).into())
     }
 
     #[get("/hello/{name}")]
@@ -252,9 +276,9 @@ impl NoteController {
 }
 
 #[controller]
-#[injectable(scope = request)]
+#[injectable(scope = singleton)]
 pub struct StampController {
-    stamp: Arc<RequestStamp>,
+    stamp: Arc<Stamp>,
 }
 
 #[routes]
@@ -291,7 +315,7 @@ pub struct CoreModule;
 )]
 pub struct NotesModule;
 
-#[module(controllers = [StampController], providers = [RequestStamp])]
+#[module(controllers = [StampController], providers = [Stamp])]
 pub struct StampModule;
 
 #[module(imports = [ConfigModule, NotesModule, StampModule])]
@@ -318,15 +342,16 @@ fn request(method: &str, uri: &str) -> axum::http::request::Builder {
 
 #[test]
 fn the_macro_built_graph_is_valid() {
-    let report = Hornero::new(AppModule).validate().unwrap();
-    assert!(report.find("RequestStamp").unwrap().declared);
-    assert!(report.find("StampController").unwrap().declared);
-    assert!(report.find("NoteController").is_none());
+    Hornero::new(AppModule).validate().unwrap();
 }
 
 #[tokio::test]
 async fn macro_built_application_serves_requests() {
-    let app = Hornero::new(AppModule).build().await.unwrap();
+    let app = Hornero::new(AppModule)
+        .error_renderer(plain_text)
+        .build()
+        .await
+        .unwrap();
     let router = app.router();
 
     // Public route with sync handler, Path + Query extractors, constructor-injected services.
@@ -416,10 +441,7 @@ async fn macro_built_application_serves_requests() {
         request("GET", "/stamp").body(Body::empty()).unwrap(),
     )
     .await;
-    assert_ne!(
-        first, second,
-        "request-scoped controller sees a new stamp per request"
-    );
+    assert_eq!(first, second, "a controller is built once, at bootstrap");
 
     assert!(app.get::<Counter>().unwrap().0.load(Ordering::SeqCst) >= 6);
 }
@@ -458,23 +480,6 @@ async fn macro_built_providers_can_be_overridden() {
     assert_eq!(status, StatusCode::CREATED);
     let note: Note = serde_json::from_str(&body).unwrap();
     assert_eq!((note.created_at, note.text.as_str()), (42, "t (by tester)"));
-}
-
-#[test]
-fn explicit_scopes_are_pinned() {
-    #[injectable(scope = singleton)]
-    pub struct Pinned {
-        #[allow(dead_code)]
-        stamp: Arc<RequestStamp>,
-    }
-    #[module(providers = [RequestStamp, Pinned])]
-    pub struct App;
-    let err = Hornero::new(App).validate().unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("Pinned (in App) is pinned to singleton scope"),
-        "{err}"
-    );
 }
 
 #[test]
@@ -751,6 +756,110 @@ async fn openapi_attributes_do_not_change_routing() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+// --- extractors that are providers ---------------------------------------------------------
+
+pub struct Accounts;
+
+impl Accounts {
+    fn name_of(&self, token: &str) -> Option<String> {
+        (token == "ada-token").then(|| "ada".to_owned())
+    }
+}
+
+#[derive(Injectable)]
+pub struct CurrentAccount {
+    accounts: Arc<Accounts>,
+}
+
+impl Extractor for CurrentAccount {
+    type Output = String;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<String, HttpError> {
+        parts
+            .headers
+            .get("x-token")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.accounts.name_of(token))
+            .ok_or_else(|| HttpError::unauthorized("invalid token"))
+    }
+}
+
+/// Declares the extractor as well as `Extracted<CurrentAccount>` does: no macro reads the name.
+type Account = Extracted<CurrentAccount>;
+
+#[controller("/accounts")]
+pub struct AccountController;
+
+#[routes]
+impl AccountController {
+    #[get("/me")]
+    fn me(&self, Extracted(name): Extracted<CurrentAccount>) -> String {
+        name
+    }
+
+    #[post("/me")]
+    async fn rename(&self, account: Account, Json(name): Json<String>) -> String {
+        format!("{} is now {name}", account.as_str())
+    }
+}
+
+#[module(controllers = [AccountController], providers = [value(Accounts)])]
+pub struct AccountModule;
+
+#[tokio::test]
+async fn handlers_receive_extractors_by_type_or_alias() {
+    let router = Hornero::new(AccountModule).build().await.unwrap().router();
+
+    let request = Request::get("/accounts/me")
+        .header("x-token", "ada-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada");
+
+    let request = Request::post("/accounts/me")
+        .header("x-token", "ada-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#""lovelace""#))
+        .unwrap();
+    let res = router.clone().oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"ada is now lovelace");
+
+    let request = Request::get("/accounts/me").body(Body::empty()).unwrap();
+    let res = router.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Names the extractor only through the alias, so the alias alone must declare it.
+#[controller("/aliased")]
+pub struct AliasOnlyController;
+
+#[routes]
+impl AliasOnlyController {
+    #[get("/me")]
+    fn me(&self, account: Account) -> String {
+        account.0
+    }
+}
+
+#[module(controllers = [AliasOnlyController])]
+pub struct AliasModuleWithoutAccounts;
+
+#[test]
+fn an_alias_does_not_hide_a_missing_dependency() {
+    let err = Hornero::new(AliasModuleWithoutAccounts)
+        .validate()
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("CurrentAccount (in AliasModuleWithoutAccounts) requires `Accounts`"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-error: expected `singleton`, `request` or `transient`
+error: expected `singleton` or `transient`
  --> tests/ui/invalid_scope.rs:3:22
   |
 3 | #[injectable(scope = session)]

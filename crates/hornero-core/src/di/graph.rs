@@ -1,12 +1,11 @@
 //! Bootstrap-time validation: walks the module tree, applies visibility rules, resolves every
-//! dependency edge to a concrete node, detects cycles and computes effective scopes.
+//! dependency edge to a concrete node, detects cycles and checks scopes.
 //!
 //! Nothing here constructs a provider, so [`Hornero::validate`](crate::Hornero::validate) can run it in a
 //! plain `#[test]`.
 
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
@@ -14,7 +13,7 @@ use axum::Router;
 use super::injectable::Scope;
 use super::key::Key;
 use super::module::{Identity, LayerFn, Module, ModuleDef, ModuleKey};
-use super::provider::{Builtin, ProviderDef};
+use super::provider::ProviderDef;
 use super::runtime::{RtNode, Runtime};
 use crate::app::join_paths;
 use crate::error::{BootError, Problem};
@@ -30,6 +29,7 @@ pub(crate) struct GlobalEnhancers {
     pub(crate) interceptors: Vec<EnhancerRef>,
     pub(crate) filters: Vec<EnhancerRef>,
     pub(crate) middlewares: Vec<EnhancerRef>,
+    pub(crate) renderer: Option<crate::web::chain::ErrorRenderer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,8 +118,6 @@ pub(crate) struct Graph {
     pub(crate) root: usize,
     /// Topological order: dependencies before dependents.
     pub(crate) order: Vec<usize>,
-    pub(crate) effective: Vec<Scope>,
-    pub(crate) report: ScopeReport,
     /// Global enhancers declared by modules (`AppGuard<G>` and friends) with their declaring
     /// module, imported modules first.
     pub(crate) app_enhancers: Vec<(usize, EnhancerRef)>,
@@ -151,8 +149,6 @@ impl Graph {
             nodes: Vec::new(),
             root: 0,
             order: Vec::new(),
-            effective: Vec::new(),
-            report: ScopeReport::default(),
             app_enhancers: Vec::new(),
             routes: Arc::default(),
             by_type: HashMap::new(),
@@ -219,7 +215,7 @@ impl Graph {
         graph.order = graph.topological_order();
         graph.bail()?;
 
-        graph.compute_scopes();
+        graph.check_scopes();
         graph.bail()?;
         Ok(graph)
     }
@@ -234,12 +230,11 @@ impl Graph {
 
     fn add_core(&mut self, shutdown: Shutdown) {
         let mut core = ModuleNode::new(TypeId::of::<CoreModule>(), "hornero".into(), true, None);
-        for def in [ProviderDef::value(shutdown), ProviderDef::request_context()] {
-            let key = def.key;
-            let node = self.push_node(def, 0, NodeKind::Builtin, key.short_name());
-            core.local.insert(key, node);
-            core.exported.insert(key, node);
-        }
+        let def = ProviderDef::value(shutdown);
+        let key = def.key;
+        let node = self.push_node(def, 0, NodeKind::Builtin, key.short_name());
+        core.local.insert(key, node);
+        core.exported.insert(key, node);
         self.modules.push(core);
     }
 
@@ -279,6 +274,7 @@ impl Graph {
                             .chain(controller_guards.iter().cloned())
                             .chain(route.guards.iter().map(EnhancerRef::info))
                             .collect(),
+                        extractors: route.extractors.iter().map(EnhancerRef::info).collect(),
                     });
                 }
             }
@@ -424,8 +420,7 @@ impl Graph {
     }
 
     /// Instances of one module type share a name. Numbers them in collection order and names the
-    /// module that imported each, so diagnostics, the scope report and the route table tell them
-    /// apart.
+    /// module that imported each, so diagnostics and the route table tell them apart.
     fn label_instances(&mut self) {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for module in &self.modules {
@@ -931,130 +926,45 @@ impl Graph {
         order.push(node);
     }
 
-    fn compute_scopes(&mut self) {
-        let count = self.nodes.len();
-        let mut effective = vec![Scope::Singleton; count];
-        let mut cause: Vec<Option<usize>> = vec![None; count];
-        for &node in &self.order {
-            let declared = self.nodes[node].def.scope;
-            effective[node] = declared;
-            if declared != Scope::Request
-                && let Some(&dep) = self.nodes[node]
-                    .deps
-                    .iter()
-                    .find(|&&dep| effective[dep] == Scope::Request)
-            {
-                effective[node] = Scope::Request;
-                cause[node] = Some(dep);
-            }
-        }
-
-        let chain = |start: usize| -> Vec<String> {
-            let mut out = Vec::new();
-            let mut current = Some(start);
-            while let Some(node) = current {
-                // Slots mirror their enhancer; listing both would repeat the name.
-                if !matches!(self.nodes[node].kind, NodeKind::Slot(_)) {
-                    out.push(self.nodes[node].label.clone());
-                }
-                current = cause[node];
-            }
-            if let Some(last) = out.last_mut() {
-                last.push_str(" [request]");
-            }
-            out
-        };
-
+    /// A scope only decides how many instances exist, since everything is built during bootstrap.
+    /// Hooks and routes need a single instance, so a transient one is an error.
+    fn check_scopes(&mut self) {
         let mut problems = Vec::new();
-        let mut report = ScopeReport::default();
         for &node in &self.order {
             let n = &self.nodes[node];
-            let bubbled = cause[node].is_some();
-            let item = self.describe(node);
-
-            if bubbled && n.def.pinned {
+            if n.def.scope != Scope::Transient {
+                continue;
+            }
+            if n.def.has_hooks {
                 problems.push(Problem::ScopeViolation {
-                    item: item.clone(),
-                    reason: format!(
-                        "is pinned to {} scope but depends on a request-scoped provider",
-                        scope_name(n.def.scope)
-                    ),
-                    chain: chain(node),
+                    item: self.describe(node),
+                    reason: "has lifecycle hooks but is transient; hooks only run on singletons"
+                        .into(),
                 });
             }
-            if n.def.has_hooks && effective[node] != Scope::Singleton {
+            if n.kind == NodeKind::Controller {
                 problems.push(Problem::ScopeViolation {
-                    item: item.clone(),
-                    reason: format!(
-                        "has lifecycle hooks but is {}; hooks only run on singletons",
-                        if effective[node] == Scope::Request {
-                            "request-scoped"
-                        } else {
-                            "transient"
-                        }
-                    ),
-                    chain: if bubbled { chain(node) } else { Vec::new() },
+                    item: self.describe(node),
+                    reason: "cannot be transient; a controller is built once, during bootstrap"
+                        .into(),
                 });
-            }
-            if effective[node] == Scope::Request {
-                let forbidden = match n.kind {
-                    NodeKind::Slot(EnhancerKind::Middleware) => Some("cannot be request-scoped"),
-                    NodeKind::Mount => Some("cannot be request-scoped"),
-                    _ => None,
-                };
-                if let Some(reason) = forbidden {
-                    problems.push(Problem::ScopeViolation {
-                        item: item.clone(),
-                        reason: reason.into(),
-                        chain: chain(node),
-                    });
-                }
-                if matches!(n.kind, NodeKind::Provider | NodeKind::Controller) {
-                    report.entries.push(ScopeEntry {
-                        item: n.label.clone(),
-                        module: self.modules[n.module].name.clone(),
-                        declared: !bubbled,
-                        chain: if bubbled { chain(node) } else { Vec::new() },
-                    });
-                }
             }
         }
-
         self.problems.extend(problems);
-        self.effective = effective;
-        self.report = report;
     }
 
     pub(crate) fn runtime(&self) -> Runtime {
         let count = self.nodes.len();
-        let mut needs_context = vec![false; count];
-        for &node in &self.order {
-            let n = &self.nodes[node];
-            needs_context[node] = n.def.builtin == Builtin::RequestContext
-                || (self.effective[node] != Scope::Singleton
-                    && n.deps.iter().any(|&dep| needs_context[dep]));
-        }
-
-        let mut slot_count = 0;
         let nodes = (0..count)
             .map(|idx| {
                 let n = &self.nodes[idx];
-                let slot = (self.effective[idx] == Scope::Request
-                    && n.def.builtin == Builtin::None)
-                    .then(|| {
-                        slot_count += 1;
-                        slot_count - 1
-                    });
                 RtNode {
                     key: n.def.key,
                     label: Arc::from(self.describe(idx)),
-                    scope: self.effective[idx],
+                    scope: n.def.scope,
                     deps: n.deps.clone(),
                     absent: n.absent.clone(),
                     factory: n.def.factory.clone(),
-                    builtin: n.def.builtin,
-                    slot,
-                    needs_context: needs_context[idx],
                 }
             })
             .collect();
@@ -1062,7 +972,6 @@ impl Graph {
         Runtime {
             nodes,
             singletons: (0..count).map(|_| OnceLock::new()).collect(),
-            slot_count,
         }
     }
 
@@ -1071,7 +980,7 @@ impl Graph {
         let mut candidates: HashMap<Key, Vec<usize>> = HashMap::new();
         for (idx, node) in self.nodes.iter().enumerate() {
             if matches!(node.kind, NodeKind::Provider | NodeKind::Builtin)
-                && self.effective[idx] == Scope::Singleton
+                && node.def.scope == Scope::Singleton
             {
                 candidates.entry(node.def.key).or_default().push(idx);
             }
@@ -1095,70 +1004,4 @@ fn distinct(iter: impl Iterator<Item = usize>) -> Vec<usize> {
         }
     }
     out
-}
-
-fn scope_name(scope: Scope) -> &'static str {
-    match scope {
-        Scope::Singleton => "singleton",
-        Scope::Request => "request",
-        Scope::Transient => "transient",
-    }
-}
-
-/// Every component that ends up request-scoped, and why.
-///
-/// Logged at bootstrap and available through [`App::scope_report`](crate::App::scope_report) or
-/// [`Hornero::validate`](crate::Hornero::validate), so request-scope bubbling never goes unnoticed.
-#[derive(Clone, Debug, Default)]
-pub struct ScopeReport {
-    /// One entry per request-scoped component, in dependency order.
-    pub entries: Vec<ScopeEntry>,
-}
-
-/// A request-scoped component in a [`ScopeReport`].
-#[derive(Clone, Debug)]
-pub struct ScopeEntry {
-    /// Short type name of the component.
-    pub item: String,
-    /// The module that registers it.
-    pub module: String,
-    /// `true` when declared request-scoped, `false` when pulled in by a dependency.
-    pub declared: bool,
-    /// For bubbled entries: the dependency chain ending at a declared request-scoped provider.
-    pub chain: Vec<String>,
-}
-
-impl ScopeReport {
-    /// Whether nothing is request-scoped.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// The entry for the component with this short type name.
-    pub fn find(&self, item: &str) -> Option<&ScopeEntry> {
-        self.entries.iter().find(|entry| entry.item == item)
-    }
-}
-
-impl fmt::Display for ScopeReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for entry in &self.entries {
-            if entry.declared {
-                writeln!(
-                    f,
-                    "  {} (in {}): declared request-scoped",
-                    entry.item, entry.module
-                )?;
-            } else {
-                writeln!(
-                    f,
-                    "  {} (in {}): request-scoped via {}",
-                    entry.item,
-                    entry.module,
-                    entry.chain.join(" -> ")
-                )?;
-            }
-        }
-        Ok(())
-    }
 }

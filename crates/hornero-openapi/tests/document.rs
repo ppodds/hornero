@@ -1,6 +1,7 @@
 //! The document `hornero-openapi` infers from the route table, handler signatures, attributes and
 //! guards.
 
+use hornero::axum::http::request::Parts;
 use hornero::openapi::{
     ApiSecurity, IntoParams, OpenApiConfig, SecurityScheme, ToSchema, document, warnings,
 };
@@ -562,6 +563,124 @@ fn global_and_module_guards_secure_every_route_together() {
     assert_eq!(
         doc["components"]["securitySchemes"]["api_key"],
         json!({ "type": "apiKey", "in": "header", "name": "x-api-key", "description": "Issued per client" })
+    );
+}
+
+// --- security from extractors ------------------------------------------------------------------
+
+/// Authenticates by itself, so the routes that take it need no guard to be documented as secured.
+#[derive(Injectable)]
+struct Caller;
+
+impl Extractor for Caller {
+    type Output = String;
+
+    async fn extract(&self, _: &mut Parts) -> Result<String, HttpError> {
+        Ok("ada".to_owned())
+    }
+}
+
+impl ApiSecurity for Caller {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+}
+
+#[controller("/me")]
+struct MeController;
+
+#[routes]
+impl MeController {
+    #[get("/")]
+    async fn me(&self, Extracted(name): Extracted<Caller>) -> String {
+        name
+    }
+
+    #[get("/public")]
+    async fn public(&self) -> &'static str {
+        ""
+    }
+}
+
+#[module(controllers = [MeController])]
+struct MeModule;
+
+#[test]
+fn extractors_implementing_api_security_secure_the_routes_that_take_them() {
+    let routes = Hornero::new(MeModule).routes().unwrap();
+    let doc = json_of(&document(&routes, &config()));
+    assert_eq!(
+        doc["paths"]["/me"]["get"]["security"],
+        json!([{ "bearer": [] }])
+    );
+    assert!(doc["paths"]["/me/public"]["get"]["security"].is_null());
+    assert!(warnings(&routes, &config()).is_empty());
+}
+
+/// Requires the `profile` and `todos:read` scopes of the bearer scheme.
+#[derive(Injectable)]
+struct Reader;
+
+impl Guard for Reader {
+    async fn can_activate(&self, _: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        Ok(())
+    }
+}
+
+impl ApiSecurity for Reader {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+
+    fn scopes(_: &RouteInfo) -> Vec<String> {
+        vec!["profile".to_owned(), "todos:read".to_owned()]
+    }
+}
+
+/// Requires `todos:write` of the same scheme, and `todos:read` again.
+#[derive(Injectable)]
+struct Writer;
+
+impl Extractor for Writer {
+    type Output = String;
+
+    async fn extract(&self, _: &mut Parts) -> Result<String, HttpError> {
+        Ok("ada".to_owned())
+    }
+}
+
+impl ApiSecurity for Writer {
+    fn scheme() -> (&'static str, SecurityScheme) {
+        ("bearer", SecurityScheme::bearer_jwt())
+    }
+
+    fn scopes(_: &RouteInfo) -> Vec<String> {
+        vec!["todos:read".to_owned(), "todos:write".to_owned()]
+    }
+}
+
+#[controller("/scoped")]
+#[guards(Reader)]
+struct ScopedController;
+
+#[routes]
+impl ScopedController {
+    #[post("/")]
+    async fn write(&self, Extracted(name): Extracted<Writer>) -> String {
+        name
+    }
+}
+
+#[module(controllers = [ScopedController])]
+struct ScopedModule;
+
+#[test]
+fn enhancers_sharing_a_scheme_require_the_scopes_of_each() {
+    let routes = Hornero::new(ScopedModule).routes().unwrap();
+    let doc = json_of(&document(&routes, &config()));
+    assert_eq!(
+        doc["paths"]["/scoped"]["post"]["security"],
+        json!([{ "bearer": ["profile", "todos:read", "todos:write"] }])
     );
 }
 

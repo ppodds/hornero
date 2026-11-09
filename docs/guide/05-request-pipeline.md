@@ -1,12 +1,13 @@
 # 5. Request pipeline：guard、interceptor、filter、middleware
 
-hornero 有四種可注入的 enhancer，加上 tower layer。它們都可以有依賴，也都會在啟動時驗證。
+hornero 有四種可注入的 enhancer，加上錯誤 renderer 與 tower layer。enhancer 都可以有依賴，也都會在啟動時驗證。
 
 | 元件 | 知道是哪條路由嗎 | 用途 |
 |---|---|---|
 | **Guard** | 是 | 決定 request 能不能進到 handler（驗證身分、權限、功能開關） |
 | **Interceptor** | 是 | 包住 handler：計時、log、快取、修改回應 |
-| **Exception filter** | 是 | 重新渲染錯誤回應 |
+| **Exception filter** | 是 | 依型別把 domain error 轉成 `HttpError`（狀態碼與訊息） |
+| **Renderer** | 是 | 統一錯誤格式：一個函式，渲染路由上的每一個錯誤 |
 | **Middleware** | 否 | 需要 DI、但與路由無關的處理（API key、request id、租戶解析） |
 | **tower layer** | 否 | 不需要 DI 的通用處理（trace、CORS、壓縮、timeout），可直接使用整個 tower-http 生態系 |
 
@@ -21,8 +22,7 @@ hornero 有四種可注入的 enhancer，加上 tower layer。它們都可以有
 CatchPanicLayer                                 panic → 500 problem+json
   模組 middleware    #[module(middlewares = [..])]  只包住該模組的路由與 mount
   模組 tower layer   ModuleDef::layer
-    request scope                               只有用到 request-scoped 元件的路由才有
-    exception filter                            最具體、且 catches 該錯誤的那一個
+    renderer         Hornero::error_renderer        路由的錯誤在這裡變成回應
     guards           global → controller → handler
     interceptors     global ⊃ controller ⊃ handler
     extractors → handler
@@ -30,12 +30,14 @@ CatchPanicLayer                                 panic → 500 problem+json
 
 同一組裡，**先註冊的在外層**。`CatchPanicLayer` 在全域 middleware 與 layer 的內側，所以 panic 產生的 500 也會經過它們（CORS header、request id、`TraceLayer` 都看得到）；它仍在路由之外，連 404 fallback 都涵蓋。
 
+middleware 與 tower layer 是 axum 的 layer，處理的是回應。從 renderer 往內是 hornero 執行的路由：每一層都回傳 `Result`，錯誤以 `HttpError` 值往外傳。拋出的 domain error 離開 handler、extractor 或 interceptor 時，由 [exception filter](#exception-filter) 依型別轉換；最後在 renderer 變成回應。
+
 這個順序帶來幾個結果：
 
-- **filter 包住 guard 與 interceptor**，所以 guard 回傳的 401 / 403 也會經過 filter。
-- **interceptor 在 guard 裡面**，所以被 guard 擋下的 request 不會經過 interceptor。要記錄每一個 request，請用 `TraceLayer` 或 middleware。
-- **method 不符的 405 不會執行任何 guard、interceptor 或 filter**：route 層只對該路由註冊的 method 生效，405 以 problem+json 回應並保留 `Allow` header。
-- **middleware 不知道路由**：它在路由比對前後都看不到 controller 或 handler 的資訊。需要路由資訊時，請用 guard 或 interceptor。
+- **interceptor 收到錯誤本身**：`next.handle(req).await` 回傳 `Result<Response, HttpError>`，`Err` 已經過 filter 轉換，原始錯誤仍是它的 source。
+- **guard 的錯誤也經過 filter 與 renderer**，但 interceptor 在 guard 裡面，所以被 guard 擋下的 request 不會經過 interceptor。要記錄每一個 request，請用 `TraceLayer` 或 middleware。
+- **method 不符的 405 不會執行任何 guard、interceptor、filter 或 renderer**：405 以 problem+json 回應並保留 `Allow` header。
+- **middleware 不知道路由**：它在路由比對前後都看不到 controller 或 handler 的資訊。需要路由資訊時，請用 guard 或 interceptor。它看到的是渲染好的回應，背後的錯誤用 `HttpError::in_response(&response)` 讀取。
 
 ## Guard
 
@@ -51,7 +53,7 @@ pub struct GuardContext<'a> {
 }
 ```
 
-guard 回傳 `Result` 而不是 `bool`，所以 guard 可以自己決定回 401 還是 403，以及錯誤訊息。guard 可以把資料寫進 `parts.extensions`，例如已驗證的使用者，讓之後的 guard、extractor 與 request-scoped provider 讀取。
+guard 回傳 `Result` 而不是 `bool`，所以 guard 可以自己決定回 401 還是 403，以及錯誤訊息。guard 可以把資料寫進 `parts.extensions`，例如已驗證的使用者，讓之後的 guard、interceptor 與 extractor 讀取。
 
 以下範例包含一個驗證 bearer token 的 guard、一個讀取 metadata 的權限 guard，以及一個「proof」extractor：
 
@@ -253,7 +255,7 @@ assert_eq!(client.get("/reports").header("x-api-key", "secret").await.status(), 
 metadata 以型別作為 key，取代 Nest 的 `SetMetadata` 加 `Reflector`：
 
 - 設定：在 controller（`#[controller]` 下方）或路由方法上加 `#[meta(Roles(&["admin"]))]`，或用 builder 的 `.meta(value)`。
-- 讀取：guard 用 `ctx.route.meta::<Roles>()`，interceptor 與 filter 用 `ctx.meta::<Roles>()`。
+- 讀取：guard 用 `ctx.route.meta::<Roles>()`，interceptor、filter 與 renderer 用 `ctx.meta::<Roles>()`。
 - 同一型別同時設在 controller 與 handler 上時，handler 的值優先。
 
 metadata 型別只需要 `Send + Sync + 'static`。用 newtype 包裝值，就不會和別人的 metadata 撞名。
@@ -263,37 +265,48 @@ metadata 型別只需要 `Send + Sync + 'static`。用 newtype 包裝值，就�
 <!-- ignore: trait 簽章摘要，真正的定義在 hornero-core -->
 ```rust,ignore
 pub trait Interceptor: Send + Sync + 'static {
-    fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> impl Future<Output = Response> + Send;
+    fn intercept(&self, ctx: &RouteContext, req: Request, next: CallHandler)
+        -> impl Future<Output = Result<Response, HttpError>> + Send;
 }
 ```
 
-Nest 用 RxJS 寫的 interceptor，在 hornero 裡就是一個 `async fn(req, next) -> Response`：
+Nest 用 RxJS 寫的 interceptor，在 hornero 裡就是一個 `async fn(req, next) -> Result<Response, HttpError>`：
 
-- 呼叫 `next.run(req).await` 之前可以修改 request，之後可以修改回應。
-- 不呼叫 `next` 就能直接回應（例如快取命中、維護模式）。
+- 呼叫 `next.handle(req).await` 之前可以修改 request，之後可以處理結果：`Ok` 是回應，`Err` 是錯誤本身（已經過 exception filter 轉換，原始錯誤仍是 source）。`?` 把錯誤原樣往外傳，`map_err` 可以換掉它。
+- 不呼叫 `next` 就能直接回應（例如快取命中、維護模式），或回傳 `Err` 拒絕 request。
+- 錯誤到 renderer 才變成回應，所以對回應做的修改不會出現在錯誤回應上。兩邊都要處理時就 match 結果，例如下面的 `Timing` 用 `with_header` 讓錯誤帶上 header。
 - 全域 interceptor 包住 controller 的，controller 的包住 handler 的。全域 interceptor 可以用 `Hornero::interceptor::<I>()` 註冊，或在模組的 `providers` 寫 `AppInterceptor<I>`（Nest 的 `APP_INTERCEPTOR`）；前者在外層。
 
 ```rust
 use std::time::Instant;
 
 use hornero::axum::extract::Request;
-use hornero::axum::http::HeaderValue;
-use hornero::axum::middleware::Next;
+use hornero::axum::http::{HeaderName, HeaderValue};
 use hornero::prelude::*;
+
+const ELAPSED: HeaderName = HeaderName::from_static("x-elapsed-us");
 
 #[derive(Injectable)]
 struct Timing;
 
 impl Interceptor for Timing {
-    async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
+    async fn intercept(
+        &self,
+        ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
         let started = Instant::now();
-        let mut response = next.run(req).await; // 執行內層 interceptor 與 handler
-        let elapsed = started.elapsed().as_micros().to_string();
-        response
-            .headers_mut()
-            .insert("x-elapsed-us", HeaderValue::from_str(&elapsed).unwrap());
-        tracing::debug!(handler = ctx.handler(), elapsed_us = %elapsed, "handled");
-        response
+        let result = next.handle(req).await; // 執行內層 interceptor 與 handler
+        let elapsed = started.elapsed().as_micros() as u64;
+        tracing::debug!(handler = ctx.handler(), elapsed_us = elapsed, ok = result.is_ok(), "handled");
+        match result {
+            Ok(mut response) => {
+                response.headers_mut().insert(ELAPSED, HeaderValue::from(elapsed));
+                Ok(response)
+            }
+            Err(err) => Err(err.with_header(ELAPSED, HeaderValue::from(elapsed))),
+        }
     }
 }
 
@@ -304,14 +317,19 @@ struct CacheFor(&'static str);
 struct CacheControl;
 
 impl Interceptor for CacheControl {
-    async fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> Response {
-        let mut response = next.run(req).await;
+    async fn intercept(
+        &self,
+        ctx: &RouteContext,
+        req: Request,
+        next: CallHandler,
+    ) -> Result<Response, HttpError> {
+        let mut response = next.handle(req).await?; // 錯誤不快取，原樣往外傳
         if let Some(CacheFor(value)) = ctx.meta::<CacheFor>() {
             response
                 .headers_mut()
                 .insert("cache-control", HeaderValue::from_static(value));
         }
-        response
+        Ok(response)
     }
 }
 
@@ -327,6 +345,11 @@ impl CatalogController {
     fn list(&self) -> &'static str {
         "[]"
     }
+
+    #[get("/{id}")]
+    fn find(&self, Path(id): Path<u64>) -> Result<String, HttpError> {
+        Err(HttpError::not_found(format!("item {id} not found")))
+    }
 }
 
 #[module(controllers = [CatalogController])]
@@ -338,25 +361,34 @@ let app = hornero_testing::TestApp::new(AppModule).build().await.unwrap();
 let res = app.client().get("/catalog").await;
 assert_eq!(res.header("cache-control"), Some("max-age=60"));
 assert!(res.header("x-elapsed-us").is_some());
+
+let missing = app.client().get("/catalog/7").await;
+assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+assert!(missing.header("x-elapsed-us").is_some()); // 錯誤帶著 header
 # }
 ```
 
 ## Exception filter
 
-<!-- ignore: trait 簽章摘要，真正的定義在 hornero-core；預設方法的內容省略 -->
+<!-- ignore: trait 簽章摘要，真正的定義在 hornero-core -->
 ```rust,ignore
 pub trait ExceptionFilter: Send + Sync + 'static {
-    fn catches(&self, err: &HttpError) -> bool { true } // 選用，相當於 @Catch(Type)
-    fn catch(&self, err: &HttpError, ctx: &RouteContext) -> impl Future<Output = Response> + Send;
+    type Error: std::error::Error + Send + Sync + 'static; // 相當於 @Catch(Type)
+    fn catch(&self, err: &Self::Error, ctx: &RouteContext) -> impl Future<Output = HttpError> + Send;
 }
 ```
 
-Rust 沒有 exception。handler 回傳 `Result<_, HttpError>`，`HttpError` 轉成回應時會把自己附在回應的 extensions 上，filter 就是靠這個找到原始錯誤並重新渲染。
+Rust 沒有 exception。guard、interceptor、extractor 與 handler 用 `?` 拋出 domain error，exception filter 依型別把它轉成 `HttpError`：
 
-- **每個錯誤由一個 filter 處理**：依序查看 handler 層、controller 層、全域的 filter（同一層依註冊順序；全域的先看 `Hornero::filter::<F>()`，再看模組 `providers` 裡的 `AppFilter<F>`，即 Nest 的 `APP_FILTER`），第一個 `catches` 回傳 `true` 的處理它。沒有 filter 接住時，錯誤以預設格式回應。
-- **依錯誤型別接住**：用 `?` 拋出的 domain error 會變成 500，原始錯誤保留為 source。`catches` 裡用 `err.is::<TodoError>()` 判斷，`catch` 裡用 `err.downcast_ref::<TodoError>()` 取出，就能把它轉成 404、409 等回應。完整範例見 [錯誤處理](08-errors.md#domain-error)。
-- **filter 看得到**：handler、guard、interceptor 回傳的 `HttpError`；`Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）；request-scoped 元件建構失敗產生的 500。
-- **filter 看不到**：axum 內建 extractor 的 rejection（純文字，例如格式錯誤的 `Json`）、404 fallback、panic。要讓輸入錯誤也走 filter，請使用 `Valid<Json<T>>` 或 `Rejection = HttpError` 的自訂 extractor。
+- **依錯誤型別處理**：`?` 把任何 `std::error::Error` 轉成拋出的 `HttpError`，原始錯誤保留為 source。filter 宣告 `type Error`，只收到這個型別的錯誤，`catch` 拿到的就是 `&TodoError`。完整範例見 [錯誤處理](08-errors.md#domain-error)。
+- **每個錯誤由一個 filter 處理**：依序查看 handler 層、controller 層、全域的 filter（同一層依註冊順序；全域的先看 `Hornero::filter::<F>()`，再看模組 `providers` 裡的 `AppFilter<F>`，即 Nest 的 `APP_FILTER`），第一個型別相符的處理它。沒有 filter 處理時是不透露細節的 500，log 會寫出它的型別。
+- **filter 看不到回答**：用狀態碼建構的 `HttpError`（`HttpError::not_found(..)`、`from_boxed`）以及 axum extractor 的 rejection 本身就是回答，直接交給 renderer。
+- **filter 只決定狀態碼與訊息**：回傳的 `HttpError` 帶著的 header 會加在回應上，格式交給 renderer（下一節）。
+- **filter 看不到 request**：手上只有錯誤與路由。回應要依 request 內容變化時，見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)。
+
+## Renderer
+
+整個應用的錯誤格式是一個函式 `fn(&HttpError, &RouteContext) -> Response`，用 `Hornero::error_renderer` 設定；沒有設定時渲染成 problem+json。它渲染路由上的每一個錯誤，包括 guard、interceptor、extractor 與 handler 的錯誤，以及 axum extractor 的 rejection。收到的是 filter 轉換之後的錯誤：
 
 ```rust
 use hornero::axum::http::header::CONTENT_TYPE;
@@ -364,16 +396,11 @@ use hornero::prelude::*;
 use serde_json::json;
 
 /// 在預設的 problem document 上補上出錯的路由
-#[derive(Injectable)]
-struct ProblemFilter;
-
-impl ExceptionFilter for ProblemFilter {
-    async fn catch(&self, err: &HttpError, ctx: &RouteContext) -> Response {
-        let mut problem = err.to_problem();
-        problem["instance"] = json!(ctx.path());
-        problem["handler"] = json!(format!("{}::{}", ctx.controller(), ctx.handler()));
-        (err.status(), [(CONTENT_TYPE, "application/problem+json")], problem.to_string()).into_response()
-    }
+fn problem(err: &HttpError, ctx: &RouteContext) -> Response {
+    let mut problem = err.to_problem();
+    problem["instance"] = json!(ctx.path());
+    problem["handler"] = json!(format!("{}::{}", ctx.controller(), ctx.handler()));
+    (err.status(), [(CONTENT_TYPE, "application/problem+json")], problem.to_string()).into_response()
 }
 
 #[controller("/orders")]
@@ -392,7 +419,7 @@ struct AppModule;
 
 # #[tokio::main(flavor = "current_thread")]
 # async fn main() {
-let hornero = Hornero::new(AppModule).filter::<ProblemFilter>();
+let hornero = Hornero::new(AppModule).error_renderer(problem);
 
 let app = hornero_testing::TestApp::from_hornero(hornero).build().await.unwrap();
 let problem: serde_json::Value = app.client().get("/orders/7").await.json();
@@ -403,7 +430,7 @@ assert_eq!(problem["handler"], "OrderController::find");
 # }
 ```
 
-filter 產生的回應會**完全取代**原本的回應。`HttpError` 攜帶的 header（例如 401 預設的 `WWW-Authenticate: Bearer`）不會自動保留，自訂 filter 若想保留，可以從 `err.render()`（預設回應）開始修改，或自己組回應時複製 `err.headers()`。
+renderer 不必複製 `err.headers()`：hornero 會把錯誤攜帶的 header（例如 401 預設的 `WWW-Authenticate: Bearer`）加在它的回應上，並把錯誤附在回應的 extensions，讓 middleware 與 5xx log 讀取。不經過路由的回應（404 fallback、405、panic）不套用 renderer，見 [錯誤回應的流向](08-errors.md#錯誤回應的流向)。
 
 ## Middleware
 
@@ -466,7 +493,7 @@ assert_eq!(app.client().get("/ping").await.header("x-powered-by"), Some("hornero
 
 - **模組 middleware**（`middlewares = [..]` 或 `m.middleware::<M>()`）只包住該模組的 controller 與 mount 的路由，包括 mount 在非 `/` 前綴（例如 `/admin`）的 router 自己的 fallback。交給應用 fallback 的 request（掛在 `/` 的 router 的 fallback，或 hornero 的 404）不經過任何模組的 middleware，即使那個 router 是該模組掛的。
 - **全域 middleware**（`Hornero::middleware::<M>()`）包住所有路由，包括 404 fallback。
-- middleware 在啟動時就要實例化，所以**必須是 singleton**。如果它依賴 request-scoped 的東西而被傳染，啟動會失敗。
+- middleware 看到的是渲染好的回應。路由的錯誤留在回應的 extensions 上，用 `HttpError::in_response(&response)` 讀取，例如依錯誤記錄 metric，或依 request 改寫錯誤的呈現方式（見 [依 request 資料呈現錯誤](06-scopes.md#依-request-資料呈現錯誤)）。
 
 ## tower layer
 
@@ -496,8 +523,10 @@ let _hornero = Hornero::new(AppModule)
 |---|---|
 | 擋下沒有權限的 request | Guard |
 | handler 需要已驗證的使用者 | Guard 寫入 extensions，加上 proof extractor |
+| handler 需要的資料要靠 provider 取得 | [`Extractor`](06-scopes.md#需要-provider-的-extractor)，只有要求它的 handler 才執行 |
 | 依路由 metadata 決定行為（快取、權限、速率） | Guard 或 Interceptor |
-| 計時、log handler 名稱、修改回應 | Interceptor |
-| 統一錯誤格式、把 domain error 轉成狀態碼 | Exception filter |
+| 計時、log handler 名稱、修改回應或錯誤 | Interceptor |
+| 把 domain error 轉成狀態碼 | Exception filter |
+| 統一錯誤格式 | Renderer（`Hornero::error_renderer`） |
 | 需要依賴、與路由無關（API key 驗證、租戶解析） | Middleware |
 | 通用 HTTP 處理（trace、CORS、壓縮、timeout） | tower layer |

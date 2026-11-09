@@ -12,15 +12,16 @@ use crate::util::BoxError;
 
 /// An error that renders as an HTTP response. hornero's replacement for Nest's `HttpException`.
 ///
-/// Any `std::error::Error` converts into a 500 through `?`, with the original error kept as the
-/// source (logged, never sent to the client). An [`ExceptionFilter`](crate::ExceptionFilter) can
-/// turn such an error back into a specific response by checking the source's type with
-/// [`is`](Self::is) or [`downcast_ref`](Self::downcast_ref), Nest's `@Catch(TodoNotFound)`.
-/// Errors no filter catches stay 500s.
+/// Built with a status (`HttpError::not_found`, say), it is an answer and renders as is. Any
+/// `std::error::Error` converts into one through `?`, carrying the original as a domain error: the
+/// [`ExceptionFilter`](crate::ExceptionFilter) for its type maps it, Nest's `@Catch(TodoError)`.
+/// Without one it stays a 500 whose source (logged, never sent to the client) is the original
+/// error. axum's own rejections keep their status.
 ///
-/// The default rendering is RFC 9457 `application/problem+json`. The error is also attached to
-/// the response extensions so an exception filter can re-render it, and so hornero's router can log
-/// it when the final response is a 5xx.
+/// Within a route the error travels as a value, through guards, interceptors and the handler, and
+/// becomes a response once: through the application's [`ErrorRenderer`](crate::ErrorRenderer), or
+/// as RFC 9457 `application/problem+json` by default. The response keeps the error in its
+/// extensions, for [`in_response`](Self::in_response) and for logging the final 5xx.
 pub struct HttpError {
     status: StatusCode,
     message: Cow<'static, str>,
@@ -28,6 +29,8 @@ pub struct HttpError {
     source: Option<BoxError>,
     // Boxed: a `HeaderMap` inline would make every `Result<_, HttpError>` large.
     headers: Box<HeaderMap>,
+    /// The type of the domain error `?` converted, until an exception filter maps it.
+    raised: Option<&'static str>,
 }
 
 impl HttpError {
@@ -39,6 +42,7 @@ impl HttpError {
             details: None,
             source: None,
             headers: Box::default(),
+            raised: None,
         }
     }
 
@@ -79,7 +83,8 @@ impl HttpError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
-    /// Wraps an arbitrary error as a 500, keeping it as the (private) source.
+    /// Wraps an arbitrary error as a 500, keeping it as the (private) source. Unlike `?`, this is
+    /// the answer: exception filters do not see it.
     pub fn from_boxed(source: BoxError) -> Self {
         Self::internal("internal server error").with_source(source)
     }
@@ -98,8 +103,7 @@ impl HttpError {
     }
 
     /// Sets a response header, replacing any existing value for `name`. Headers travel with the
-    /// error, so an [`ExceptionFilter`](crate::ExceptionFilter) that builds its own response can
-    /// copy them from [`headers`](Self::headers).
+    /// error: hornero adds them to whatever response the renderer builds.
     pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
         self
@@ -148,6 +152,16 @@ impl HttpError {
         self.downcast_ref::<E>().is_some()
     }
 
+    /// The error `response` was rendered from, if any.
+    ///
+    /// For [`Middleware`](crate::Middleware), which wraps routes and only sees their responses:
+    /// every error a route answers with is here, after filters mapped it. An
+    /// [`Interceptor`](crate::Interceptor) receives the error itself from `next.handle`.
+    pub fn in_response(response: &Response) -> Option<&HttpError> {
+        let ErrorExtension(err) = response.extensions().get::<ErrorExtension>()?;
+        Some(err)
+    }
+
     /// The RFC 9457 problem document used by the default rendering.
     pub fn to_problem(&self) -> Value {
         let mut problem = json!({
@@ -162,28 +176,152 @@ impl HttpError {
         problem
     }
 
+    /// Whether this carries a domain error no exception filter has mapped yet.
+    pub(crate) fn is_raised(&self) -> bool {
+        self.raised.is_some()
+    }
+
+    /// A filter's answer for `origin`. The original error becomes its source, replacing any the
+    /// answer set, so `is` and `downcast_ref` find it whatever the filter returned; and the answer
+    /// is never mapped again, even when the filter built it with `HttpError::from`.
+    ///
+    /// The headers added around `origin` (by a tuple, or `with_header`) stay, winning over the
+    /// answer's as a tuple around it would: the filter only sees the domain error, so it could not
+    /// keep them itself. The status is the filter's.
+    pub(crate) fn caused_by(mut self, mut origin: HttpError) -> Self {
+        if let Some(source) = origin.source.take() {
+            self.source = Some(source);
+        }
+        self.headers.extend(*origin.headers);
+        self.raised = None;
+        self
+    }
+
+    /// Takes back the error a response was rendered from, so it travels as a value again, with
+    /// what the response added around it: the headers and status of a `(headers, HttpError)` or
+    /// `(StatusCode, HttpError)` tuple.
+    pub(crate) fn take_from(response: &mut Response) -> Option<HttpError> {
+        let ErrorExtension(err) = response.extensions_mut().remove::<ErrorExtension>()?;
+        match Arc::try_unwrap(err) {
+            Ok(mut err) => {
+                err.status = response.status();
+                Some(err.with_response_headers(std::mem::take(response.headers_mut())))
+            }
+            Err(shared) => {
+                response.extensions_mut().insert(ErrorExtension(shared));
+                None
+            }
+        }
+    }
+
+    /// Adds the headers of a response the error is taken from, repeated values included. What
+    /// describes the old body (`Content-Type`, `Content-Length`, `Content-Encoding`) stays behind:
+    /// the renderer writes a new one.
+    pub(crate) fn with_response_headers(mut self, mut headers: HeaderMap) -> Self {
+        headers.remove(header::CONTENT_TYPE);
+        headers.remove(header::CONTENT_LENGTH);
+        headers.remove(header::CONTENT_ENCODING);
+        self.headers.extend(headers);
+        self
+    }
+
     /// Logs the error with its source chain. hornero's router calls this for responses that are
     /// still 5xx after exception filters ran.
     pub(crate) fn log(&self) {
-        match &self.source {
-            Some(source) => {
-                let mut chain = source.to_string();
-                let mut cause = source.source();
-                while let Some(err) = cause {
-                    chain.push_str(": ");
-                    chain.push_str(&err.to_string());
-                    cause = err.source();
-                }
-                tracing::error!(status = %self.status, error = %chain, "{}", self.message);
+        let chain = self.source.as_deref().map(source_chain);
+        if let Some(raised) = self.raised {
+            tracing::error!(
+                status = %self.status,
+                error = %chain.unwrap_or_default(),
+                "unhandled {raised}: add an ExceptionFilter for it to choose the status",
+            );
+            return;
+        }
+        match chain {
+            Some(chain) => {
+                tracing::error!(status = %self.status, error = %chain, "{}", self.message)
             }
             None => tracing::error!(status = %self.status, "{}", self.message),
         }
     }
 }
 
+/// `err` and each of its causes, separated by `: `.
+fn source_chain(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    let mut chain = err.to_string();
+    let mut cause = err.source();
+    while let Some(err) = cause {
+        chain.push_str(": ");
+        chain.push_str(&err.to_string());
+        cause = err.source();
+    }
+    chain
+}
+
+/// What `?` does: carries `err` to the exception filter for its type, as a 500 until one maps it.
+/// axum's own rejections are answers instead, with their status, as when axum extracts them from
+/// a handler parameter: no filter sees them either way.
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
     fn from(err: E) -> Self {
-        Self::from_boxed(Box::new(err))
+        if let Some(answer) = Self::axum_rejection(&err) {
+            return answer.with_source(err);
+        }
+        let mut this = Self::internal("internal server error").with_source(err);
+        this.raised = Some(std::any::type_name::<E>());
+        this
+    }
+}
+
+impl HttpError {
+    /// axum's own rejections know their status: `Query::from_request_parts(..).await?` inside an
+    /// `Extractor` answers 400, as the same extractor in a handler does. So does a rejection's
+    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say). Only the types of
+    /// axum's default features: those of `ws` or `multipart` are not visible here, and a filter
+    /// maps them.
+    fn axum_rejection<E: 'static>(err: &E) -> Option<Self> {
+        use axum::extract::rejection::*;
+        macro_rules! known {
+            ($($ty:ty),* $(,)?) => {
+                let any = err as &dyn std::any::Any;
+                $(if let Some(rejection) = any.downcast_ref::<$ty>() {
+                    return Some(Self::new(rejection.status(), rejection.body_text()));
+                })*
+            };
+        }
+        // What extractors reject with.
+        known!(
+            JsonRejection,
+            QueryRejection,
+            FormRejection,
+            RawFormRejection,
+            PathRejection,
+            RawPathParamsRejection,
+            ExtensionRejection,
+            MatchedPathRejection,
+            NestedPathRejection,
+            BytesRejection,
+            StringRejection,
+            FailedToBufferBody,
+        );
+        // Their variants.
+        known!(
+            JsonDataError,
+            JsonSyntaxError,
+            MissingJsonContentType,
+            FailedToDeserializeQueryString,
+            InvalidFormContentType,
+            FailedToDeserializeForm,
+            FailedToDeserializeFormBody,
+            FailedToDeserializePathParams,
+            InvalidUtf8InPathParam,
+            MissingPathParams,
+            MissingExtension,
+            MatchedPathMissing,
+            LengthLimitError,
+            UnknownBodyError,
+            InvalidUtf8,
+        );
+        None
     }
 }
 
@@ -204,7 +342,8 @@ impl fmt::Display for HttpError {
     }
 }
 
-/// Attached to responses produced from an [`HttpError`], so filters can find the original error.
+/// Attached to responses produced from an [`HttpError`], so the error can be taken back as a value
+/// (a handler's answer, an axum rejection), read by middleware and logged.
 #[derive(Clone)]
 pub(crate) struct ErrorExtension(pub(crate) Arc<HttpError>);
 
@@ -325,15 +464,12 @@ pub enum Problem {
         /// The instances declaring it.
         instances: Vec<String>,
     },
-    /// A component ends up in a scope it cannot have: middleware, mounts or providers with hooks
-    /// that are not singletons, or a pinned provider pulled into request scope.
+    /// A component is transient but needs a single instance: a provider with hooks, or a controller.
     ScopeViolation {
         /// The offending component, with its module.
         item: String,
-        /// What is wrong, e.g. `is pinned to singleton scope but depends on a request-scoped provider`.
+        /// What is wrong, e.g. `has lifecycle hooks but is transient; hooks only run on singletons`.
         reason: String,
-        /// The dependency chain that made it request-scoped, when bubbling caused the problem.
-        chain: Vec<String>,
     },
     /// An override replaces a type that no module provides, or an enhancer nothing uses.
     UnusedOverride {
@@ -541,17 +677,7 @@ impl Problem {
                     "{INDENT}hint: declare it in a module imported once, such as the root module, or merge the instances with `Module::identity`."
                 )
             }
-            Problem::ScopeViolation {
-                item,
-                reason,
-                chain,
-            } => {
-                writeln!(f, "{INDENT}{item} {reason}.")?;
-                if !chain.is_empty() {
-                    writeln!(f, "{INDENT}chain: {}", chain.join(" -> "))?;
-                }
-                Ok(())
-            }
+            Problem::ScopeViolation { item, reason } => writeln!(f, "{INDENT}{item} {reason}."),
             Problem::UnusedOverride { provider } => {
                 writeln!(
                     f,
@@ -715,11 +841,11 @@ mod tests {
             "application/problem+json"
         );
         assert_eq!(rendered.headers()[header::RETRY_AFTER], "5");
-        assert!(rendered.extensions().get::<ErrorExtension>().is_none());
+        assert!(HttpError::in_response(&rendered).is_none());
 
         let response = HttpError::conflict("taken").into_response();
-        let attached = response.extensions().get::<ErrorExtension>().unwrap();
-        assert_eq!(attached.0.message(), "taken");
+        let attached = HttpError::in_response(&response).unwrap();
+        assert_eq!(attached.message(), "taken");
     }
 
     #[test]

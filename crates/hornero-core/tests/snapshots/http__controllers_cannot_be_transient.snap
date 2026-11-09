@@ -5,5 +5,4 @@ expression: err.to_string()
 failed to bootstrap application: 1 problem
 
 [1] scope violation
-    middleware ScopedMiddleware (in App) cannot be request-scoped.
-    chain: ScopedMiddleware -> RequestId [request]
+    Ephemeral (in App) cannot be transient; a controller is built once, during bootstrap.

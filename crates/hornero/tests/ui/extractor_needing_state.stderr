@@ -1,0 +1,17 @@
+error[E0277]: this function cannot be a route handler
+  --> tests/ui/extractor_needing_state.rs:24:5
+   |
+24 |     fn me(&self, _user: CurrentUser) -> &'static str {
+   |     ^^ a parameter cannot be extracted, or the return type is not `IntoResponse`
+   |
+   = help: the trait `RouteHandler<MeController, _>` is not implemented for closure `{closure@$DIR/tests/ui/extractor_needing_state.rs:24:5: 24:7}`
+   = note: a parameter is an axum extractor or `Extracted<E>`, and only the last one may consume the body
+   = note: handlers run with the state `()`: work that needs state or a provider goes in a `hornero::Extractor`, received as `Extracted<E>`
+note: required by a bound in `ControllerDef::<C>::route`
+  --> $WORKSPACE/crates/hornero-core/src/web/controller.rs
+   |
+   |     pub fn route<H, Args>(
+   |            ----- required by a bound in this associated function
+...
+   |         H: RouteHandler<C, Args>,
+   |            ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ControllerDef::<C>::route`

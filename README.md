@@ -48,8 +48,8 @@ fn dependency_graph_is_valid() {
 ## Features
 
 - **The whole dependency graph is validated before startup.** Missing dependencies, cycles, visibility errors, ambiguity, scope violations and route conflicts are reported together, with hints for fixing them.
-- **No DI cost per request.** Singletons are injected at startup; only request-scoped chains are built for each request.
-- **Nest-style scopes.** Singleton / Request / Transient. Request scope propagates up the dependency chain, and a scope report is printed at startup.
+- **No DI cost per request.** Every provider is built at startup; a request only clones an `Arc`.
+- **Request data stays out of the container.** There is no request scope: guards write to the request, extractors read it, and services take what they need as arguments. An `Extractor` is a provider, so reading the request can use injected dependencies too, validated at startup like everything else.
 - **Strict module encapsulation.** A provider must be exported before importers can use it. Global modules are supported.
 - **Incremental.** Every macro expands to a public builder API, and any axum `Router` can be mounted into a module.
 - **OpenAPI without writing it twice.** Paths, parameters, bodies, responses and authentication are inferred from the route table, handler signatures and guards, with Swagger UI included (`hornero-openapi`).
@@ -83,7 +83,7 @@ Rust code in the docs is checked (`cargo test -p hornero-docs`): it is either a 
 
 ## Example
 
-`examples/todo` demonstrates the main concepts: configuration, SeaORM (sqlite), an `AuthModule` that exports a guard, typed route metadata, validation, a singleton audit log, a global interceptor and exception filter, and domain errors raised with `?` and converted by type in the exception filter. `/docs` serves the inferred Swagger UI.
+`examples/todo` demonstrates the main concepts: configuration, SeaORM (sqlite), an `AuthModule` that exports a guard, typed route metadata, validation, a singleton audit log, a global interceptor and error renderer, and domain errors raised with `?` and mapped by type in an exception filter. `/docs` serves the inferred Swagger UI.
 
 ```sh
 # Run from examples/todo: config.toml and the sqlite file todo.db are relative to the working directory

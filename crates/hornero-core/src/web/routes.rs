@@ -60,6 +60,7 @@ pub struct RouteInfo {
     pub(crate) module: String,
     pub(crate) meta: Metadata,
     pub(crate) guards: Vec<EnhancerInfo>,
+    pub(crate) extractors: Vec<EnhancerInfo>,
 }
 
 impl RouteInfo {
@@ -101,10 +102,15 @@ impl RouteInfo {
     pub fn guards(&self) -> &[EnhancerInfo] {
         &self.guards
     }
+
+    /// The [`Extractor`](crate::Extractor)s the handler asks for, in parameter order.
+    pub fn extractors(&self) -> &[EnhancerInfo] {
+        &self.extractors
+    }
 }
 
-/// A guard (or other enhancer) as listed by [`RouteInfo::guards`]: its type, plus the metadata it
-/// describes itself with, such as the security scheme `hornero-openapi` documents for it.
+/// A guard or extractor as listed by [`RouteInfo`]: its type, plus the metadata it describes
+/// itself with, such as the security scheme `hornero-openapi` documents for it.
 #[derive(Clone)]
 pub struct EnhancerInfo {
     pub(crate) name: String,

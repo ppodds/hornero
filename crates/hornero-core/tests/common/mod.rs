@@ -9,8 +9,8 @@ use tower::ServiceExt;
 
 /// Declares a struct whose tuple fields are injected `Arc`s, with a hand-written `Injectable`.
 ///
-/// `service!(A: B, C)` declares `struct A(Arc<B>, Arc<C>)`; `service!(A; scope = Scope::Request)`
-/// sets the declared scope.
+/// `service!(A: B, C)` declares `struct A(Arc<B>, Arc<C>)`; `service!(A; scope = Scope::Transient)`
+/// sets the scope.
 #[macro_export]
 macro_rules! service {
     ($name:ident $(: $($dep:ident),+)? $(; $($const_name:ident = $value:expr),+)?) => {
@@ -32,7 +32,6 @@ macro_rules! service {
         }
     };
     (@const scope $value:expr) => { const SCOPE: ::hornero_core::Scope = $value; };
-    (@const pinned $value:expr) => { const SCOPE_PINNED: bool = $value; };
 }
 
 /// Declares a module from closures over `ModuleDef`.

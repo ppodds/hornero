@@ -7,8 +7,7 @@
 | [應用程式](#應用程式) | `Hornero`、`App` |
 | [模組](#模組) | `Module`、`ModuleDef`、`Provide`、`Identity`、`ModuleKey` |
 | [Provider](#provider) | `Injectable`、`Scope`、`hooks`、`LifecycleFn`、`ProviderDef`、`FactoryFn`、`bind!`、`Key`、`Dependency`、`Qualified`、`Resolver` |
-| [Request scope](#request-scope) | `RequestContext`、`ScopeReport`、`ScopeEntry` |
-| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Guard`、`GuardContext`、`Interceptor`、`ExceptionFilter`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
+| [HTTP](#http) | `Controller`、`ControllerAttrs`、`ControllerDef`、`RouteDef`、`RouteHandler`、`Extractor`、`Extracted`、`Guard`、`GuardContext`、`Interceptor`、`CallHandler`、`ExceptionFilter`、`ErrorRenderer`、`AppGuard`、`AppInterceptor`、`AppFilter`、`Middleware`、`RouteContext`、`Metadata`、`Routes`、`RouteInfo`、`EnhancerInfo` |
 | [錯誤](#錯誤) | `HttpError`、`BootError`、`ShutdownError`、`Problem` |
 | [生命週期](#生命週期) | `Lifecycle`、`Hook`、`Shutdown` |
 | [工具型別](#工具型別) | `BoxError`、`BoxFuture` |
@@ -32,7 +31,8 @@ pub struct Hornero { /* ... */ }
 | `fn shutdown_timeout(self, timeout: Duration) -> Self` | `serve`（與 `listen`）在關機開始後等待進行中 request 的上限，預設 10 秒；逾時或收到第二次 SIGINT/SIGTERM 就取消仍在執行的 request（client 收到 503，或串流 body 被切斷），仍會執行關閉 hook。`Duration::MAX` 表示無限等待 |
 | `fn guard<G: Guard + Injectable>(self) -> Self` | 全域 guard，在根模組解析；在模組宣告的 [`AppGuard`](#appguardappinterceptorappfilter) 以及 controller、handler 的 guard 之前執行 |
 | `fn interceptor<I: Interceptor + Injectable>(self) -> Self` | 全域 interceptor，包住模組宣告的 `AppInterceptor` 以及 controller、handler 的 interceptor |
-| `fn filter<F: ExceptionFilter + Injectable>(self) -> Self` | 全域 exception filter；在 handler 與 controller 層級的 filter 都沒有接住錯誤時才比對，比模組宣告的 `AppFilter` 先比對 |
+| `fn filter<F: ExceptionFilter + Injectable>(self) -> Self` | 全域 exception filter；在 handler 與 controller 層級都沒有處理該錯誤型別的 filter 時才比對，比模組宣告的 `AppFilter` 先比對 |
+| `fn error_renderer(self, renderer: ErrorRenderer) -> Self` | 應用的錯誤格式（見 [`ErrorRenderer`](#errorrenderer)），渲染路由上的每一個錯誤；預設 problem+json |
 | `fn middleware<M: Middleware + Injectable>(self) -> Self` | 全域 DI middleware，包住所有路由與 404 fallback |
 | `fn layer<L>(self, layer: L) -> Self` | 包住整個應用的 tower layer；先加的在外層 |
 | `fn override_provider<T: ?Sized>(self, value: Arc<T>) -> Self` | 以 `value` 取代所有 `T` 的 provider；原本的依賴不再需要 |
@@ -41,8 +41,9 @@ pub struct Hornero { /* ... */ }
 | `fn override_guard<G>(self, guard: impl Guard) -> Self` | 以任意 `Guard` 取代所有用到 guard `G` 的地方 |
 | `fn override_interceptor<I>(self, interceptor: impl Interceptor) -> Self` | 同上，interceptor |
 | `fn override_filter<F>(self, filter: impl ExceptionFilter) -> Self` | 同上，exception filter |
+| `fn override_extractor<E: Extractor>(self, extractor: impl Extractor<Output = E::Output>) -> Self` | 以 `Output` 相同的任意 `Extractor` 取代所有 `Extracted<E>` 參數 |
 | `fn routes(&self) -> Result<Routes, BootError>` | 列出所有 controller 路由（見 [`Routes`](#routesrouteinfo-與-enhancerinfo)），和 `validate` 一樣驗證依賴圖與路由、不建構任何東西；產生 API 文件用 |
-| `fn validate(&self) -> Result<ScopeReport, BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
+| `fn validate(&self) -> Result<(), BootError>` | 只驗證依賴圖與路由，不建構任何東西。路由衝突用 dry-run 組裝 router 來檢查（controller 路由用佔位 handler，`mount_router` 用真正的 router），所以 axum 自己會拒絕的衝突（例如 mount 與 controller 路由重疊）在這裡就會找到；需要 DI 的 `mount(..)` factory 只有 `build` 檢查得到 |
 | `async fn build(self) -> Result<App, BootError>` | 驗證、建構所有 singleton、組出 router，再執行 `on_module_init` 與 `on_application_bootstrap`。建構之後任何一步失敗，都會觸發 `Shutdown` 並對已建構的有 hook 的 singleton 執行 `on_module_destroy` 與 `on_application_shutdown`（反向依賴順序），清理失敗接在原本的問題之後 |
 | `async fn listen(self, addr: impl ToSocketAddrs) -> Result<(), BoxError>` | `build` 後開始 serve，直到收到 SIGINT / SIGTERM 或 `Shutdown::trigger`，最後執行關閉 hook；位址無法綁定時，先執行關閉 hook 再回傳錯誤：一個與綁定錯誤同 `ErrorKind` 的 `io::Error`，關閉 hook 也失敗時它的 `source()` 是 `ShutdownError`。先 `build` 再綁定是刻意的：port 一開就會通過 TCP health check，應用卻還沒啟動完 |
 
@@ -69,8 +70,7 @@ let hornero = Hornero::new(AppModule)
     .guard::<AllowAll>()
     .layer(TraceLayer::new_for_http());
 
-let report = hornero.validate().unwrap();
-assert!(report.is_empty());
+hornero.validate().unwrap();
 ```
 
 ### `App`
@@ -84,7 +84,6 @@ pub struct App { /* ... */ }
 | 方法 | 說明 |
 |---|---|
 | `fn router(&self) -> Router` | 組好的 axum `Router`（clone 成本很低） |
-| `fn scope_report(&self) -> &ScopeReport` | 哪些元件是 request-scoped，以及原因 |
 | `fn routes(&self) -> &Routes` | 所有 controller 路由，與 `Hornero::routes` 相同 |
 | `fn shutdown_handle(&self) -> Shutdown` | 應用的 `Shutdown`；呼叫 `trigger()` 會停止 `serve` |
 | `fn get<T: ?Sized>(&self) -> Option<Arc<T>>` | 依型別取得 singleton：根模組看得到的那個，或整個應用唯一的那個。service locator，只給測試與啟動程式碼使用 |
@@ -112,7 +111,7 @@ pub trait Module: Any + Send + Sync {
 |---|---|
 | `define` | 用 `ModuleDef` 描述模組內容。可能被呼叫多次（`validate` 與 `build`），所以不要做 I/O |
 | `identity` | 同一型別的多次 import 是否為同一個模組，見 [`Identity`](#identity)。預設 `Identity::Auto` |
-| `name` | 錯誤訊息與 scope report 中的名稱，預設是不含路徑的型別名稱 |
+| `name` | 錯誤訊息與路由表中的名稱，預設是不含路徑的型別名稱 |
 
 見 [模組](../guide/03-modules.md)。
 
@@ -212,7 +211,6 @@ pub enum Identity {
 ```rust,ignore
 pub trait Injectable: Send + Sync + Sized + 'static {
     const SCOPE: Scope = Scope::Singleton;
-    const SCOPE_PINNED: bool = false;
     const LIFECYCLE: Option<LifecycleFn<Self>> = None;
 
     fn dependencies() -> Vec<Key>;
@@ -225,8 +223,7 @@ pub trait Injectable: Send + Sync + Sized + 'static {
 
 | 項目 | 說明 |
 |---|---|
-| `SCOPE` | 宣告的 scope；實際 scope 仍可能因傳染變成 `Request` |
-| `SCOPE_PINNED` | `true` 時，被傳染成 request scope 會是 bootstrap 錯誤 |
+| `SCOPE` | 這個 provider 的 scope |
 | `LIFECYCLE` | 生命週期 hook，用 `hornero::hooks::<Self>()` 啟用 |
 | `dependencies()` | 依賴的 `Key`，順序與 `construct` 取用的順序一致；帶 qualifier 的依賴寫 `Key::of::<T>().qualified::<Q>()`，可選的依賴加上 `.optional()` |
 | `construct(resolver)` | 從 `resolver` 取得依賴並建構實例；可以用 `async fn` 實作 |
@@ -256,16 +253,15 @@ impl Injectable for Greeter {
 ### `enum Scope`
 
 ```rust,ignore
-pub enum Scope { Singleton, Request, Transient }
+pub enum Scope { Singleton, Transient }
 ```
 
 | 變體 | 說明 |
 |---|---|
-| `Singleton` | 整個應用一個，啟動時建構。預設值 |
-| `Request` | 每個 request 一個，第一次需要時建構；會向上傳染 |
+| `Singleton` | 整個應用一個。預設值 |
 | `Transient` | 每個依賴它的元件各一個 |
 
-實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。見 [Scope](../guide/06-scopes.md)。
+所有實例都在啟動時建構。實作了 `Clone`、`Copy`、`Debug`、`PartialEq`、`Eq`、`Hash`。見 [Scope](../guide/06-scopes.md)。
 
 ### `hooks` 與 `LifecycleFn`
 
@@ -296,7 +292,6 @@ type-erased 的 provider 註冊：滿足哪個 key、依賴什麼、如何建構
 | Builder 與存取 | 說明 |
 |---|---|
 | `fn scope(self, scope: Scope) -> Self` | 設定 scope |
-| `fn pinned(self) -> Self` | 禁止被傳染成 request scope |
 | `fn qualified<Q: 'static>(self) -> Self` | 以 qualifier `Q` 註冊，讓同一個模組可以有多個同型別的 provider；使用方以 `#[inject(qualifier = Q)]` 或 [`Qualified<T, Q>`](#qualified) 指定 |
 | `fn with_hooks<T: Lifecycle>(self) -> Self` | 為型別為 `T` 的 factory 或 value provider 啟用 hook；`T` 必須是這個 provider 的型別（qualifier 不影響），否則啟動時回報 `Problem::InvalidProvider` |
 | `fn key(&self) -> Key` | 這個 provider 滿足的 key |
@@ -478,56 +473,6 @@ pub struct Resolver { /* ... */ }
 
 ---
 
-## Request scope
-
-### `RequestContext`
-
-```rust,ignore
-pub struct RequestContext { /* ... */ }
-```
-
-request head 的快照，以 `Arc<RequestContext>` 注入 request-scoped provider，相當於 Nest 的 `REQUEST`。元件看到的是它被建構當下的 request：快照在每個 guard 與 interceptor 之後作廢並於下次需要時重拍，所以 guard 寫進 extensions 的資料對之後建構的元件（包含 controller 及其依賴）可見，已建構的元件則保留原本的快照。
-
-| 方法 | 說明 |
-|---|---|
-| `fn method(&self) -> &Method` | HTTP method |
-| `fn uri(&self) -> &Uri` | 完整 URI |
-| `fn version(&self) -> Version` | HTTP 版本 |
-| `fn headers(&self) -> &HeaderMap` | headers |
-| `fn extensions(&self) -> &Extensions` | extensions（guard 與 middleware 寫入的資料） |
-| `fn get<T: Clone + Send + Sync + 'static>(&self) -> Option<&T>` | `extensions().get::<T>()` 的簡寫 |
-
-### `ScopeReport` 與 `ScopeEntry`
-
-```rust,ignore
-pub struct ScopeReport {
-    pub entries: Vec<ScopeEntry>,
-}
-
-pub struct ScopeEntry {
-    pub item: String,
-    pub module: String,
-    pub declared: bool,
-    pub chain: Vec<String>,
-}
-```
-
-所有 request-scoped 元件與原因。由 `Hornero::validate()` 與 `App::scope_report()` 回傳，啟動時也會寫進 log。
-
-| 項目 | 說明 |
-|---|---|
-| `ScopeReport::entries` | 每個 request-scoped 元件一筆，依依賴順序排列 |
-| `fn is_empty(&self) -> bool` | 沒有任何 request-scoped 元件 |
-| `fn find(&self, item: &str) -> Option<&ScopeEntry>` | 依名稱（不含路徑的型別名稱）查詢 |
-| `ScopeEntry::item` | 元件名稱 |
-| `ScopeEntry::module` | 所屬模組 |
-| `ScopeEntry::declared` | `true`：自己宣告為 request；`false`：被傳染 |
-| `ScopeEntry::chain` | 被傳染時的依賴鏈，終點是宣告為 request 的 provider |
-
-`Display` 每筆輸出一行，例如 `  TodoService (in TodoModule): request-scoped via TodoService -> AuditLog [request]`。
-
----
-
 ## HTTP
 
 ### `trait Controller` 與 `trait ControllerAttrs`
@@ -583,7 +528,35 @@ pub struct RouteDef { /* ... */ }
 pub trait RouteHandler<C, Args>: Clone + Send + Sync + 'static { /* 只有 hornero 內部使用的方法 */ }
 ```
 
-可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>`，`Tn` 實作 `FromRequest<()>`（可以讀取 body）。controller 實例在每個 request 透過 handle 取得：singleton 是一次 `Arc` clone，request-scoped 則從 request scope 取得。
+可以當 handler 的 closure：`Fn(Arc<C>, T1, ..., Tn) -> impl Future<Output: IntoResponse>`，`n` 為 0 到 12，`T1..Tn-1` 實作 `FromRequestParts<()>` 或是 `Extracted<E>`，`Tn` 還可以實作 `FromRequest<()>`（可以讀取 body）。controller 在啟動時建構，每個 request 拿到的是它的 `Arc` clone。
+
+### `trait Extractor` 與 `Extracted`
+
+```rust,ignore
+pub trait Extractor: Send + Sync + 'static {
+    type Output: Send + 'static;
+
+    fn extract(
+        &self,
+        parts: &mut Parts,
+    ) -> impl Future<Output = Result<Self::Output, HttpError>> + Send;
+}
+
+pub struct Extracted<E: Extractor>(pub E::Output);
+```
+
+需要 provider 的 extractor。`Extracted<E>` 是 handler 參數，內容是 `E::Output`，並且 `Deref` 到它。
+
+| 項目 | 說明 |
+|---|---|
+| 解析 | 路由從 handler 的簽名得知 `E`，在 controller 的模組裡解析：看得到 provider 就用那個實例，否則建立私有的，和 guard 相同。依賴缺少是 `BootError`，手寫路由與 type alias 也一樣 |
+| 執行 | 在 guard 與 interceptor 之後，依參數順序，每個參數一次；沒有這個參數的 handler 不會執行它 |
+| 錯誤 | `Err` 就是回應，會經過 exception filter |
+| body | 不會讀取，後面的參數仍然可以是 `Json<T>` |
+| 限制 | `Extracted<E>` 沒有實作 `FromRequestParts`，只能用在 controller handler，也不能包在 `Option` 裡 |
+| 替換 | `override_extractor::<E>` 替換 `Extracted<E>` 參數，不影響注入 `E` 的 provider |
+
+見 [需要 provider 的 extractor](../guide/06-scopes.md#需要-provider-的-extractor)。
 
 ### `trait Guard` 與 `GuardContext`
 
@@ -606,33 +579,42 @@ pub struct GuardContext<'a> {
 | `GuardContext::route` | 路由資訊與 metadata |
 | `GuardContext::parts` | request head；可以把資料寫進 `parts.extensions` 給後續元件使用 |
 
-### `trait Interceptor`
+### `trait Interceptor` 與 `CallHandler`
 
 ```rust,ignore
 pub trait Interceptor: Send + Sync + 'static {
-    fn intercept(&self, ctx: &RouteContext, req: Request, next: Next) -> impl Future<Output = Response> + Send;
+    fn intercept(&self, ctx: &RouteContext, req: Request, next: CallHandler)
+        -> impl Future<Output = Result<Response, HttpError>> + Send;
+}
+
+pub struct CallHandler { /* ... */ }
+
+impl CallHandler {
+    pub fn handle(self, req: Request) -> impl Future<Output = Result<Response, HttpError>> + Send;
 }
 ```
 
-包住 handler。呼叫 `next.run(req).await` 執行內層；不呼叫就能直接回應。在 guard 之後執行；全域包住 controller，controller 包住 handler。
+包住 handler。`next.handle(req).await` 執行內層的 interceptor、extractor 與 handler（Nest 的 `CallHandler`），回傳 `Result`：`Err` 是錯誤本身，已經過 exception filter 轉換，原始錯誤仍是 source。`?` 把錯誤原樣往外傳，`map_err` 換掉它；不呼叫 `next` 就能直接回應或拒絕。在 guard 之後執行；全域包住 controller，controller 包住 handler。
+
+錯誤到 [renderer](#errorrenderer) 才變成回應，所以只修改 `Ok` 回應的 interceptor 不會影響錯誤回應；要讓錯誤也帶上 header，用 `err.with_header(..)`。
 
 ### `trait ExceptionFilter`
 
 ```rust,ignore
 pub trait ExceptionFilter: Send + Sync + 'static {
-    fn catches(&self, err: &HttpError) -> bool { true }
-    fn catch(&self, err: &HttpError, ctx: &RouteContext) -> impl Future<Output = Response> + Send;
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn catch(&self, err: &Self::Error, ctx: &RouteContext) -> impl Future<Output = HttpError> + Send;
 }
 ```
 
-重新渲染帶有 `HttpError` 的回應（來自 handler、guard、interceptor、`Rejection = HttpError` 的 extractor，或 request-scoped 元件建構失敗）。
+把一種 domain error 轉成 `HttpError`，相當於 Nest 的 `@Catch(TodoError)`。domain error 由 guard、interceptor、extractor 或 handler 用 `?`（或 `HttpError::from`）拋出；用狀態碼建構的 `HttpError` 與 axum extractor 的 rejection 已經是回答，filter 看不到。filter 執行時 request 已經被消耗，只看得到錯誤與路由；要依 request 呈現錯誤，見 [`HttpError::in_response`](#httperror)。
 
-| 方法 | 說明 |
+| 項目 | 說明 |
 |---|---|
-| `catches` | 這個 filter 是否處理 `err`，相當於 Nest 的 `@Catch(Type)`。預設 `true`（接住所有錯誤）；用 `err.is::<TodoError>()` 只接某種 domain error |
-| `catch` | 產生回應。從 `err.render()` 開始修改可以保留預設內容；回傳 `HttpError::not_found(..).into_response()` 這類回應則把錯誤轉成另一個狀態碼 |
+| `type Error` | 這個 filter 處理的錯誤型別。hornero 以 `downcast_ref` 比對 `?` 轉換的那個錯誤本身，不往 source chain 裡找 |
+| `catch` | 回傳 HTTP 錯誤：狀態碼、訊息、細節與 header。原始錯誤成為它的 source（取代回傳值自己設的 source），所以之後 `err.is::<Self::Error>()` 一定成立、5xx 的 log 寫出原因；filter 自己的失敗（例如查詢失敗）請在 filter 裡記錄。回傳值就是最終的回答，即使用 `HttpError::from` 建構，也不會再交給其他 filter。拋出的錯誤外面加的 header（tuple 或 `with_header`）保留到回傳值上，同名時以外面的為準。格式交給 renderer |
 
-**選擇規則**：依序查看 handler、controller、全域的 filter（先 `Hornero::filter`，再模組宣告的 `AppFilter`），同一層依註冊順序，第一個 `catches` 回傳 `true` 的 filter 處理錯誤，其他 filter 不會執行。沒有任何 filter 接住時，回應維持原樣。filter 回應的狀態碼仍是 5xx 時，原本的錯誤會被寫進 log。
+**選擇規則**：錯誤離開 handler、extractor 或 interceptor 時（guard 的錯誤在渲染前），依序查看 handler、controller、全域的 filter（先 `Hornero::filter`，再模組宣告的 `AppFilter`），同一層依註冊順序，第一個 `Error` 型別相符的 filter 處理錯誤，其他 filter 不會執行。每個錯誤最多轉換一次。沒有任何 filter 相符時，錯誤是不透露細節的 500，log 寫出它的型別與 `add an ExceptionFilter for it to choose the status`。
 
 ```rust
 use hornero::prelude::*;
@@ -652,13 +634,10 @@ impl std::error::Error for OutOfStock {}
 struct OutOfStockFilter;
 
 impl ExceptionFilter for OutOfStockFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.is::<OutOfStock>()
-    }
+    type Error = OutOfStock;
 
-    async fn catch(&self, err: &HttpError, _ctx: &RouteContext) -> Response {
-        let item = err.downcast_ref::<OutOfStock>().map_or(0, |e| e.0);
-        HttpError::conflict(format!("item {item} is out of stock")).into_response()
+    async fn catch(&self, err: &OutOfStock, _ctx: &RouteContext) -> HttpError {
+        HttpError::conflict(err.to_string())
     }
 }
 
@@ -670,7 +649,7 @@ impl CartController {
     #[post("/{item}")]
     fn add(&self, Path(item): Path<u32>) -> Result<StatusCode, HttpError> {
         let reserved: Result<(), OutOfStock> = Err(OutOfStock(item));
-        reserved?; // OutOfStock → 500，再由 filter 轉成 409
+        reserved?; // 拋出 OutOfStock，由 filter 轉成 409
         Ok(StatusCode::NO_CONTENT)
     }
 }
@@ -687,6 +666,14 @@ assert_eq!(res.status(), StatusCode::CONFLICT);
 assert_eq!(res.json::<serde_json::Value>()["detail"], "item 3 is out of stock");
 # }
 ```
+
+### `ErrorRenderer`
+
+```rust,ignore
+pub type ErrorRenderer = fn(&HttpError, &RouteContext) -> Response;
+```
+
+應用的錯誤格式，用 [`Hornero::error_renderer`](#hornero) 設定；沒有設定時是 `HttpError::render`（problem+json）。它渲染路由上的每一個錯誤：guard、interceptor、extractor 與 handler 的錯誤，以及 axum extractor 的 rejection，收到的是 filter 轉換之後的錯誤。hornero 接著把 `err.headers()` 加到它的回應上，並把錯誤放進回應的 extensions（`HttpError::in_response`、5xx log）。不經過路由的回應（404 fallback、405、panic、middleware 的錯誤、關機逾時的 503）不套用 renderer。
 
 ### `AppGuard`、`AppInterceptor`、`AppFilter`
 
@@ -840,13 +827,14 @@ pub struct EnhancerInfo { /* ... */ }
 | `fn module(&self) -> &str` | 註冊這個 controller 的模組名稱 |
 | `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | 型別為 `T` 的 metadata，與 guard 在 `RouteContext::meta` 看到的相同：handler 層級優先於 controller 層級 |
 | `fn guards(&self) -> &[EnhancerInfo]` | 這條路由會執行的 guard，依執行順序：全域的（先 `Hornero::guard`，再模組宣告的 `AppGuard`）、controller 的、handler 的 |
+| `fn extractors(&self) -> &[EnhancerInfo]` | handler 要求的 `Extractor`，依參數順序，重複的只列一次 |
 
 | `EnhancerInfo` 的方法 | 說明 |
 |---|---|
 | `fn name(&self) -> &str` | enhancer 名稱（不含路徑的型別名稱） |
 | `fn type_id(&self) -> TypeId` | enhancer 型別的 `TypeId` |
 | `fn is<T: 'static>(&self) -> bool` | enhancer 是否為 `T` |
-| `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | enhancer 用 [`Injectable::describe`](#trait-injectable) 描述自己的 metadata，例如 `hornero-openapi` 從實作 `ApiSecurity` 的 guard 取得的 security scheme |
+| `fn meta<T: Send + Sync + 'static>(&self) -> Option<&T>` | enhancer 用 [`Injectable::describe`](#trait-injectable) 描述自己的 metadata，例如 `hornero-openapi` 從實作 `ApiSecurity` 的 guard 或 extractor 取得的 security scheme |
 
 ```rust
 use hornero::prelude::*;
@@ -892,7 +880,9 @@ assert!(route.guards()[0].is::<AuthGuard>());
 pub struct HttpError { /* ... */ }
 ```
 
-會變成 HTTP 回應的錯誤，相當於 Nest 的 `HttpException`。預設渲染成 RFC 9457 `application/problem+json`，並附在回應的 extensions 上供 exception filter 使用。exception filter 處理之後，最終回應仍是 5xx 的錯誤會由 hornero 的 router 寫進 log（含 source chain），每個錯誤一次。
+會變成 HTTP 回應的錯誤，相當於 Nest 的 `HttpException`。用狀態碼建構的是**回答**，原樣渲染；`?`（`From<E>`）轉換的是**拋出**的 domain error，由處理它型別的 [exception filter](#trait-exceptionfilter) 轉換，沒有就是 500。
+
+在路由裡錯誤以值往外傳，最後渲染一次：[renderer](#errorrenderer)，預設 RFC 9457 `application/problem+json`。回應會帶上錯誤的 header，並在 extensions 保留錯誤本身（`in_response`）。最終回應仍是 5xx 的錯誤由 hornero 的 router 寫進 log（含 source chain），每個錯誤一次。
 
 | 建構方式 | 說明 |
 |---|---|
@@ -904,14 +894,14 @@ pub struct HttpError { /* ... */ }
 | `fn conflict(message) -> Self` | 409 |
 | `fn unprocessable(message) -> Self` | 422 |
 | `fn internal(message) -> Self` | 500 |
-| `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因 |
-| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | 同 `from_boxed`，讓 `?` 可以用 |
+| `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因。是回答：exception filter 看不到 |
+| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 預設 feature 裡的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等，以及組成它們的 `JsonSyntaxError`、`FailedToDeserializeQueryString` 等變體；`ws`、`multipart` 的型別不在內，需要 filter）保留原本的狀態碼與訊息，是回答，filter 看不到，與 handler 參數的 rejection 相同 |
 
 | Builder | 說明 |
 |---|---|
 | `fn with_details(self, details: impl Serialize) -> Self` | 結構化細節，渲染在 `errors` 欄位；序列化失敗時 `details` 維持 `None`，並以 `tracing::warn!` 記錄 |
 | `fn with_source(self, source: impl Into<BoxError>) -> Self` | 內部原因：寫進 log，不會送給 client |
-| `fn with_header(self, name: HeaderName, value: HeaderValue) -> Self` | 設定回應 header（同名會取代）；`render()` 會套用，filter 可從 `headers()` 取得 |
+| `fn with_header(self, name: HeaderName, value: HeaderValue) -> Self` | 設定回應 header（同名會取代）；不論回應由 renderer 或 `render()` 產生都會帶上 |
 
 | 存取與渲染 | 說明 |
 |---|---|
@@ -921,7 +911,8 @@ pub struct HttpError { /* ... */ }
 | `fn headers(&self) -> &HeaderMap` | 隨錯誤攜帶的回應 header（401 預設含 `WWW-Authenticate: Bearer`） |
 | `fn source(&self) -> Option<&(dyn Error + Send + Sync + 'static)>` | 內部原因 |
 | `fn downcast_ref<E: Error + 'static>(&self) -> Option<&E>` | 內部原因是 `E` 時取得它：`?` 轉換的錯誤，或傳給 `from_boxed` / `with_source` 的錯誤。不會往 source chain 裡找 |
-| `fn is<E: Error + 'static>(&self) -> bool` | 內部原因是否為 `E`，常用在 `ExceptionFilter::catches` |
+| `fn is<E: Error + 'static>(&self) -> bool` | 內部原因是否為 `E`。filter 轉換之後仍成立，interceptor 與 renderer 可以用它分辨原始的 domain error |
+| `fn in_response(response: &Response) -> Option<&HttpError>` | `response` 背後的 `HttpError`（filter 轉換之後的）。給只看得到回應的 middleware 與 tower layer 使用；interceptor 直接收到錯誤。見 [依 request 資料呈現錯誤](../guide/06-scopes.md#依-request-資料呈現錯誤) |
 | `fn to_problem(&self) -> Value` | problem document：`type`、`title`、`status`、`detail`，以及選用的 `errors` |
 | `fn render(&self) -> Response` | 預設的 problem+json 回應，不消耗 `self`、不寫 log、不附加 extension |
 
@@ -938,7 +929,7 @@ assert_eq!(err.source().unwrap().to_string(), "row missing");
 assert_eq!(err.to_problem()["title"], "Not Found");
 
 let err = HttpError::from(std::io::Error::other("disk full")); // `?` 做的轉換
-assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR); // 沒有 filter 處理時
 assert!(err.is::<std::io::Error>());
 assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().to_string(), "disk full");
 
@@ -986,7 +977,7 @@ pub struct ShutdownError { /* ... */ }
 | `InvalidModuleExport` | `module`、`export` | `export_module` 了沒有 import 的模組 |
 | `UndeclaredModuleIdentity` | `module`、`imported_by` | 帶資料、沒有宣告 `Identity` 的模組被 import 了不只一次 |
 | `DuplicateGlobalEnhancer` | `enhancer`、`module`、`instances` | 同一模組型別的多個實例宣告了同一個全域 enhancer |
-| `ScopeViolation` | `item`、`reason`、`chain` | middleware 或 mount 變成 request-scoped、有 hook 的 provider 不是 singleton，或 pinned 的 provider 被傳染 |
+| `ScopeViolation` | `item`、`reason` | 有 hook 的 provider 或 controller 宣告成 transient |
 | `UnusedOverride` | `provider` | override 了沒有任何模組提供的型別 |
 | `InvalidProvider` | `provider`、`reason` | provider 的註冊本身有誤，例如 `with_hooks::<T>()` 的 `T` 不是這個 provider 的型別 |
 | `InvalidRoute` | `handler`、`reason` | 舊路徑語法、不支援的 method、axum 拒絕的路由 |

@@ -9,17 +9,19 @@ hornero 是建立在 tokio + axum 0.8 之上的 Web framework，提供 NestJS �
 | ADR | 決策 |
 |---|---|
 | [0001](adr/0001-runtime-di.md) | 執行期 TypeId 容器 + 啟動期整圖驗證，而非型別層級編譯期 DI |
-| [0002](adr/0002-scope-bubbling.md) | Singleton / Request / Transient，request scope 採 Nest 式傳染，並以 scope report 與啟動期檢查控管 |
+| [0002](adr/0002-scope-bubbling.md) | ~~Singleton / Request / Transient，request scope 採 Nest 式傳染~~，已被 ADR-0007 取代 |
 | [0003](adr/0003-strict-visibility.md) | 嚴格模組可見性：local > imports 的 exports > global |
-| [0004](adr/0004-no-axum-wrapping.md) | 不包裝 axum：handler 參數就是 extractor，任何 tower layer 直接可用 |
+| [0004](adr/0004-no-axum-wrapping.md) | 不包裝 axum：handler 參數就是 extractor，任何 tower layer 直接可用（路由內的 pipeline 由 ADR-0008 修改） |
 | [0005](adr/0005-qualifiers.md) | 以 marker 型別作為 qualifier（`Pool@Primary`），並以 `Option<Arc<T>>` 表示可選依賴 |
+| [0007](adr/0007-no-request-scope.md) | 移除 request scope：所有 provider 在啟動時建構，request 資料走 extractor |
+| [0008](adr/0008-route-pipeline.md) | 路由 pipeline 由 hornero 執行：錯誤以 `HttpError` 值傳遞，filter 依型別轉換，renderer 統一格式 |
 
 ---
 
 ## 1. 設計原則
 
 1. **不包裝 axum。** facade 直接 re-export axum；框架只負責「組裝」。
-2. **DI 成本集中在啟動期。** 依賴邊在啟動時解析成具體 node，singleton 在 request 期間零查表。
+2. **DI 成本集中在啟動期。** 依賴邊在啟動時解析成具體 node，所有 provider 在 bind port 前建構完畢，request 期間不碰容器。
 3. **Fail fast，錯誤訊息要好。** 缺依賴、循環、不可見、歧義、scope 違規、路由衝突，全部在 bind port 前一次回報，並附修正提示。
 4. **漸進式。** 每個 macro 都只是公開 builder API 的語法糖。
 5. **Types as tokens。** 沒有字串 token；同型別多實例用 qualifier 型別（`.qualified::<Replica>()`、`#[inject(qualifier = Replica)]`），或泛型 tag（`Db<Replica>`）、newtype。見 [ADR-0005](adr/0005-qualifiers.md)。
@@ -39,7 +41,7 @@ hornero 是建立在 tokio + axum 0.8 之上的 Web framework，提供 NestJS �
 crates/
   hornero/              facade：re-export hornero-core、hornero-macros、axum、tower；prelude
   hornero-core/         DI 容器、模組系統、HTTP pipeline、lifecycle、錯誤型別
-    src/di/          key、injectable、provider、module、graph（驗證）、runtime、scope、resolver
+    src/di/          key、injectable、provider、module、graph（驗證）、runtime、resolver
     src/web/         controller、handler、guard、interceptor、filter、middleware、enhancer、pipeline、route
     src/app.rs       Hornero builder、App、路由組裝、graceful shutdown
   hornero-macros/       proc macros（展開成 hornero-core 的公開 API）
@@ -93,7 +95,7 @@ pub struct TodoModule;
 - 動態模組宣告 `Identity::Instance`：每次 import 都是獨立實例，同 Nest v11 起以物件參照判斷 `forRoot()` 的身分；`SeaOrmModule`、`OpenApiModule`、`ConfigModule::for_root` 都是。依內容合併的模組（`ConfigModule::for_feature`）宣告 `Identity::key(..)`，以 (型別, key) 為身分，key 以 `==` 比較，不用 hash。
 - `export_module::<M>()` 依型別比對，轉出所有型別為 `M` 的 import（同 Nest 以 class 比對 re-export）；其中有兩個實例 export 同一個 key 時是 `AmbiguousReexport` 啟動錯誤。模組自己 `export` 的 key 優先，與模組內 local 優先於 import 的規則一致。
 - 循環 import 依身分偵測：`Type`、`Key` 身分在 import stack 上重複時回報 `CircularImport`，所以 key 不同的同型別模組可以巢狀；`Instance` 身分永遠不會重複，改以型別偵測，避免無限遞迴。
-- 同一型別有多個實例時，診斷訊息、scope report 與 route table 以 `CacheModule#2, imported by StorageModule` 區分它們。
+- 同一型別有多個實例時，診斷訊息與 route table 以 `CacheModule#2, imported by StorageModule` 區分它們。
 - global enhancer（`AppGuard<G>` 等）在每個宣告它的模組各執行一次。同一模組型別的多個實例宣告同一個 enhancer 是 `DuplicateGlobalEnhancer` 啟動錯誤：重複來自 import 端，宣告處看不出來。
 - 可見性規則見 ADR-0003。
 
@@ -108,27 +110,15 @@ pub struct TodoModule;
 
 slot 以 `Arc<dyn ErasedGuard>` 儲存，因此 `override_guard::<AuthGuard>(AllowAll)` 可以換成任何 `Guard` 實作，且原本 guard 的依賴不再需要。
 
-## 5. Scope
+## 5. Scope 與 request 資料
 
-詳見 ADR-0002。摘要：
+詳見 ADR-0007。摘要：
 
-- `Scope::{Singleton, Request, Transient}`；effective scope = 自己宣告為 Request，或任一依賴的 effective scope 為 Request → Request。
-- 啟動期限制：middleware、mount 不得變成 request-scoped；有 lifecycle hooks 的 provider 必須是 singleton；明確宣告 scope 的 provider（`#[injectable(scope = singleton)]`）被傳染時報錯。
-- 啟動時以 `tracing::info!` 輸出 scope report：
-
-```text
-request-scoped components:
-  AuditLog (in TodoModule): declared request-scoped
-  TodoService (in TodoModule): request-scoped via TodoService -> AuditLog [request]
-  TodoController (in TodoModule): request-scoped via TodoController -> TodoService -> AuditLog [request]
-```
-
-### Runtime 機制
-
-- 只有 route 鏈上確實有 request-scoped 元件時，才會加上 scope layer，在 extensions 放入 `RequestScope`；純 singleton 的路由沒有任何額外成本。
-- `RequestScope` 內部是 `Box<[tokio::sync::OnceCell<Instance>]>`，slot index 在啟動時算好；同一 request 內共用、跨 request 隔離。
-- `Handle<T>` = `Ready(instance) | Lazy(node)`：controller / guard / interceptor / filter 都透過它取得實例；singleton 路徑只是一次 `Arc` clone。
-- `RequestContext`（Nest 的 `REQUEST`）是 request head 的快照，每個元件看到的是**它被建構當下**的 request：快照在 request-scoped 的 guard、interceptor 或 handler 建構前建立，並在每個 guard 與 interceptor 之後作廢（它們可以修改 request），下一個需要的元件會重新拍一份。已建構的元件保留自己拿到的快照。因此 guard 寫入 extensions 的資料（例如 `AuthUser`）對之後建構的 request-scoped provider 可見，即使更早還有別的 request-scoped guard 用過 `RequestContext`。只有 exception filter 需要 context 時，由最先執行的階段拍一份（interceptor 提前回應時使用），guard 拒絕請求時重拍，到 handler 時若期間有 guard 或 interceptor 執行過也會重拍；filter 在 handler 之後執行，使用當時最新的快照，因此看得到 guard 寫入的資料。快照會移除 scope 本身，避免 `Arc` 循環。
+- `Scope::{Singleton, Transient}`。scope 只決定實例數量：所有 provider 都在啟動時建構，request 期間不碰容器，handler 與 enhancer 直接持有 `Arc`。
+- 啟動期限制：有 lifecycle hooks 的 provider 與 controller 不得是 transient（`ScopeViolation`）。
+- 沒有 request scope。request 資料放在 request 的 extensions：guard、interceptor 與 middleware 寫入，handler 用 extractor 讀取，再用參數傳給 service。
+- handler 的 state 是 `()`，所以 axum extractor 拿不到 provider。需要依賴的工作寫成 `Extractor`：它是 provider，handler 用 `Extracted<E>` 參數取得結果。參數本身就是宣告：`RouteHandler` 在型別層分辨 axum extractor 與 `Extracted<E>`，路由據此建立 slot，手寫路由與 type alias 也一樣在啟動時驗證。slot 經由 request extensions 交給參數，所以 `Extracted<E>` 只能用在 controller handler。
+- exception filter 與 renderer 在 request 被消耗之後才執行，只看得到錯誤與路由。依 request 呈現錯誤由 middleware（用 `HttpError::in_response` 取得錯誤）或 interceptor（收到錯誤本身）負責。
 
 ## 6. Request pipeline
 
@@ -136,25 +126,28 @@ request-scoped components:
 request
   → 全域 tower layers / DI middleware（Hornero::layer / Hornero::middleware）
   → 模組 tower layers / DI middleware（只包住該模組的 controller）
-  → routing
-  → [scope layer]（僅在需要時）
-  → exception filter（handler > controller > global 中，第一個 catches 該錯誤的）
-  → guards（global → controller → handler，依序；第一個失敗即回應）
-  → interceptors（global 包 controller 包 handler）
-  → extractors（≈ Nest 的 Pipe；Valid<Json<T>> 做驗證）
-  → handler（&self + extractors）
+  → routing（axum：路徑比對、405）
+  → RouteChain（hornero 執行，每一層回傳 Result<_, HttpError>）
+      → guards（global → controller → handler，依序；第一個失敗即停止）
+      → interceptors（global 包 controller 包 handler；next.handle(req) 回傳 Result）
+      → extractors（≈ Nest 的 Pipe；Valid<Json<T>> 做驗證；Extracted<E> 注入 provider）
+      → handler（&self + extractors）
+      錯誤離開 handler / extractor / interceptor 時：exception filter 依 domain error 的型別轉換
+      最後：renderer（Hornero::error_renderer，預設 problem+json）把錯誤渲染一次
 ```
 
-全部編譯成 `axum::middleware::from_fn` 或 tower layer，沒有另一套執行模型。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。應用的 fallback 只由全域 middleware 與 layer 包住，不經過任何模組的 middleware 或 layer：axum `merge` 留下的 fallback 是最後合併的模組的，帶著該模組的 layer，所以 hornero 另外組 fallback。掛在 `/` 的 router 自己的 fallback（例如 SPA 的 `index.html`）會被使用，只有 axum 空的 404 才換成 problem+json；這些 router 的路由在 fallback 裡一律回 404，免得全域 layer 在路由之後改寫路徑，繞過模組的 middleware 打到它們。mount 在非 `/` 前綴的 router 自己的 fallback 不在此列：axum `nest` 把它收在該前綴下，跟其他路由一樣經過模組的 middleware 與 layer。
+routing 以外的部分是 tower layer 與 `axum::middleware::from_fn`。路由本身是一個 axum handler，裡面由 hornero 的 `RouteChain` 依序執行 guard、interceptor、extractor 與 handler（ADR-0008）：錯誤以 `HttpError` 值往外傳，在 renderer 才變成回應，所以 interceptor 拿得到錯誤本身，axum extractor 的 rejection 也走同一條路。`CatchPanicLayer` 在全域 middleware 與 tower layer 的內側、路由的外側作為保險（所以 panic 的 500 仍會經過 CORS、request id、trace 等全域處理，404 fallback 的 panic 也接得住），未匹配路由回 problem+json 404。應用的 fallback 只由全域 middleware 與 layer 包住，不經過任何模組的 middleware 或 layer：axum `merge` 留下的 fallback 是最後合併的模組的，帶著該模組的 layer，所以 hornero 另外組 fallback。掛在 `/` 的 router 自己的 fallback（例如 SPA 的 `index.html`）會被使用，只有 axum 空的 404 才換成 problem+json；這些 router 的路由在 fallback 裡一律回 404，免得全域 layer 在路由之後改寫路徑，繞過模組的 middleware 打到它們。mount 在非 `/` 前綴的 router 自己的 fallback 不在此列：axum `nest` 把它收在該前綴下，跟其他路由一樣經過模組的 middleware 與 layer。
 
-route 層（scope、filter、guard、interceptor）以 `route_layer` 掛載，只對該 route 註冊的 HTTP method 執行：同一路徑上其他 method 的請求得到 405 時，不會執行任何 guard、interceptor 或 filter。405 同樣以 problem+json 回應，並保留 axum 設定的 `Allow` header。
+`RouteChain` 以 `on(MethodFilter, ..)` 掛在該 route 註冊的 HTTP method 上：同一路徑上其他 method 的請求由 axum 回 405，不會執行任何 guard、interceptor、filter 或 renderer。405 同樣以 problem+json 回應，並保留 axum 設定的 `Allow` header。
 
 | 抽象 | 簽名 | 說明 |
 |---|---|---|
 | `Guard` | `can_activate(&self, &mut GuardContext) -> Result<(), HttpError>` | 回傳 `Result` 而非 bool：自選 401/403；可寫入 `parts.extensions` |
-| `Interceptor` | `intercept(&self, &RouteContext, Request, Next) -> Response` | RxJS Observable 換成 async around-advice |
-| `ExceptionFilter` | `catches(&self, &HttpError) -> bool`（預設 `true`）與 `catch(&self, &HttpError, &RouteContext) -> Response` | 看得到 handler、guard、request-scoped 建構失敗產生的 `HttpError`；`?` 拋出的 domain error 以 `err.is::<T>()` 依型別接住 |
+| `Interceptor` | `intercept(&self, &RouteContext, Request, CallHandler) -> Result<Response, HttpError>` | RxJS Observable 換成 async around-advice；`CallHandler::handle` 執行內層，錯誤以 `Err` 傳回（已經過 filter 轉換） |
+| `ExceptionFilter` | `type Error` 與 `catch(&self, &Self::Error, &RouteContext) -> HttpError` | Nest 的 `@Catch(Type)`：只收到 `?` 拋出、型別相符的 domain error，回傳 HTTP 錯誤；格式交給 renderer。看不到 request（它已被消耗） |
+| `ErrorRenderer` | `fn(&HttpError, &RouteContext) -> Response` | 應用的錯誤格式，`Hornero::error_renderer` 設定；渲染路由上的每一個錯誤 |
 | `Middleware` | `handle(&self, Request, Next) -> Response` | 需要 DI 時才用；否則直接用 tower layer |
+| `Extractor` | `extract(&self, &mut Parts) -> Result<Self::Output, HttpError>` | 需要 provider 的 extractor；handler 用 `Extracted<E>` 取得 `Output`，只有要求它的 handler 才執行 |
 
 `RouteContext::meta::<T>()` 提供型別化 metadata（handler 層覆蓋 controller 層），取代 `SetMetadata` + `Reflector` 的字串 key。
 
@@ -167,11 +160,17 @@ route 層（scope、filter、guard、interceptor）以 `route_layer` 掛載，�
 
 ## 7. 錯誤模型
 
-- Handler 回傳 `Result<_, HttpError>`。任何 `std::error::Error` 透過 `?` 轉成 500，原始錯誤保留為 source，**不會**送給 client。
-- Domain error 的轉換交給 exception filter：`catches` 以 `err.is::<TodoError>()` 依 source 的型別選擇 filter（Nest 的 `@Catch(Type)`），沒有 filter 接住就維持 500。因此保留 `impl<E: Error> From<E> for HttpError`：它讓 `?` 能用在任何錯誤上，代價是使用者無法替自己的錯誤型別寫 `From<E> for HttpError`（E0119）；有了依型別選擇的 filter，就不需要那個 `From`。
-- `HttpError` 預設渲染成 RFC 9457 `application/problem+json`，並把自己放進 response extensions 供 filter 重新渲染。它也攜帶回應 header（`with_header` / `headers()`，`unauthorized()` 預設帶 `WWW-Authenticate: Bearer`）：`render()` 會套用，自訂 filter 的回應則完全取代原回應，要保留就自己複製 `err.headers()`。`with_details` 序列化失敗時 `details` 維持空，並以 `tracing::warn!` 記錄。
-- 5xx 的 log 寫在 router 最外層（所有全域 layer 之外），依**最終回應**決定：被 filter 轉成 4xx 的 domain error 不會留下 error log，panic 與沒被接住的錯誤各記錄一次。
-- `hornero-validation` 把 extractor rejection 也轉成 `HttpError`，讓所有 client error 外觀一致、也會經過 filter。
+詳見 ADR-0008。摘要：
+
+- guard、interceptor、extractor 與 handler 回傳 `Result<_, HttpError>`。`HttpError` 分兩種：用狀態碼建構的是**回答**，原樣渲染；任何 `std::error::Error` 透過 `?`（`From<E>`）轉成的是**拋出**的 domain error，記下型別、原始錯誤保留為 source，**不會**送給 client。
+- 拋出的錯誤交給 exception filter：filter 以 `type Error` 宣告型別（Nest 的 `@Catch(Type)`），hornero 用 `downcast_ref` 在 handler > controller > global 中找第一個相符的，`catch` 回傳 `HttpError`，原始錯誤仍是 source。錯誤離開 handler、extractor、interceptor 時就轉換，所以外層 interceptor 看到的是 client 會收到的狀態碼。
+- 沒有 filter 的拋出錯誤是框架內建的 catch-all：500，log 寫出型別與「add an ExceptionFilter for it to choose the status」。不在啟動時檢查每條路由是否有 filter。axum 自己的 rejection 型別（`JsonRejection` 等 12 種）經 `?` 轉換時保留原本的狀態碼。
+- 保留 `impl<E: Error> From<E> for HttpError`：它讓 `?` 能用在任何錯誤上，代價是使用者無法替自己的錯誤型別寫 `From<E> for HttpError`（E0119）；有了依型別選擇的 filter，就不需要那個 `From`。
+- 錯誤只渲染一次：`Hornero::error_renderer` 設定的 renderer，預設 RFC 9457 `application/problem+json`。hornero 接著加上錯誤攜帶的 header（`with_header` / `headers()`，`unauthorized()` 預設帶 `WWW-Authenticate: Bearer`），並把錯誤放進 response extensions，供 middleware（`HttpError::in_response`）與 5xx log 讀取。`with_details` 序列化失敗時 `details` 維持空，並以 `tracing::warn!` 記錄。
+- axum extractor 的 rejection 在 handler 參數處轉成 `HttpError`：帶有 `HttpError` 的回應（`Rejection = HttpError`、`hornero-validation` 的 `Valid`）取回原值；其他 4xx / 5xx 取狀態碼、body 文字與 header；非錯誤狀態（例如 `Redirect`）原樣送出。
+- handler 回傳的 `IntoResponse` 先渲染成回應，再從 extensions 取回 `HttpError`，所以回傳 `Result<_, HttpError>` 或自訂 `IntoResponse` 的錯誤都以值的形式交給 interceptor。
+- 5xx 的 log 寫在 router 最外層（所有全域 layer 之外），依**最終回應**決定：被 filter 轉成 4xx 的 domain error 不會留下 error log，panic 與沒被處理的錯誤各記錄一次。
+- renderer 只負責路由上的錯誤；404 fallback、405、panic、middleware 的錯誤與關機逾時的 503 維持 problem+json。
 - 啟動錯誤是 `BootError`，一次列出所有問題，例如：
 
 ```text
@@ -233,7 +232,7 @@ let todo: Todo = app.client().with_bearer("t").post("/todos").json(&body).await
 | reflect-metadata 執行期 DI、字串 token | 沒有 reflection；字串無型別 | TypeId 當 key、啟動期整圖驗證 |
 | 每個 service 都抽 interface | dyn dispatch + async trait boxing，噪音多 | 預設注入具體型別；只在邊界（repo、外部 client）用 `Arc<dyn Trait>` |
 | `forwardRef` | `Arc` 循環會洩漏，建構順序不存在 | 啟動錯誤並印出循環路徑 |
-| Request scope 靜默傳染 | 隱性效能懸崖 | 保留傳染語意，但有 scope report 與啟動期檢查 |
+| Request scope 靜默傳染 | 隱性效能懸崖；建構失敗延到 request 期間 | 不提供 request scope：request 資料走 extractor，service 用參數接收 |
 | `throw HttpException` | 沒有例外 | `Result` + `?` + `HttpError` + filter |
 | Pipes | — | extractor / newtype：parse, don't validate |
 | Guard 回 bool + 字串 metadata | 無型別 | `Result<(), HttpError>` + 型別化 metadata + 證明型 extractor |
@@ -252,4 +251,4 @@ let todo: Todo = app.client().with_bearer("t").post("/todos").json(&body).await
 - **dyn async trait**：Rust 尚不支援 `async fn` 的 dyn dispatch，以 `BoxFuture` 回傳（見 `examples/todo/src/todo/repo.rs`）。
 - **型別名稱**：診斷訊息使用 `std::any::type_name`，其格式不保證穩定（例如目前會省略預設泛型參數，`Db<Primary>` 顯示為 `Db`）。
 - **sea-orm 驅動**：`sqlx-postgres` / `sqlx-mysql` 0.9 目前依賴尚未正式發布的 `hmac` / `sha1` 版本，因此 `hornero-sea-orm` 只提供 `sqlite` feature；其他驅動由應用程式自己的 `sea-orm` 依賴啟用。
-- **後續**：`hornero-openapi`（utoipa）、排程、typed events、request-scoped transaction interceptor、無相依 singleton 平行建構。
+- **後續**：`hornero-openapi`（utoipa）、排程、typed events、每個 request 一個交易的 interceptor、無相依 singleton 平行建構。

@@ -7,17 +7,14 @@ use crate::lifecycle::{ErasedLifecycle, Lifecycle};
 use crate::util::BoxError;
 use crate::web::route::Metadata;
 
-/// How long a provider instance lives.
+/// How many instances of a provider exist. Every instance is built during bootstrap.
+///
+/// There is no request scope: request data reaches handlers through axum extractors, and from
+/// there the services they call as arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// One instance for the whole application, built during bootstrap. The default.
+    /// One instance for the whole application. The default.
     Singleton,
-    /// One instance per HTTP request, built lazily the first time the request needs it.
-    ///
-    /// Request scope bubbles up like in Nest: anything that depends on a request-scoped
-    /// provider becomes request-scoped too. The bootstrap logs a scope report listing every
-    /// component that was pulled into request scope and the chain that caused it.
-    Request,
     /// A fresh instance for every consumer.
     Transient,
 }
@@ -44,11 +41,8 @@ fn erase_lifecycle<T: Lifecycle>(this: &Arc<T>) -> Arc<dyn ErasedLifecycle> {
     note = "add `#[derive(Injectable)]` to the struct, `#[injectable]` to an impl block with a `new` constructor, or implement `hornero::Injectable` by hand"
 )]
 pub trait Injectable: Send + Sync + Sized + 'static {
-    /// Declared scope. The effective scope may still become [`Scope::Request`] through bubbling.
+    /// The scope of this provider.
     const SCOPE: Scope = Scope::Singleton;
-
-    /// When `true`, bubbling into request scope is a bootstrap error instead of a silent change.
-    const SCOPE_PINNED: bool = false;
 
     /// Lifecycle hooks, see [`hooks`].
     const LIFECYCLE: Option<LifecycleFn<Self>> = None;

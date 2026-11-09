@@ -19,7 +19,10 @@ hornero 有兩種錯誤：
 | `HttpError::unprocessable(msg)` | 422 |
 | `HttpError::internal(msg)` | 500 |
 | `HttpError::new(status, msg)` | 任意 |
-| `HttpError::from_boxed(err)` / `HttpError::from(err)` | 500，`err` 成為內部原因 |
+| `HttpError::from_boxed(err)` | 500，`err` 成為內部原因 |
+| `?` 或 `HttpError::from(err)` | 由處理 `err` 型別的 [exception filter](#domain-error) 決定，沒有就是 500；axum 自己的 rejection（`JsonRejection`、`QueryRejection` 等，以及組成它們的 `JsonSyntaxError`、`FailedToDeserializeQueryString` 等）保留原本的狀態碼 |
+
+前面幾種是**回答**：錯誤本身就是要給 client 的回應，原樣渲染，exception filter 看不到。最後一列是**拋出**：`?` 帶著原始的 domain error 去找處理它型別的 filter，由 filter 決定狀態碼，原始錯誤保留為內部原因。
 
 | Builder | 用途 |
 |---|---|
@@ -27,7 +30,7 @@ hornero 有兩種錯誤：
 | `.with_source(err)` | 內部原因：寫進 log，不會出現在回應裡 |
 | `.with_header(name, value)` | 回應 header（同名會取代），例如 `HttpError::unauthorized(msg).with_header(WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"hornero\""))` |
 
-header 跟著錯誤本身走：`render()` 會套用，自訂 exception filter 自己組回應時，用 `err.headers()` 取得並複製即可。`with_details` 的值序列化失敗時，`details` 維持空白並以 `tracing::warn!` 記錄。
+header 跟著錯誤本身走：不論回應由預設格式或自訂的 [renderer](#統一錯誤格式) 產生，hornero 都會加上它們。handler 用 tuple 包住錯誤時也一樣：`([(SET_COOKIE, "session=; Max-Age=0")], HttpError::unauthorized(..))` 的 `Set-Cookie`、`(StatusCode::SERVICE_UNAVAILABLE, err)` 的狀態碼都會保留，和 axum 的行為相同。例外是包住拋出的錯誤（`?` 或 `HttpError::from`）而有 filter 轉換它時：狀態碼由 filter 決定，header 仍然保留，見 [domain error](#domain-error)。`with_details` 的值序列化失敗時，`details` 維持空白並以 `tracing::warn!` 記錄。
 
 預設渲染成 [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) 的 `application/problem+json`：
 
@@ -51,11 +54,22 @@ assert_eq!(
 );
 ```
 
-exception filter 處理完之後，**最終回應仍是 5xx** 的錯誤會用 `tracing::error!` 記錄，內容包含訊息與完整的 source chain；4xx 不會記錄。
+在一條路由裡，錯誤是**值**：guard、interceptor、extractor 與 handler 都回傳 `Result`，`HttpError` 一路往外傳，最後才渲染一次：
+
+```text
+guard、interceptor、extractor、handler   Err(HttpError)
+        │  拋出的 domain error 離開每一層時，交給處理它型別的 exception filter
+        ▼
+exception filter      TodoError → HttpError::not_found(..)，原始錯誤保留為 source
+        ▼
+renderer              Hornero::error_renderer，預設 problem+json；加上錯誤攜帶的 header
+        ▼
+middleware、tower layer、5xx log
+```
 
 ## `?` 與 500
 
-任何 `std::error::Error` 都可以用 `?` 轉成 `HttpError`，結果是**不透露細節的 500**：client 只看到 `internal server error`，原始錯誤寫進 log。資料庫錯誤、I/O 錯誤這類意外狀況，直接 `?` 就好：
+任何 `std::error::Error` 都可以用 `?` 轉成 `HttpError`。沒有 filter 處理它的型別時，結果是**不透露細節的 500**：client 只看到 `internal server error`，原始錯誤寫進 log。資料庫錯誤、I/O 錯誤這類意外狀況，直接 `?` 就好：
 
 ```rust
 use hornero::prelude::*;
@@ -67,7 +81,7 @@ struct NumberController;
 impl NumberController {
     #[get("/{raw}")]
     fn parse(&self, Path(raw): Path<String>) -> Result<String, HttpError> {
-        let number: u32 = raw.parse()?; // ParseIntError → 500
+        let number: u32 = raw.parse()?; // ParseIntError：沒有 filter 處理 → 500
         Ok((number * 2).to_string())
     }
 }
@@ -87,11 +101,17 @@ assert_eq!(problem["detail"], "internal server error"); // "invalid digit" 只�
 # }
 ```
 
-預期中的失敗（找不到、衝突、權限不足）也可以用 `?` 拋出，再由 exception filter 依錯誤型別轉成對應的狀態碼，見下一節。
+log 會寫出錯誤的型別與完整的 source chain：
+
+```text
+ERROR unhandled core::num::error::ParseIntError: add an ExceptionFilter for it to choose the status status=500 Internal Server Error error=invalid digit found in string
+```
+
+這就是內建的 catch-all：框架不要求每條路由都掛上 filter，也不在啟動時檢查。預期中的失敗（找不到、衝突、權限不足）被當成 500 時，log 會指出是哪個型別，替它加一個 filter 即可，見下一節。
 
 ## Domain error
 
-service 回傳自己的錯誤型別，handler 用 `?` 拋出，exception filter 依型別轉成回應。這就是 Nest 的 `throw new TodoNotFound()` 搭配 `@Catch(TodoNotFound)`：
+service 回傳自己的錯誤型別，handler 用 `?` 拋出，exception filter 依型別轉成 `HttpError`。這就是 Nest 的 `throw new TodoNotFound()` 搭配 `@Catch(TodoNotFound)`：
 
 ```rust
 use std::fmt;
@@ -139,22 +159,18 @@ impl TodoService {
     }
 }
 
-// HTTP 層：把 domain error 轉成回應
+// HTTP 層：把 domain error 轉成 HTTP 錯誤
 #[derive(Injectable)]
 struct TodoErrorFilter;
 
 impl ExceptionFilter for TodoErrorFilter {
-    fn catches(&self, err: &HttpError) -> bool {
-        err.is::<TodoError>() // 只接 TodoError，其他錯誤交給下一個 filter
-    }
+    type Error = TodoError; // 相當於 @Catch(TodoError)
 
-    async fn catch(&self, err: &HttpError, _ctx: &RouteContext) -> Response {
-        let mapped = match err.downcast_ref::<TodoError>() {
-            Some(TodoError::NotFound(id)) => HttpError::not_found(format!("todo {id} not found")),
-            Some(TodoError::Duplicate(title)) => HttpError::conflict(format!("`{title}` already exists")),
-            None => return err.render(),
-        };
-        mapped.into_response()
+    async fn catch(&self, err: &TodoError, _ctx: &RouteContext) -> HttpError {
+        match err {
+            TodoError::NotFound(id) => HttpError::not_found(format!("todo {id} not found")),
+            TodoError::Duplicate(title) => HttpError::conflict(format!("`{title}` already exists")),
+        }
     }
 }
 
@@ -179,7 +195,7 @@ impl TodoController {
 
     #[get("/export")]
     async fn export(&self) -> Result<String, HttpError> {
-        Ok(self.todos.export().await?) // io::Error：沒有 filter 接住
+        Ok(self.todos.export().await?) // io::Error：沒有 filter 處理
     }
 }
 
@@ -207,36 +223,99 @@ assert_eq!(res.json::<serde_json::Value>()["detail"], "internal server error"); 
 
 運作方式：
 
-- `?` 把 `TodoError` 轉成 500 的 `HttpError`，原始錯誤保留為 source。`err.is::<T>()` 與 `err.downcast_ref::<T>()` 取回它。它們只看 `?` 轉換的那個錯誤本身，不會往 source chain 裡找：如果 `TodoError` 被包在另一個錯誤型別裡，請 catch 外層的型別。
-- 發生錯誤時，hornero 依序查看 handler、controller、全域的 filter（同一層依註冊順序），交給**第一個 `catches` 回傳 `true` 的 filter**。`catches` 預設接住所有錯誤。
-- 沒有任何 filter 接住時，錯誤維持原樣：不透露細節的 500，並寫進 log。被 filter 轉成 4xx 的錯誤不會留下 error log。
+- `?` 把 `TodoError` 轉成拋出的 `HttpError`，原始錯誤保留為 source。
+- 錯誤離開 handler 時，hornero 依序查看 handler、controller、全域的 filter（同一層依註冊順序），交給**第一個 `Error` 型別相符的 filter**。guard、interceptor 與 extractor 用 `?` 拋出的錯誤也一樣。
+- filter 回傳的 `HttpError` 是回答，原始錯誤成為它的 source：interceptor、renderer 與 middleware 裡，`err.is::<TodoError>()` 與 `err.downcast_ref::<TodoError>()` 一定取得到它。回傳值自己設的 source 會被原始錯誤取代，所以 filter 自己的失敗（例如查詢翻譯失敗）請在 filter 裡記錄。
+- 每個錯誤最多轉換一次：filter 的回傳值不會再交給 filter，即使它是用 `HttpError::from` 建構的。
+- 拋出的錯誤外面加的 header（`([(SET_COOKIE, ..)], HttpError::from(err))` 的 tuple 或 `.with_header`）會保留到 filter 的回傳值上，同名時以外面加的為準，就像 tuple 包在回傳值外面；filter 只拿得到 domain error，沒辦法自己保留它們。狀態碼仍由 filter 決定。
+- 型別比對看的是 `?` 轉換的那個錯誤本身，不會往 source chain 裡找：如果 `TodoError` 被包在另一個錯誤型別裡，請替外層的型別寫 filter。
+- 沒有 filter 處理時，錯誤成為不透露細節的 500 並寫進 log（見上一節）。被 filter 轉成 4xx 的錯誤不會留下 error log。
+- filter 只決定**狀態碼與訊息**，回應的格式由 [renderer](#統一錯誤格式) 決定，所以每個 filter 都不必重複格式。
 
-**filter 放在哪裡**：只有一個 controller 會遇到的錯誤，放在 controller（`#[controller]` 下方的 `#[filters(..)]`）。跨模組共用的 domain error，註冊成全域 filter。和接住所有錯誤的 filter（例如自訂格式的 `ProblemFilter`）一起使用時，**具體的先註冊**：
+**filter 放在哪裡**：只有一個 controller 會遇到的錯誤，放在 controller（`#[controller]` 下方的 `#[filters(..)]`）。跨模組共用的 domain error（例如驗證身分失敗的 `AuthError`），註冊成全域 filter：`Hornero::filter::<F>()`，或模組 `providers` 裡的 `AppFilter<F>`（Nest 的 `APP_FILTER`）。每個 filter 只處理自己的型別，所以註冊順序只在同一個型別有多個 filter 時才有影響：較具體的（handler、controller）先處理。
+
+> **為什麼不寫 `impl From<TodoError> for HttpError`？** `HttpError` 有 `impl<E: std::error::Error> From<E>`（`?` 能用在任何錯誤上就是靠它），所以替實作了 `Error` 的型別再寫 `From` 會衝突（E0119）。轉換交給 filter 就不需要它。
+
+## 統一錯誤格式
+
+錯誤的格式由 **renderer** 決定：一個 `fn(&HttpError, &RouteContext) -> Response`，用 `Hornero::error_renderer` 設定，整個應用只有一個。沒有設定時渲染成 problem+json。
+
+renderer 收到的是 filter 轉換之後的錯誤，負責路由上的**每一個**錯誤：handler、guard、interceptor、extractor 回傳的錯誤，以及 axum extractor 的 rejection（壞掉的 JSON、無法解析的路徑參數）。錯誤攜帶的 header 由 hornero 加上，renderer 不必自己複製：
 
 ```rust
 use hornero::prelude::*;
-# #[derive(Injectable)]
-# struct TodoErrorFilter;
-# impl ExceptionFilter for TodoErrorFilter {
-#     async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response { err.render() }
-# }
-# #[derive(Injectable)]
-# struct ProblemFilter;
-# impl ExceptionFilter for ProblemFilter {
-#     async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response { err.render() }
-# }
-# #[module]
-# struct AppModule;
+use serde_json::json;
 
-Hornero::new(AppModule)
-    .filter::<TodoErrorFilter>() // 只接 TodoError
-    .filter::<ProblemFilter>()   // 其他所有錯誤
-# ;
+/// 應用的錯誤格式
+fn house_format(err: &HttpError, ctx: &RouteContext) -> Response {
+    let body = json!({ "error": err.message(), "route": ctx.path() });
+    (err.status(), Json(body)).into_response()
+}
+
+#[derive(Injectable)]
+struct TokenGuard;
+
+impl Guard for TokenGuard {
+    async fn can_activate(&self, ctx: &mut GuardContext<'_>) -> Result<(), HttpError> {
+        match ctx.parts.headers.get("authorization") {
+            Some(_) => Ok(()),
+            None => Err(HttpError::unauthorized("missing token")),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NewNote {
+    title: String,
+}
+
+#[controller("/notes")]
+#[guards(TokenGuard)]
+struct NoteController;
+
+#[routes]
+impl NoteController {
+    #[post("/")]
+    fn create(&self, Json(note): Json<NewNote>) -> String {
+        note.title
+    }
+}
+
+#[module(controllers = [NoteController])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let hornero = Hornero::new(AppModule).error_renderer(house_format);
+let app = hornero_testing::TestApp::from_hornero(hornero).build().await.unwrap();
+let client = app.client();
+
+// guard 的錯誤：格式來自 renderer，WWW-Authenticate 來自錯誤本身
+let res = client.post("/notes").await;
+assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+assert_eq!(res.header("www-authenticate"), Some("Bearer"));
+assert_eq!(res.json::<serde_json::Value>(), json!({ "error": "missing token", "route": "/notes" }));
+
+// axum extractor 的 rejection：保留 axum 的狀態碼與訊息
+let res = client
+    .post("/notes")
+    .bearer("token")
+    .header("content-type", "application/json")
+    .body("{")
+    .await;
+assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+let body: serde_json::Value = res.json();
+assert!(body["error"].as_str().unwrap().starts_with("Failed to parse the request body as JSON"));
+# }
 ```
 
-每個錯誤只會經過一個 filter，所以 `TodoErrorFilter` 的輸出不會再交給 `ProblemFilter`。需要統一格式時，把格式寫成一個函式，讓兩個 filter 都呼叫它。`examples/todo` 就是這樣做的：`src/todo/error.rs` 的 `TodoErrorFilter` 與 `src/common.rs` 的 `ProblemFilter` 共用 `problem()`。
+axum 的 rejection 怎麼變成錯誤：
 
-> **為什麼不寫 `impl From<TodoError> for HttpError`？** `HttpError` 有 `impl<E: std::error::Error> From<E>`（`?` 能用在任何錯誤上就是靠它），所以替實作了 `Error` 的型別再寫 `From` 會衝突（E0119）。轉換交給 filter 就不需要它。
+- axum 內建 extractor 的 rejection 保留它的狀態碼與訊息。在 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 裡對它用 `?`（例如 `Query::<Page>::from_request_parts(parts, &()).await?`）也一樣是 400，不會變成 500；它和 handler 參數的 rejection 一樣是回答，filter 看不到。拆開 rejection、只用 `?` 轉出其中的變體（例如 `QueryRejection::FailedToDeserializeQueryString(inner)` 的 `inner`）也一樣。
+- 上一條只涵蓋 axum 預設 feature 裡的型別。選用 feature 的型別（`ws` 的 `WebSocketUpgradeRejection`、`multipart` 的 `MultipartRejection` 與 `next_field` 回傳的 `MultipartError` 等）hornero 不認得：當 handler 參數時照下面「其他 rejection」處理，狀態碼一樣保留；經 `?` 轉換時則是拋出的錯誤，沒有 filter 就是 500。需要時替該型別寫一個 filter，`catch` 回傳 `HttpError::new(err.status(), err.body_text())`。
+- `Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）回傳的就是那個 `HttpError`。
+- 其他 rejection 取它的狀態碼、文字與 header（同名的多個值都保留），例如 `(StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")], "missing bearer token")`。描述原本 body 的 `Content-Type`、`Content-Length`、`Content-Encoding` 不保留，因為 renderer 會產生新的 body；有 `Content-Encoding`（例如 gzip）的 body 不當成文字讀，訊息改用狀態碼的名稱。
+- 不是 4xx / 5xx 的 rejection（例如導向登入頁的 `Redirect`）不是錯誤，原樣送出。
 
 ### 其他做法
 
@@ -287,9 +366,9 @@ impl IntoResponse for TodoError {
     fn into_response(self) -> Response {
         match self {
             TodoError::NotFound(id) => HttpError::not_found(format!("todo {id} not found")),
-            TodoError::Storage(_) => HttpError::from(self), // 500，原因只寫 log
+            TodoError::Storage(_) => HttpError::from_boxed(self.into()), // 500，原因只寫 log
         }
-        .into_response() // 經由 HttpError 渲染，所以 exception filter 也看得到
+        .into_response() // 經由 HttpError 渲染，所以 renderer 與 interceptor 也拿得到這個錯誤
     }
 }
 
@@ -328,20 +407,23 @@ handler 需要同時用 `?` 處理 domain error 與其他錯誤時，這種做�
 
 ## 錯誤回應的流向
 
-`HttpError` 轉成回應時：
+路由上的錯誤：
 
-1. 依 `to_problem()` 渲染 problem+json並套用錯誤攜帶的 header（401 預設有 `WWW-Authenticate: Bearer`）。
-2. 把錯誤本身附在回應的 extensions 上。
-3. 回應往外傳到 exception filter：第一個 `catches` 它的 filter 重新渲染，見 [Request pipeline](05-request-pipeline.md#exception-filter)。
-4. 在 hornero router 的最外層（所有全域 layer 之外），最終回應仍是 5xx 的錯誤寫進 log（包括 handler panic）。每個錯誤最多記錄一次。
+1. guard、interceptor、extractor 或 handler 回傳 `Err(HttpError)`。
+2. 拋出的 domain error 離開 handler、extractor 或 interceptor 時，由處理它型別的 filter 轉換，所以外層 interceptor 看到的已經是 client 會收到的狀態碼；guard 的錯誤在渲染前轉換。見 [Request pipeline](05-request-pipeline.md#exception-filter)。
+3. 錯誤渲染一次：renderer，或預設的 problem+json。hornero 加上錯誤攜帶的 header（401 預設有 `WWW-Authenticate: Bearer`），並把錯誤附在回應的 extensions 上。
+4. 回應往外經過模組與全域的 middleware、tower layer。middleware 用 `HttpError::in_response(&response)` 讀得到錯誤。
+5. 在 hornero router 的最外層（所有全域 layer 之外），最終回應仍是 5xx 的錯誤寫進 log（包括 handler panic）。每個錯誤最多記錄一次。
 
-以下回應**不是**來自 `HttpError`，所以 filter 看不到：
+renderer 只負責路由上的錯誤。以下回應不經過路由，維持 problem+json：
 
-| 來源 | 回應 | 怎麼統一格式 |
-|---|---|---|
-| axum 內建 extractor 的 rejection（壞掉的 JSON、缺少的 query 參數） | 純文字，狀態碼由 extractor 決定 | 改用 `Valid<Json<T>>`（見 [驗證](11-validation.md)），或 `Rejection = HttpError` 的自訂 extractor |
-| 沒有路由符合 | 404 problem+json | 已經是 problem+json，但不經過 filter |
-| handler panic | 500 problem+json，panic 訊息只寫 log | 由 `CatchPanicLayer` 處理，它在全域 layer 與 middleware 的內側，回應仍會經過它們 |
+| 來源 | 回應 |
+|---|---|
+| 沒有路由符合 | 404 |
+| 路徑符合但 method 不符 | 405，保留 `Allow` header |
+| handler panic | 500，panic 訊息只寫 log。由 `CatchPanicLayer` 處理，它在全域 layer 與 middleware 的內側，回應仍會經過它們 |
+| middleware 回傳的 `HttpError` | 依 `HttpError` 的 `IntoResponse` 渲染 |
+| 關機逾時被取消的 request | 503 |
 
 ## Bootstrap 錯誤
 
@@ -420,7 +502,7 @@ match &err.problems()[0] {
 | `InvalidModuleExport` | 轉出（`export_module`）了沒有 import 的模組 | import 那個模組 |
 | `UndeclaredModuleIdentity` | 帶資料的模組被 import 了不只一次，卻沒有宣告身分 | 在 `fn identity()` 回傳 `Identity::Instance`、`Identity::key(..)` 或 `Identity::Type`，見 [模組的身分](03-modules.md#動態模組) |
 | `DuplicateGlobalEnhancer` | 同一模組型別的多個實例宣告了同一個全域 enhancer | 改在只 import 一次的模組（例如根模組）宣告 |
-| `ScopeViolation` | middleware / mount / 有 hook 的 provider 變成 request-scoped，或 pinned 的 provider 被傳染 | 見 [Scope](06-scopes.md#傳染的限制) |
+| `ScopeViolation` | 有 hook 的 provider 或 controller 宣告成 transient | 改成 singleton，見 [Scope 的限制](06-scopes.md#scope-的限制) |
 | `UnusedOverride` | override 了沒有任何模組提供的型別 | 修正型別，或移除 override |
 | `InvalidRoute` | 舊的 `:id` 語法、axum 不支援的 method、axum 拒絕的路由 | 改用 `{id}`；調整路徑 |
 | `DuplicateRoute` | 兩個 handler 處理同一個 method 與路徑 | 調整路徑或前綴 |

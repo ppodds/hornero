@@ -1,5 +1,4 @@
-//! A singleton audit log. The caller is passed per call (from the `AuthUser` handler argument)
-//! instead of being captured from the request, so nothing is pulled into request scope.
+//! A singleton audit log. The caller is passed per call, from the `AuthUser` handler argument.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

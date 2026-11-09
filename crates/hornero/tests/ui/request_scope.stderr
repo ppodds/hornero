@@ -1,0 +1,5 @@
+error: there is no request scope; a provider cannot hold request data. Read it in a handler with an axum extractor, or with a `hornero::Extractor` if that needs a provider
+ --> tests/ui/request_scope.rs:3:22
+  |
+3 | #[injectable(scope = request)]
+  |                      ^^^^^^^

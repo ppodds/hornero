@@ -94,7 +94,7 @@ assert_eq!(
 
 ### 規則
 
-- **只有 singleton 能有 hook**。有 hook 的 provider 若是 request-scoped 或 transient（包括被傳染），啟動時會報錯。
+- **只有 singleton 能有 hook**。有 hook 的 provider 若是 transient，啟動時會報錯。
 - **init 或 bootstrap hook 失敗會中止啟動**，回傳 `BootError`：
 
   ```text

@@ -112,21 +112,29 @@ use hornero::prelude::*;
 # #[derive(Injectable)]
 # struct Timing;
 # impl Interceptor for Timing {
-#     async fn intercept(&self, _: &RouteContext, req: Request, next: Next) -> Response { next.run(req).await }
+#     async fn intercept(&self, _: &RouteContext, req: Request, next: CallHandler) -> Result<Response, HttpError> {
+#         next.handle(req).await
+#     }
 # }
+# #[derive(Debug)]
+# struct TodoError;
+# impl std::fmt::Display for TodoError {
+#     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("todo error") }
+# }
+# impl std::error::Error for TodoError {}
 # #[derive(Injectable)]
-# struct ProblemFilter;
-# impl ExceptionFilter for ProblemFilter {
-#     async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response { err.render() }
+# struct TodoErrorFilter;
+# impl ExceptionFilter for TodoErrorFilter {
+#     type Error = TodoError;
+#     async fn catch(&self, _: &TodoError, _: &RouteContext) -> HttpError { HttpError::not_found("todo not found") }
 # }
 # struct Public;
 # use hornero::axum::extract::Request;
-# use hornero::axum::middleware::Next;
 
 #[controller("/todos")]
 #[guards(AuthGuard)]
 #[interceptors(Timing)]
-#[filters(ProblemFilter)]
+#[filters(TodoErrorFilter)]
 #[meta(Public)]
 pub struct TodoController {
     todos: Arc<TodoService>,
@@ -140,7 +148,7 @@ pub struct TodoController {
 - 這些 attribute 必須寫在 `#[controller]` **下方**（Nest 的慣例也是 `@Controller` 寫在最上面）；寫在上方會得到明確的編譯錯誤。同一種 attribute 可以寫多次，也可以一次列多個：`#[guards(AuthGuard, RolesGuard)]`，依由上到下、由左到右的順序執行。
 - 也可以寫成參數：`#[controller("/todos", guards = [AuthGuard], meta = [Public])]`，效果相同。兩種寫法並用時，參數裡的先執行。
 - struct 的規則和 `#[derive(Injectable)]` 相同：`Arc<T>` 欄位是依賴，其他欄位要加 `#[inject(default)]` 或 `#[inject(with = ...)]`。
-- 要設定 scope 時，在 struct 上加 `#[injectable(scope = request)]` 或 `#[inject(scope = request)]`。通常不需要：controller 會依依賴自動變成 request-scoped（見 [Scope](06-scopes.md)）。
+- controller 是 singleton：只在啟動時建構一次，由所有 request 共用，宣告成 transient 是 bootstrap 錯誤（見 [Scope 的限制](06-scopes.md#scope-的限制)）。request 的資料用 extractor 取得，不要存在 controller 上。
 
 ## `#[routes]`
 
@@ -224,7 +232,7 @@ assert!(err.to_string().contains(
 
 - **receiver**：`&self`，或 `self: Arc<Self>`（要把 controller 移進 `tokio::spawn` 時使用）。不支援 `&mut self`，因為同一個 controller 實例會同時服務多個 request。
 - **同步或非同步都可以**：沒有 `.await` 的 handler 可以寫成一般的 `fn`。
-- **其餘參數都是 axum extractor**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。
+- **其餘參數都是 axum extractor 或 `Extracted<E>`**，最多 12 個。只有最後一個可以讀取 body（`Json<T>`、`String`、`Bytes`、`Form<T>`……），其他的必須實作 `FromRequestParts`。handler 的 state 是 `()`，所以需要 state 的 extractor 不能當參數。
 - **回傳值是任何 `IntoResponse`**。
 - handler 不能有泛型參數。
 
@@ -282,7 +290,7 @@ handler 參數就是 axum extractor，axum 生態系裡的 extractor 都能直�
 
 hornero **不使用 axum 的 `State`**：controller 需要的東西都透過 DI 注入，router 的 state 型別固定是 `()`。
 
-自訂 extractor 的 `Rejection` 建議用 `HttpError`，錯誤回應才會是一致的 problem+json，也會經過 exception filter：
+自訂 extractor 的 `Rejection` 建議用 `HttpError`：hornero 取回的就是這個 `HttpError`，結構化細節與 header 都保留，在裡面用 `?` 拋出的 domain error 也會交給 exception filter。其他型別的 rejection 只保留狀態碼、文字與 header。不論哪一種，錯誤回應都由應用的 [renderer](05-request-pipeline.md#renderer) 渲染：
 
 ```rust
 use hornero::axum::extract::FromRequestParts;
@@ -331,6 +339,8 @@ assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 ```
 
 需要「已驗證身分」這類資料時，把它做成 extractor：handler 參數裡出現 `user: AuthUser`，本身就證明這個 request 已經通過驗證。做法見 [Request pipeline](05-request-pipeline.md#guard)。
+
+extractor 的工作需要 provider 時（查資料庫、讀設定），實作 `Extractor` 並用 `Extracted<E>` 當參數，見 [需要 provider 的 extractor](06-scopes.md#需要-provider-的-extractor)。
 
 ## 回傳值
 

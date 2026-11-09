@@ -23,10 +23,12 @@
 | 註冊值、factory 或自訂 provider | [`ProviderDef`](hornero-core.md#providerdef) |
 | 寫 controller 與路由 | [`#[controller]`](hornero.md#controller)、[`#[routes]`](hornero.md#routes) |
 | 驗證身分、檢查權限 | [`Guard`](hornero-core.md#trait-guard-與-guardcontext)、[`Metadata`](hornero-core.md#metadata) |
-| 包住 handler（計時、快取、改寫回應） | [`Interceptor`](hornero-core.md#trait-interceptor) |
-| 自訂錯誤格式 | [`ExceptionFilter`](hornero-core.md#trait-exceptionfilter)、[`HttpError`](hornero-core.md#httperror) |
+| 包住 handler（計時、快取、改寫回應或錯誤） | [`Interceptor`、`CallHandler`](hornero-core.md#trait-interceptor-與-callhandler) |
+| 把 domain error 轉成狀態碼 | [`ExceptionFilter`](hornero-core.md#trait-exceptionfilter)、[`HttpError`](hornero-core.md#httperror) |
+| 自訂錯誤格式 | [`ErrorRenderer`](hornero-core.md#errorrenderer)（`Hornero::error_renderer`） |
 | 需要依賴的 middleware | [`Middleware`](hornero-core.md#trait-middleware) |
-| 每個 request 一個實例、讀取目前的 request | [`Scope`](hornero-core.md#enum-scope)、[`RequestContext`](hornero-core.md#requestcontext) |
+| 設定實例數量 | [`Scope`](hornero-core.md#enum-scope) |
+| 讀取 request 的資料 | axum extractor，見 [Scope 與 request 資料](../guide/06-scopes.md#request-資料) |
 | 啟動與關閉時執行程式碼 | [`Lifecycle`](hornero-core.md#trait-lifecycle)、[`Shutdown`](hornero-core.md#shutdown) |
 | 處理啟動錯誤 | [`BootError`](hornero-core.md#booterror)、[`Problem`](hornero-core.md#enum-problem) |
 | 列出所有路由 | [`Routes`](hornero-core.md#routesrouteinfo-與-enhancerinfo) |

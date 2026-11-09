@@ -144,7 +144,7 @@ body 與參數的型別這樣對應到 schema：
 沒有寫 `body` 的 `#[api_response]` 依狀態碼決定 body：
 
 - **2xx**（204 除外）沿用從回傳型別推導的 body，所以 `#[api_response(201)]` 就足以把 `(StatusCode, Json<Todo>)` 說清楚。
-- **4xx、5xx** 是 hornero 的錯誤格式：`application/problem+json` 的 `ProblemDetails` schema（見 [錯誤處理](08-errors.md)）。
+- **4xx、5xx** 是 hornero 的錯誤格式：`application/problem+json` 的 `ProblemDetails` schema（見 [錯誤處理](08-errors.md)）。用 `Hornero::error_renderer` 換掉格式時，文件推導不出新的格式，請用 `.modify` 改寫錯誤回應的 media type 與 schema。
 - 只要宣告了任何 2xx，就不會再自動加上 200。
 - `description` 預設是狀態碼的標準說明，例如 `Not Found`。
 
@@ -268,6 +268,7 @@ assert_eq!(doc["components"]["securitySchemes"]["bearer"]["bearerFormat"], "JWT"
 
 - `scheme()` 回傳 scheme 的名稱與內容。名稱相同的 guard 共用一個 scheme。
 - 一條路由經過好幾個實作 `ApiSecurity` 的 guard 時，全部都是必要條件。
+- 自己驗證身分的 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 也可以實作 `ApiSecurity`：handler 有這個參數的路由就會要求它的 scheme。
 - `scopes(route)` 回傳 OAuth2 / OpenID Connect 需要的 scope，預設沒有。
 - `SecurityScheme` 提供 `bearer()`、`bearer_jwt()`、`basic()`、`api_key_header(name)`、`api_key_query(name)`、`api_key_cookie(name)`；OAuth2 這類較複雜的 scheme，從 utoipa 的 `SecurityScheme` 轉換即可。
 

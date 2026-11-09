@@ -25,7 +25,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use bytes::Bytes;
 use hornero::{
-    App, BootError, ExceptionFilter, Guard, Hornero, Interceptor, Module, ProviderDef, ScopeReport,
+    App, BootError, ExceptionFilter, Extractor, Guard, Hornero, Interceptor, Module, ProviderDef,
     ShutdownError,
 };
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -73,7 +73,7 @@ impl TestApp {
     pub fn get<T: ?Sized + Send + Sync + 'static>(&self) -> Arc<T> {
         self.app.get::<T>().unwrap_or_else(|| {
             panic!(
-                "no singleton `{}` is visible from the root module (request-scoped and transient providers cannot be fetched)",
+                "no singleton `{}` is visible from the root module (transient providers cannot be fetched)",
                 std::any::type_name::<T>()
             )
         })
@@ -88,16 +88,11 @@ impl TestApp {
     pub fn get_qualified<T: ?Sized + Send + Sync + 'static, Q: 'static>(&self) -> Arc<T> {
         self.app.get_qualified::<T, Q>().unwrap_or_else(|| {
             panic!(
-                "no singleton `{}` qualified by `{}` is visible from the root module (request-scoped and transient providers cannot be fetched)",
+                "no singleton `{}` qualified by `{}` is visible from the root module (transient providers cannot be fetched)",
                 std::any::type_name::<T>(),
                 std::any::type_name::<Q>()
             )
         })
-    }
-
-    /// Every request-scoped component and why it is request-scoped.
-    pub fn scope_report(&self) -> &ScopeReport {
-        self.app.scope_report()
     }
 
     /// The underlying [`App`].
@@ -152,6 +147,15 @@ impl TestAppBuilder {
     /// Replaces every use of the exception filter `F` with `filter`.
     pub fn override_filter<F: 'static>(mut self, filter: impl ExceptionFilter) -> Self {
         self.hornero = self.hornero.override_filter::<F>(filter);
+        self
+    }
+
+    /// Replaces every use of the extractor `E` with `extractor`, which outputs the same type.
+    pub fn override_extractor<E: Extractor>(
+        mut self,
+        extractor: impl Extractor<Output = E::Output>,
+    ) -> Self {
+        self.hornero = self.hornero.override_extractor::<E>(extractor);
         self
     }
 

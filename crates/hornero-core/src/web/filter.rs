@@ -1,59 +1,62 @@
+use std::error::Error;
 use std::future::Future;
-
-use axum::response::Response;
 
 use super::route::RouteContext;
 use crate::error::HttpError;
 use crate::util::BoxFuture;
 
-/// Re-renders [`HttpError`] responses, Nest's exception filters.
+/// Turns one domain error type into an [`HttpError`], Nest's `@Catch(TodoError)`.
 ///
-/// Rust has no exceptions: handlers return `Result<_, HttpError>`, and filters see every
-/// response that carries an `HttpError` (from handlers, guards, or failed request-scoped
-/// construction). One filter handles each error: the most specific one that
-/// [`catches`](ExceptionFilter::catches) it, looking at handler, then controller, then global
-/// filters, each level in registration order. When none does, the error renders as is.
-///
-/// Domain errors raised with `?` arrive as 500s whose source is the original error, so a filter
-/// that catches them by type turns them into proper responses:
+/// A domain error enters the pipeline through `?` (or `HttpError::from`) in a guard, an
+/// interceptor, an extractor or the handler. The most specific filter for its type maps it:
+/// handler, then controller, then global filters, each level in registration order. When none
+/// does, it stays a 500 whose source is the original error. An `HttpError` built with a status
+/// (`HttpError::not_found`, say) is already an answer, and no filter sees it.
 ///
 /// ```ignore
 /// impl ExceptionFilter for TodoErrorFilter {
-///     fn catches(&self, err: &HttpError) -> bool {
-///         err.is::<TodoError>()
-///     }
+///     type Error = TodoError;
 ///
-///     async fn catch(&self, err: &HttpError, _: &RouteContext) -> Response {
-///         match err.downcast_ref::<TodoError>() {
-///             Some(TodoError::NotFound(id)) => HttpError::not_found(format!("todo {id} not found")).into_response(),
-///             _ => err.render(),
+///     async fn catch(&self, err: &TodoError, _: &RouteContext) -> HttpError {
+///         match err {
+///             TodoError::NotFound(id) => HttpError::not_found(format!("todo {id} not found")),
+///             TodoError::Storage(_) => HttpError::internal("internal server error"),
 ///         }
 ///     }
 /// }
 /// ```
 pub trait ExceptionFilter: Send + Sync + 'static {
-    /// Whether this filter handles `err`, Nest's `@Catch(Type)`. Every error by default; narrow it
-    /// with [`HttpError::is`] so other errors reach less specific filters.
-    fn catches(&self, _err: &HttpError) -> bool {
-        true
-    }
+    /// The error this filter handles.
+    type Error: Error + Send + Sync + 'static;
 
-    /// Renders the response for `err`. Start from [`HttpError::render`] to keep the defaults.
-    fn catch(&self, err: &HttpError, ctx: &RouteContext) -> impl Future<Output = Response> + Send;
+    /// The HTTP answer for `err`. The original error becomes its source, for the log and for
+    /// `is` / `downcast_ref` downstream, replacing any source the answer sets: a failure of the
+    /// filter's own (a lookup it needed, say) is for the filter to log. The answer is final, even
+    /// one built with `HttpError::from`: no filter maps it again. Headers added around `err` (a
+    /// `(headers, err)` tuple, say) stay on it.
+    fn catch(
+        &self,
+        err: &Self::Error,
+        ctx: &RouteContext,
+    ) -> impl Future<Output = HttpError> + Send;
 }
 
 #[doc(hidden)]
 pub trait ErasedFilter: Send + Sync {
-    fn catches(&self, err: &HttpError) -> bool;
-    fn catch<'a>(&'a self, err: &'a HttpError, ctx: &'a RouteContext) -> BoxFuture<'a, Response>;
+    fn try_catch<'a>(
+        &'a self,
+        err: &'a (dyn Error + Send + Sync + 'static),
+        ctx: &'a RouteContext,
+    ) -> Option<BoxFuture<'a, HttpError>>;
 }
 
 impl<F: ExceptionFilter> ErasedFilter for F {
-    fn catches(&self, err: &HttpError) -> bool {
-        ExceptionFilter::catches(self, err)
-    }
-
-    fn catch<'a>(&'a self, err: &'a HttpError, ctx: &'a RouteContext) -> BoxFuture<'a, Response> {
-        Box::pin(ExceptionFilter::catch(self, err, ctx))
+    fn try_catch<'a>(
+        &'a self,
+        err: &'a (dyn Error + Send + Sync + 'static),
+        ctx: &'a RouteContext,
+    ) -> Option<BoxFuture<'a, HttpError>> {
+        let err = err.downcast_ref::<F::Error>()?;
+        Some(Box::pin(ExceptionFilter::catch(self, err, ctx)))
     }
 }

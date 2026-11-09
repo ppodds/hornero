@@ -262,13 +262,13 @@ impl Builder {
         )
     }
 
-    /// The security requirement of every guard on `route` that describes a scheme and requires
-    /// it there: all of them must be met.
+    /// The security requirement of every guard and extractor on `route` that describes a scheme
+    /// and requires it there: all of them must be met, so enhancers sharing a scheme require the
+    /// scopes of each.
     fn security(&mut self, route: &RouteInfo) -> Option<Vec<SecurityRequirement>> {
-        let mut requirement: Option<SecurityRequirement> = None;
-        let mut names: Vec<&str> = Vec::new();
-        for guard in route.guards() {
-            let Some(security) = guard.meta::<SecurityDoc>() else {
+        let mut required: Vec<(&str, Vec<String>)> = Vec::new();
+        for enhancer in route.guards().iter().chain(route.extractors()) {
+            let Some(security) = enhancer.meta::<SecurityDoc>() else {
                 continue;
             };
             if !(security.required)(route) {
@@ -282,23 +282,34 @@ impl Builder {
                 Some(existing) if *existing == scheme => {}
                 Some(_) => {
                     let message = format!(
-                        "guard `{}` describes a security scheme named `{name}` that differs from the one already registered under that name; the first one is kept",
-                        guard.name()
+                        "`{}` describes a security scheme named `{name}` that differs from the one already registered under that name; the first one is kept",
+                        enhancer.name()
                     );
                     self.push_warning(message);
                 }
             }
-            if names.contains(&name) {
-                continue;
-            }
-            names.push(name);
             let scopes = (security.scopes)(route);
-            requirement = Some(match requirement {
-                None => SecurityRequirement::new(name, scopes),
-                Some(requirement) => requirement.add(name, scopes),
-            });
+            match required.iter_mut().find(|(existing, _)| *existing == name) {
+                Some((_, merged)) => {
+                    for scope in scopes {
+                        if !merged.contains(&scope) {
+                            merged.push(scope);
+                        }
+                    }
+                }
+                None => required.push((name, scopes)),
+            }
         }
-        requirement.map(|requirement| vec![requirement])
+        let requirement = required.into_iter().fold(
+            None,
+            |requirement: Option<SecurityRequirement>, (name, scopes)| {
+                Some(match requirement {
+                    None => SecurityRequirement::new(name, scopes),
+                    Some(requirement) => requirement.add(name, scopes),
+                })
+            },
+        )?;
+        Some(vec![requirement])
     }
 
     fn absorb(&mut self, label: &str, doc: SchemaDoc) -> RefOr<Schema> {
