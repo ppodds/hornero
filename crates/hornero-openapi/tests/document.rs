@@ -617,7 +617,7 @@ fn extractors_implementing_api_security_secure_the_routes_that_take_them() {
     assert!(warnings(&routes, &config()).is_empty());
 }
 
-/// Requires the `todos:read` scope of the bearer scheme.
+/// Requires the `profile` and `todos:read` scopes of the bearer scheme.
 #[derive(Injectable)]
 struct Reader;
 
@@ -633,7 +633,7 @@ impl ApiSecurity for Reader {
     }
 
     fn scopes(_: &RouteInfo) -> Vec<String> {
-        vec!["todos:read".to_owned()]
+        vec!["profile".to_owned(), "todos:read".to_owned()]
     }
 }
 
@@ -680,7 +680,7 @@ fn enhancers_sharing_a_scheme_require_the_scopes_of_each() {
     let doc = json_of(&document(&routes, &config()));
     assert_eq!(
         doc["paths"]["/scoped"]["post"]["security"],
-        json!([{ "bearer": ["todos:read", "todos:write"] }])
+        json!([{ "bearer": ["profile", "todos:read", "todos:write"] }])
     );
 }
 
