@@ -895,7 +895,7 @@ pub struct HttpError { /* ... */ }
 | `fn unprocessable(message) -> Self` | 422 |
 | `fn internal(message) -> Self` | 500 |
 | `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因。是回答：exception filter 看不到 |
-| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 自己的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等，以及組成它們的 `JsonSyntaxError`、`FailedToDeserializeQueryString` 等變體）保留原本的狀態碼與訊息，是回答，filter 看不到，與 handler 參數的 rejection 相同 |
+| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 預設 feature 裡的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等，以及組成它們的 `JsonSyntaxError`、`FailedToDeserializeQueryString` 等變體；`ws`、`multipart` 的型別不在內，需要 filter）保留原本的狀態碼與訊息，是回答，filter 看不到，與 handler 參數的 rejection 相同 |
 
 | Builder | 說明 |
 |---|---|

@@ -275,7 +275,9 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
 impl HttpError {
     /// axum's own rejections know their status: `Query::from_request_parts(..).await?` inside an
     /// `Extractor` answers 400, as the same extractor in a handler does. So does a rejection's
-    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say).
+    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say). Only the types of
+    /// axum's default features: those of `ws` or `multipart` are not visible here, and a filter
+    /// maps them.
     fn axum_rejection<E: 'static>(err: &E) -> Option<Self> {
         use axum::extract::rejection::*;
         macro_rules! known {
