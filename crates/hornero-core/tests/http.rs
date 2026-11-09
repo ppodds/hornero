@@ -775,6 +775,11 @@ async fn filters_catch_domain_errors_raised_with_the_question_mark() {
     let problem: serde_json::Value = serde_json::from_str(&res.body).unwrap();
     assert_eq!(problem["detail"], "todo 7 not found");
 
+    // The filter chooses the status; headers added around the raised error stay.
+    let res = get(&router, "/domain/signed-out-todo").await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert_eq!(res.headers["set-cookie"], "session=; Max-Age=0");
+
     // An `HttpError` with a status is already an answer: no filter sees it, even when its source
     // is a type a filter catches.
     let res = get(&router, "/domain/conflict").await;
@@ -1022,6 +1027,35 @@ impl Extractor for PageNumber {
     }
 }
 
+// Forwards the variant inside the rejection rather than the rejection.
+unit_injectable!(InnerPageNumber);
+
+impl Extractor for InnerPageNumber {
+    type Output = u32;
+
+    async fn extract(&self, parts: &mut Parts) -> Result<u32, HttpError> {
+        use axum::extract::rejection::QueryRejection;
+        match Query::<PageQuery>::from_request_parts(parts, &()).await {
+            Ok(Query(page)) => Ok(page.n),
+            Err(QueryRejection::FailedToDeserializeQueryString(inner)) => Err(inner.into()),
+            Err(other) => Err(other.into()),
+        }
+    }
+}
+
+/// Rejects with a gzip body.
+struct Gzipped;
+
+impl<S: Send + Sync> FromRequestParts<S> for Gzipped {
+    type Rejection = Response;
+
+    async fn from_request_parts(_: &mut Parts, _: &S) -> Result<Self, Response> {
+        let gzip_magic = vec![0x1f_u8, 0x8b, 0x08, 0x00];
+        let encoding = [(axum::http::header::CONTENT_ENCODING, "gzip")];
+        Err((StatusCode::BAD_REQUEST, encoding, gzip_magic).into_response())
+    }
+}
+
 /// A third-party extractor whose rejection carries a header.
 struct Bearer;
 
@@ -1089,6 +1123,14 @@ impl Controller for RejectingController {
             "page",
             |_: Arc<Self>, Extracted(n): Extracted<PageNumber>| async move { n.to_string() },
         );
+        c.get(
+            "/inner-page",
+            "inner_page",
+            |_: Arc<Self>, Extracted(n): Extracted<InnerPageNumber>| async move { n.to_string() },
+        );
+        c.get("/gzipped", "gzipped", |_: Arc<Self>, _: Gzipped| async {
+            "in"
+        });
         c.get("/bearer", "bearer", |_: Arc<Self>, _: Bearer| async {
             "in"
         });
@@ -1144,6 +1186,10 @@ async fn axum_rejections_are_errors_the_renderer_formats() {
     let res = get(&router, "/page?n=x").await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
     assert!(res.body.starts_with("Failed to deserialize query string"));
+    // So is a variant of the rejection, forwarded on its own.
+    let res = get(&router, "/inner-page?n=x").await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(res.body.starts_with("Failed to deserialize query string"));
 
     // Any other rejection: its status, text and headers.
     let res = get(&router, "/bearer").await;
@@ -1157,6 +1203,14 @@ async fn axum_rejections_are_errors_the_renderer_formats() {
     let res = get(&router, "/challenged").await;
     let challenges: Vec<_> = res.headers.get_all("www-authenticate").iter().collect();
     assert_eq!(challenges, ["Bearer", "Basic realm=\"hornero\""]);
+
+    // An encoded body is neither the message nor how the renderer's body is encoded.
+    let res = get(&router, "/gzipped").await;
+    assert_eq!(
+        (res.status, res.body.as_str()),
+        (StatusCode::BAD_REQUEST, "Bad Request")
+    );
+    assert!(res.headers.get("content-encoding").is_none());
 
     // Not an error status: sent as is.
     let res = get(&router, "/redirect").await;

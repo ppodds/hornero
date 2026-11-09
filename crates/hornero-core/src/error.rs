@@ -184,10 +184,15 @@ impl HttpError {
     /// A filter's answer for `origin`. The original error becomes its source, replacing any the
     /// answer set, so `is` and `downcast_ref` find it whatever the filter returned; and the answer
     /// is never mapped again, even when the filter built it with `HttpError::from`.
+    ///
+    /// The headers added around `origin` (by a tuple, or `with_header`) stay, winning over the
+    /// answer's as a tuple around it would: the filter only sees the domain error, so it could not
+    /// keep them itself. The status is the filter's.
     pub(crate) fn caused_by(mut self, mut origin: HttpError) -> Self {
         if let Some(source) = origin.source.take() {
             self.source = Some(source);
         }
+        self.headers.extend(*origin.headers);
         self.raised = None;
         self
     }
@@ -209,11 +214,13 @@ impl HttpError {
         }
     }
 
-    /// Adds the headers of a response the error is taken from, repeated values included. The
-    /// body's own `Content-Type` and `Content-Length` stay behind: the renderer sets its own.
+    /// Adds the headers of a response the error is taken from, repeated values included. What
+    /// describes the old body (`Content-Type`, `Content-Length`, `Content-Encoding`) stays behind:
+    /// the renderer writes a new one.
     pub(crate) fn with_response_headers(mut self, mut headers: HeaderMap) -> Self {
         headers.remove(header::CONTENT_TYPE);
         headers.remove(header::CONTENT_LENGTH);
+        headers.remove(header::CONTENT_ENCODING);
         self.headers.extend(headers);
         self
     }
@@ -267,7 +274,8 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
 
 impl HttpError {
     /// axum's own rejections know their status: `Query::from_request_parts(..).await?` inside an
-    /// `Extractor` answers 400, as the same extractor in a handler does.
+    /// `Extractor` answers 400, as the same extractor in a handler does. So does a rejection's
+    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say).
     fn axum_rejection<E: 'static>(err: &E) -> Option<Self> {
         use axum::extract::rejection::*;
         macro_rules! known {
@@ -278,6 +286,7 @@ impl HttpError {
                 })*
             };
         }
+        // What extractors reject with.
         known!(
             JsonRejection,
             QueryRejection,
@@ -291,6 +300,24 @@ impl HttpError {
             BytesRejection,
             StringRejection,
             FailedToBufferBody,
+        );
+        // Their variants.
+        known!(
+            JsonDataError,
+            JsonSyntaxError,
+            MissingJsonContentType,
+            FailedToDeserializeQueryString,
+            InvalidFormContentType,
+            FailedToDeserializeForm,
+            FailedToDeserializeFormBody,
+            FailedToDeserializePathParams,
+            InvalidUtf8InPathParam,
+            MissingPathParams,
+            MissingExtension,
+            MatchedPathMissing,
+            LengthLimitError,
+            UnknownBodyError,
+            InvalidUtf8,
         );
         None
     }

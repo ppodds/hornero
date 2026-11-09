@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::http::header;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 
@@ -57,8 +58,14 @@ impl Rejection {
             return Self::Answer(response);
         }
         let (parts, body) = response.into_parts();
-        let message = match axum::body::to_bytes(body, 64 * 1024).await {
-            Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+        // An encoded body (gzip, say) is not text.
+        let text = if parts.headers.contains_key(header::CONTENT_ENCODING) {
+            None
+        } else {
+            axum::body::to_bytes(body, 64 * 1024).await.ok()
+        };
+        let message = match text {
+            Some(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
             _ => status
                 .canonical_reason()
                 .unwrap_or("invalid request")

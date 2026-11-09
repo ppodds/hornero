@@ -612,7 +612,7 @@ pub trait ExceptionFilter: Send + Sync + 'static {
 | 項目 | 說明 |
 |---|---|
 | `type Error` | 這個 filter 處理的錯誤型別。hornero 以 `downcast_ref` 比對 `?` 轉換的那個錯誤本身，不往 source chain 裡找 |
-| `catch` | 回傳 HTTP 錯誤：狀態碼、訊息、細節與 header。原始錯誤成為它的 source（取代回傳值自己設的 source），所以之後 `err.is::<Self::Error>()` 一定成立、5xx 的 log 寫出原因；filter 自己的失敗（例如查詢失敗）請在 filter 裡記錄。回傳值就是最終的回答，即使用 `HttpError::from` 建構，也不會再交給其他 filter。格式交給 renderer |
+| `catch` | 回傳 HTTP 錯誤：狀態碼、訊息、細節與 header。原始錯誤成為它的 source（取代回傳值自己設的 source），所以之後 `err.is::<Self::Error>()` 一定成立、5xx 的 log 寫出原因；filter 自己的失敗（例如查詢失敗）請在 filter 裡記錄。回傳值就是最終的回答，即使用 `HttpError::from` 建構，也不會再交給其他 filter。拋出的錯誤外面加的 header（tuple 或 `with_header`）保留到回傳值上，同名時以外面的為準。格式交給 renderer |
 
 **選擇規則**：錯誤離開 handler、extractor 或 interceptor 時（guard 的錯誤在渲染前），依序查看 handler、controller、全域的 filter（先 `Hornero::filter`，再模組宣告的 `AppFilter`），同一層依註冊順序，第一個 `Error` 型別相符的 filter 處理錯誤，其他 filter 不會執行。每個錯誤最多轉換一次。沒有任何 filter 相符時，錯誤是不透露細節的 500，log 寫出它的型別與 `add an ExceptionFilter for it to choose the status`。
 
@@ -895,7 +895,7 @@ pub struct HttpError { /* ... */ }
 | `fn unprocessable(message) -> Self` | 422 |
 | `fn internal(message) -> Self` | 500 |
 | `fn from_boxed(source: BoxError) -> Self` | 500 `internal server error`，`source` 成為內部原因。是回答：exception filter 看不到 |
-| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 自己的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等）保留原本的狀態碼與訊息，是回答，filter 看不到，與 handler 參數的 rejection 相同 |
+| `impl<E: std::error::Error + Send + Sync + 'static> From<E>` | `?` 做的轉換：拋出 `err`，交給 `Error = E` 的 exception filter；沒有 filter 時是 500 `internal server error`，log 寫出 `E` 的型別。axum 自己的 rejection（`JsonRejection`、`QueryRejection`、`PathRejection` 等，以及組成它們的 `JsonSyntaxError`、`FailedToDeserializeQueryString` 等變體）保留原本的狀態碼與訊息，是回答，filter 看不到，與 handler 參數的 rejection 相同 |
 
 | Builder | 說明 |
 |---|---|

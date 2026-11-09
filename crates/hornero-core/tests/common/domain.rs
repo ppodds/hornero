@@ -112,6 +112,17 @@ impl Controller for DomainController {
             charge().await?;
             Ok::<_, HttpError>("charged")
         });
+        // A raised error with a header around it, which the filter's answer keeps.
+        c.get(
+            "/signed-out-todo",
+            "signed_out_todo",
+            |_: Arc<Self>| async {
+                (
+                    [(axum::http::header::SET_COOKIE, "session=; Max-Age=0")],
+                    HttpError::from(TodoError::NotFound(3)),
+                )
+            },
+        );
         c.get("/conflict", "conflict", |_: Arc<Self>| async {
             HttpError::conflict("already exists")
         });
