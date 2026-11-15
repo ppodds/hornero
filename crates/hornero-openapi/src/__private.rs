@@ -102,6 +102,17 @@ impl SchemaDoc {
         })
     }
 
+    /// A `multipart/form-data` body read through axum's `Multipart`, whose signature does not say
+    /// which fields it reads: an object, with a warning.
+    pub fn multipart() -> Self {
+        let mut doc = Self::inline(ObjectBuilder::new().schema_type(Type::Object).into());
+        doc.warnings.push(
+            "`Multipart` does not say which fields it reads, so they are not documented; describe them with `#[api_body(T, content_type = \"multipart/form-data\")]`"
+                .to_owned(),
+        );
+        doc
+    }
+
     fn wrap(mut self, f: impl FnOnce(RefOr<Schema>) -> RefOr<Schema>) -> Self {
         self.schema = f(self.schema);
         self

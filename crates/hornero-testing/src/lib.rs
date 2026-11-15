@@ -272,6 +272,17 @@ impl TestRequest {
         self
     }
 
+    /// A `multipart/form-data` body, with its `content-type` and boundary.
+    pub fn multipart(mut self, form: MultipartForm) -> Self {
+        let (boundary, bytes) = form.encode();
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        self.request
+            .headers_mut()
+            .insert(CONTENT_TYPE, header_value(&content_type));
+        *self.request.body_mut() = Body::from(bytes);
+        self
+    }
+
     /// Any body. Does not set `content-type`.
     pub fn body(mut self, body: impl Into<Body>) -> Self {
         *self.request.body_mut() = body.into();
@@ -363,6 +374,106 @@ impl TestResponse {
         );
         self
     }
+}
+
+/// A `multipart/form-data` body for [`TestRequest::multipart`]: text fields and files, sent in the
+/// order they are added.
+///
+/// ```ignore
+/// let form = MultipartForm::new()
+///     .text("title", "report")
+///     .file("file", "report.pdf", "application/pdf", pdf_bytes);
+/// app.client().post("/files").multipart(form).await;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct MultipartForm {
+    parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone)]
+struct Part {
+    name: String,
+    /// The file name and content type, for a file.
+    file: Option<(String, HeaderValue)>,
+    data: Bytes,
+}
+
+impl MultipartForm {
+    /// An empty form.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A text field. Panics when `name` contains `"`, CR or LF.
+    pub fn text(mut self, name: &str, value: &str) -> Self {
+        self.parts.push(Part {
+            name: disposition_param("field name", name),
+            file: None,
+            data: Bytes::copy_from_slice(value.as_bytes()),
+        });
+        self
+    }
+
+    /// A file: its field name, file name, content type and contents. Panics when a name contains
+    /// `"`, CR or LF, or when `content_type` is not a valid header value.
+    pub fn file(
+        mut self,
+        name: &str,
+        file_name: &str,
+        content_type: &str,
+        data: impl Into<Bytes>,
+    ) -> Self {
+        self.parts.push(Part {
+            name: disposition_param("field name", name),
+            file: Some((
+                disposition_param("file name", file_name),
+                header_value(content_type),
+            )),
+            data: data.into(),
+        });
+        self
+    }
+
+    /// The boundary, which occurs in no part, and the encoded body.
+    fn encode(&self) -> (String, Vec<u8>) {
+        let occurs = |boundary: &str| {
+            self.parts.iter().any(|part| {
+                part.data
+                    .windows(boundary.len())
+                    .any(|window| window == boundary.as_bytes())
+            })
+        };
+        let boundary = (0..)
+            .map(|attempt| format!("hornero-test-boundary-{attempt}"))
+            .find(|boundary| !occurs(boundary))
+            .expect("some boundary occurs in no part");
+
+        let mut body = Vec::new();
+        for part in &self.parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{}\"", part.name).as_bytes(),
+            );
+            if let Some((file_name, content_type)) = &part.file {
+                body.extend_from_slice(format!("; filename=\"{file_name}\"\r\n").as_bytes());
+                body.extend_from_slice(b"Content-Type: ");
+                body.extend_from_slice(content_type.as_bytes());
+            }
+            body.extend_from_slice(b"\r\n\r\n");
+            body.extend_from_slice(&part.data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        (boundary, body)
+    }
+}
+
+/// A quoted `Content-Disposition` parameter, which cannot hold `"` or a line break.
+fn disposition_param(what: &str, value: &str) -> String {
+    if value.contains(['"', '\r', '\n']) {
+        panic!("invalid multipart {what} `{value}`: it contains `\"`, CR or LF");
+    }
+    value.to_owned()
 }
 
 fn header_name(name: &str) -> HeaderName {

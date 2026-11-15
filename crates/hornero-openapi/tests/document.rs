@@ -1,6 +1,7 @@
 //! The document `hornero-openapi` infers from the route table, handler signatures, attributes and
 //! guards.
 
+use hornero::axum::extract::Multipart;
 use hornero::axum::http::request::Parts;
 use hornero::openapi::{
     ApiSecurity, IntoParams, OpenApiConfig, SecurityScheme, ToSchema, document, warnings,
@@ -409,6 +410,67 @@ fn api_body_and_api_response_bodies_override_the_signature() {
     assert_eq!(
         upload["responses"]["413"]["description"],
         "Payload Too Large"
+    );
+}
+
+#[controller("/uploads")]
+struct UploadController;
+
+#[routes]
+impl UploadController {
+    #[post("/raw")]
+    async fn raw(&self, _form: Multipart) -> &'static str {
+        ""
+    }
+
+    #[post("/optional")]
+    async fn optional(&self, _form: Option<Multipart>) -> &'static str {
+        ""
+    }
+
+    #[post("/described")]
+    #[api_body(Upload, content_type = "multipart/form-data")]
+    async fn described(&self, _form: Multipart) -> &'static str {
+        ""
+    }
+}
+
+#[module(controllers = [UploadController])]
+struct UploadModule;
+
+#[test]
+fn multipart_bodies_are_objects_whose_fields_api_body_describes() {
+    let routes = Hornero::new(UploadModule).routes().unwrap();
+    let doc = json_of(&document(&routes, &config()));
+    let raw = &doc["paths"]["/uploads/raw"]["post"];
+    assert_eq!(
+        raw["requestBody"],
+        json!({
+            "content": { "multipart/form-data": { "schema": { "type": "object" } } },
+            "required": true,
+        })
+    );
+    // No 400 or 413 of its own, as with `Json`.
+    let statuses: Vec<_> = raw["responses"].as_object().unwrap().keys().collect();
+    assert_eq!(statuses, ["200"]);
+    assert_eq!(
+        doc["paths"]["/uploads/optional"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        doc["paths"]["/uploads/described"]["post"]["requestBody"]["content"]["multipart/form-data"]
+            ["schema"],
+        json!({ "$ref": "#/components/schemas/Upload" })
+    );
+
+    // `#[api_body]` replaces the inferred body, and its warning with it.
+    let hint = "`Multipart` does not say which fields it reads, so they are not documented; describe them with `#[api_body(T, content_type = \"multipart/form-data\")]`";
+    assert_eq!(
+        warnings(&routes, &config()),
+        [
+            format!("POST /uploads/raw (UploadController::raw): {hint}"),
+            format!("POST /uploads/optional (UploadController::optional): {hint}"),
+        ]
     );
 }
 

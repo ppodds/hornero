@@ -369,6 +369,7 @@ async fn requires_a_bearer_token() {
 |---|---|
 | `header(name, value)` / `bearer(token)` | 這個 request 的 header |
 | `json(&body)` | JSON body，並設定 `content-type` |
+| `multipart(form)` | `multipart/form-data` body，以 `MultipartForm::new().text(..).file(..)` 建構 |
 | `body(bytes)` | 原始 body |
 | `.await` 或 `send().await` | 送出，取得 `TestResponse` |
 

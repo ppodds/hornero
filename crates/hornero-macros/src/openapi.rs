@@ -393,6 +393,10 @@ fn describe_argument(ty: &Type, required: bool, out: &mut Vec<TokenStream>) {
                 out.push(quote!(__doc.body(#content_type, #schema, #required);));
             }
         }
+        "Multipart" => {
+            let schema = quote!(#private::SchemaDoc::multipart());
+            out.push(quote!(__doc.body("multipart/form-data", #schema, #required);));
+        }
         "Query" => {
             if let Some(inner) = args.first() {
                 let params = params(inner, quote!(#private::ParameterIn::Query));

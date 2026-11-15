@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use hornero::prelude::*;
-use hornero_testing::TestApp;
+use hornero_testing::{MultipartForm, TestApp};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -196,4 +196,62 @@ async fn requests_carry_a_loopback_peer_address_that_can_be_changed() {
         client.get("/peer").peer_addr(peer).await.text(),
         "10.1.2.3:5555"
     );
+}
+
+#[controller("/files")]
+struct FileController;
+
+#[routes]
+impl FileController {
+    /// Each part on a line: name, file name, content type and contents.
+    #[post("/")]
+    async fn upload(&self, mut form: axum::extract::Multipart) -> Result<String, HttpError> {
+        let mut parts = Vec::new();
+        while let Some(field) = form.next_field().await? {
+            let name = field.name().unwrap_or_default().to_owned();
+            let file = field.file_name().map(str::to_owned);
+            let content_type = field.content_type().map(str::to_owned);
+            let text = field.text().await?;
+            parts.push(format!("{name}|{file:?}|{content_type:?}|{text}"));
+        }
+        Ok(parts.join("\n"))
+    }
+}
+
+#[module(controllers = [FileController])]
+struct FileModule;
+
+#[tokio::test]
+async fn multipart_forms_reach_the_handler_part_by_part() {
+    let app = TestApp::new(FileModule).build().await.unwrap();
+    let form = MultipartForm::new().text("title", "report").file(
+        "file",
+        "notes.txt",
+        "text/plain",
+        "line one\r\nline two",
+    );
+    let body = app
+        .client()
+        .post("/files")
+        .multipart(form)
+        .await
+        .assert_status(StatusCode::OK)
+        .text();
+    assert_eq!(
+        body,
+        "title|None|None|report\n\
+         file|Some(\"notes.txt\")|Some(\"text/plain\")|line one\r\nline two"
+    );
+
+    // Contents that hold the first boundary tried get another one.
+    let tricky = "\r\n--hornero-test-boundary-0--\r\n";
+    let form = MultipartForm::new().text("note", tricky);
+    let body = app.client().post("/files").multipart(form).await.text();
+    assert_eq!(body, format!("note|None|None|{tricky}"));
+}
+
+#[test]
+#[should_panic(expected = "invalid multipart field name")]
+fn multipart_field_names_cannot_hold_quotes() {
+    let _ = MultipartForm::new().text("a\"b", "x");
 }

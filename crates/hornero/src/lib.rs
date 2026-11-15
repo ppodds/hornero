@@ -49,6 +49,9 @@
 //! * `openapi` – OpenAPI documents inferred from the route table and handler signatures, as
 //!   [`openapi`] (the `hornero-openapi` crate).
 //! * `swagger-ui` – `openapi` plus Swagger UI served next to the document.
+//! * `multipart` – file uploads through axum's `Multipart` extractor
+//!   (`hornero::axum::extract::Multipart`), whose errors keep axum's status (400, 413) when
+//!   forwarded with `?`.
 //!
 //! ## Documentation
 //!

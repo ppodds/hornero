@@ -38,6 +38,7 @@ hornero 保留了 Nest 的架構（模組、provider、controller、enhancer、s
 | `@Query()` | `Query(q): Query<ListQuery>` | |
 | `@Body()` | `Json(body): Json<CreateTodo>` | |
 | `@Headers()`、`@Req()` | `HeaderMap`、任何 axum extractor | |
+| `FileInterceptor` + `@UploadedFile()` | `mut form: Multipart`，逐欄位讀取 | 需要 `multipart` feature；multer 的 `limits` 對應 `DefaultBodyLimit` 或讀取時自己計算大小，見 [檔案上傳](14-recipes.md#檔案上傳) |
 | `createParamDecorator` | 自訂 extractor；需要依賴時用 `Extractor` 與 `Extracted<E>` | |
 | `@HttpCode(201)` | 回傳 `(StatusCode::CREATED, Json(..))` | |
 | `ParseIntPipe` 等 pipe | extractor 的型別（`Path<u64>`） | 解析失敗就拒絕 |

@@ -285,6 +285,7 @@ handler 參數就是 axum extractor，axum 生態系裡的 extractor 都能直�
 | `HeaderMap`、`Method`、`Uri` | request head |
 | `Extension<T>` | middleware 或 guard 放進 extensions 的資料 |
 | `String`、`Bytes` | 原始 body |
+| `Multipart` | `multipart/form-data` body，需要 `multipart` feature，見 [檔案上傳](14-recipes.md#檔案上傳) |
 | `Valid<Json<T>>` 等 | 驗證過的資料，見 [驗證](11-validation.md) |
 | 自訂型別 | 實作 `FromRequestParts` 或 `FromRequest` |
 

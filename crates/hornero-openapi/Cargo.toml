@@ -22,7 +22,7 @@ utoipa-swagger-ui = { workspace = true, optional = true, features = ["vendored"]
 [dev-dependencies]
 garde.workspace = true
 insta = { workspace = true, features = ["json"] }
-hornero = { workspace = true, features = ["swagger-ui"] }
+hornero = { workspace = true, features = ["swagger-ui", "multipart"] }
 hornero-testing.workspace = true
 hornero-validation.workspace = true
 serde.workspace = true
