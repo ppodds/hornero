@@ -14,7 +14,7 @@ test = true
 # Everything below is only used by the guide's code blocks (doctests), examples and tests.
 [dev-dependencies]
 garde.workspace = true
-hornero = { workspace = true, features = ["swagger-ui"] }
+hornero = { workspace = true, features = ["swagger-ui", "multipart"] }
 hornero-config.workspace = true
 hornero-sea-orm = { workspace = true, features = ["sqlite"] }
 hornero-testing.workspace = true

@@ -164,7 +164,7 @@ routing 以外的部分是 tower layer 與 `axum::middleware::from_fn`。路由�
 
 - guard、interceptor、extractor 與 handler 回傳 `Result<_, HttpError>`。`HttpError` 分兩種：用狀態碼建構的是**回答**，原樣渲染；任何 `std::error::Error` 透過 `?`（`From<E>`）轉成的是**拋出**的 domain error，記下型別、原始錯誤保留為 source，**不會**送給 client。
 - 拋出的錯誤交給 exception filter：filter 以 `type Error` 宣告型別（Nest 的 `@Catch(Type)`），hornero 用 `downcast_ref` 在 handler > controller > global 中找第一個相符的，`catch` 回傳 `HttpError`，原始錯誤仍是 source。錯誤離開 handler、extractor、interceptor 時就轉換，所以外層 interceptor 看到的是 client 會收到的狀態碼。
-- 沒有 filter 的拋出錯誤是框架內建的 catch-all：500，log 寫出型別與「add an ExceptionFilter for it to choose the status」。不在啟動時檢查每條路由是否有 filter。axum 自己的 rejection 型別（`JsonRejection` 等 12 種）經 `?` 轉換時保留原本的狀態碼。
+- 沒有 filter 的拋出錯誤是框架內建的 catch-all：500，log 寫出型別與「add an ExceptionFilter for it to choose the status」（只開了 axum 的 `multipart` 時，改為提示開啟 hornero 的 `multipart` feature）。不在啟動時檢查每條路由是否有 filter。axum 預設 feature 的 rejection 型別（`JsonRejection` 等，以及組成它們的變體）與 `multipart` feature 下讀取 `Multipart` 的錯誤，經 `?` 轉換時保留原本的狀態碼。
 - 保留 `impl<E: Error> From<E> for HttpError`：它讓 `?` 能用在任何錯誤上，代價是使用者無法替自己的錯誤型別寫 `From<E> for HttpError`（E0119）；有了依型別選擇的 filter，就不需要那個 `From`。
 - 錯誤只渲染一次：`Hornero::error_renderer` 設定的 renderer，預設 RFC 9457 `application/problem+json`。hornero 接著加上錯誤攜帶的 header（`with_header` / `headers()`，`unauthorized()` 預設帶 `WWW-Authenticate: Bearer`），並把錯誤放進 response extensions，供 middleware（`HttpError::in_response`）與 5xx log 讀取。`with_details` 序列化失敗時 `details` 維持空，並以 `tracing::warn!` 記錄。
 - axum extractor 的 rejection 在 handler 參數處轉成 `HttpError`：帶有 `HttpError` 的回應（`Rejection = HttpError`、`hornero-validation` 的 `Valid`）取回原值；其他 4xx / 5xx 取狀態碼、body 文字與 header；非錯誤狀態（例如 `Redirect`）原樣送出。
@@ -251,4 +251,5 @@ let todo: Todo = app.client().with_bearer("t").post("/todos").json(&body).await
 - **dyn async trait**：Rust 尚不支援 `async fn` 的 dyn dispatch，以 `BoxFuture` 回傳（見 `examples/todo/src/todo/repo.rs`）。
 - **型別名稱**：診斷訊息使用 `std::any::type_name`，其格式不保證穩定（例如目前會省略預設泛型參數，`Db<Primary>` 顯示為 `Db`）。
 - **sea-orm 驅動**：`sqlx-postgres` / `sqlx-mysql` 0.9 目前依賴尚未正式發布的 `hmac` / `sha1` 版本，因此 `hornero-sea-orm` 只提供 `sqlite` feature；其他驅動由應用程式自己的 `sea-orm` 依賴啟用。
-- **後續**：`hornero-openapi`（utoipa）、排程、typed events、每個 request 一個交易的 interceptor、無相依 singleton 平行建構。
+- **檔案上傳**：`multipart` feature 只提供 axum 的 `Multipart`。typed multipart（以 derive 讀成 struct）、路由級的 body 上限與 `ws` feature 的 rejection 都尚未支援；body 上限以 `Hornero::layer` 或模組的 `m.layer(DefaultBodyLimit::max(..))` 設定。
+- **後續**：排程、typed events、每個 request 一個交易的 interceptor、無相依 singleton 平行建構。

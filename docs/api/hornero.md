@@ -43,8 +43,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 |---|---|
 | `openapi` | `hornero::openapi`（[`hornero-openapi`](hornero-openapi.md)）。`#[routes]` 從每個 handler 的簽名與 doc comment 推導 OpenAPI 文件，`#[derive(Injectable)]` 與 `#[injectable]` 記錄實作 `ApiSecurity` 的 guard 的 security scheme |
 | `swagger-ui` | `openapi`，加上 Swagger UI |
+| `multipart` | 檔案上傳：開啟 axum 的 `Multipart` extractor（`hornero::axum::extract::Multipart`），它的錯誤經 `?` 轉換時保留 axum 的狀態碼（400、413），見 [檔案上傳](../guide/14-recipes.md#檔案上傳) |
 
-兩者預設都關閉。沒有開啟時，`#[api_response]` 等 attribute 仍然可以寫，只是不產生任何程式碼，所以同一份程式碼在兩種設定下都能編譯。
+全部預設關閉。沒有開啟 `openapi` 時，`#[api_response]` 等 attribute 仍然可以寫，只是不產生任何程式碼，所以同一份程式碼在兩種設定下都能編譯。
 
 ---
 

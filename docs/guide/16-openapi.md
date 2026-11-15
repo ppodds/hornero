@@ -100,6 +100,7 @@ assert_eq!(app.client().get("/docs/").await.status(), StatusCode::OK);
 | `Query(q): Query<Filter>` | query 參數，同上；`Option` 欄位不是必填 |
 | `Json(body): Json<T>` | `application/json` 的 request body |
 | `Form(body): Form<T>` | `application/x-www-form-urlencoded` 的 request body |
+| `form: Multipart`（`multipart` feature） | `multipart/form-data` 的 request body。簽名說不出欄位，所以 schema 只是 `object`，並產生 warning；用 `#[api_body]` 描述欄位（見下一節的範例） |
 | `Valid(..): Valid<E>` | `E` 的推導結果，加上 422 回應 |
 | 回傳 `Json<T>` | 200，`application/json` |
 | 回傳 `(StatusCode, Json<T>)`、`(StatusCode, HeaderMap, Json<T>)` | tuple 最後一個元素決定 body；狀態碼要用 `#[api_response]` 說明 |
@@ -129,7 +130,7 @@ body 與參數的型別這樣對應到 schema：
 
 推導只看語法，所以有兩個限制：
 
-- **型別別名與自訂 extractor 認不出來**。`type Body = Json<Todo>` 或自製的 `Multipart` extractor，用 `#[api_body]` 說明。
+- **型別別名與自訂 extractor 認不出來**。`type Body = Json<Todo>` 或自製的 body extractor，用 `#[api_body]` 說明。反過來，名稱是 `Multipart` 的型別都會當成 axum 的 `Multipart`。
 - **garde 的規則不會變成 schema 的限制**。`#[garde(length(min = 1))]` 不會出現在文件裡；需要的話，用 utoipa 的 `#[schema(min_length = 1)]` 再寫一次。
 
 ## 補充推導不出來的部分
@@ -151,13 +152,18 @@ body 與參數的型別這樣對應到 schema：
 寫在 `#[controller]` 下方的 `#[api_response]` 套用到每一條路由，handler 自己寫了同一個狀態碼時以 handler 為準。
 
 ```rust
+use hornero::axum::extract::Multipart;
 use hornero::openapi::ToSchema;
 use hornero::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Deserialize, ToSchema)]
+/// `Multipart` 讀取的欄位，只用來寫文件。
+#[derive(ToSchema)]
 struct Upload {
     name: String,
+    /// 檔案內容：二進位，不是數字陣列。
+    #[schema(value_type = String, content_media_type = "application/octet-stream")]
+    file: Vec<u8>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -177,7 +183,7 @@ impl FileController {
     #[api_body(Upload, content_type = "multipart/form-data")]
     #[api_response(200, body = Stored, description = "已儲存的檔名")]
     #[api_response(413)]
-    async fn upload(&self) -> Response {
+    async fn upload(&self, _form: Multipart) -> Response {
         StatusCode::OK.into_response()
     }
 
@@ -196,7 +202,18 @@ let doc = hornero::openapi::document(&routes, &hornero::openapi::OpenApiConfig::
 let doc = serde_json::to_value(&doc).unwrap();
 let upload = &doc["paths"]["/files"]["post"];
 assert_eq!(upload["tags"], serde_json::json!(["Files"]));
-assert!(upload["requestBody"]["content"]["multipart/form-data"].is_object());
+assert_eq!(
+    upload["requestBody"]["content"]["multipart/form-data"]["schema"],
+    serde_json::json!({ "$ref": "#/components/schemas/Upload" })
+);
+assert_eq!(
+    doc["components"]["schemas"]["Upload"]["properties"]["file"],
+    serde_json::json!({
+        "type": "string",
+        "contentMediaType": "application/octet-stream",
+        "description": "檔案內容：二進位，不是數字陣列。",
+    })
+);
 assert_eq!(upload["responses"]["401"]["description"], "需要登入");
 assert_eq!(upload["responses"]["413"]["description"], "Payload Too Large");
 assert!(doc["paths"]["/files/debug"].is_null());

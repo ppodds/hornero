@@ -265,6 +265,144 @@ impl Module for WebModule {
 }
 ```
 
+## 檔案上傳
+
+開啟 `multipart` feature，就能用 axum 的 `Multipart` 讀取 `multipart/form-data`：
+
+```toml
+[dependencies]
+hornero = { path = "../hornero/crates/hornero", features = ["multipart"] }
+```
+
+`Multipart` 會讀取 body，所以必須是 handler 的最後一個參數。逐欄位讀取，錯誤用 `?` 交給 hornero：
+
+```rust
+use hornero::axum::extract::Multipart;
+use hornero::prelude::*;
+
+#[controller("/files")]
+struct FileController;
+
+#[routes]
+impl FileController {
+    /// 回傳每個檔案的檔名與大小。
+    #[post("/")]
+    async fn upload(&self, mut form: Multipart) -> Result<String, HttpError> {
+        let mut stored = Vec::new();
+        while let Some(field) = form.next_field().await? {
+            let Some(file_name) = field.file_name().map(str::to_owned) else {
+                continue; // 不是檔案的欄位
+            };
+            let bytes = field.bytes().await?;
+            stored.push(format!("{file_name}: {} bytes", bytes.len()));
+        }
+        Ok(stored.join("\n"))
+    }
+}
+
+#[module(controllers = [FileController])]
+struct AppModule;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+use hornero_testing::{MultipartForm, TestApp};
+
+let app = TestApp::new(AppModule).build().await.unwrap();
+let form = MultipartForm::new()
+    .text("title", "季報")
+    .file("file", "report.pdf", "application/pdf", vec![0u8; 1024]);
+let res = app.client().post("/files").multipart(form).await;
+assert_eq!(res.text(), "report.pdf: 1024 bytes");
+# }
+```
+
+讀取時的錯誤和 axum 的 rejection 一樣是回答：保留 axum 的狀態碼，由 [renderer](08-errors.md#統一錯誤格式) 渲染，exception filter 看不到。renderer 或 interceptor 可以用 `err.is::<MultipartError>()`（`hornero::axum::extract::multipart::MultipartError`）認出它們。
+
+| 情況 | 狀態碼 |
+|---|---|
+| 不是 `multipart/form-data`，或沒有 boundary | 400 |
+| body 格式錯誤 | 400 |
+| 超過 body 上限 | 413 |
+| 其他讀取錯誤（例如連線中斷） | 500 |
+
+handler 要回傳 `HttpError` 並用 `?`。直接回傳 `Result<_, MultipartError>` 時，hornero 拿不到錯誤，client 收到的是 axum 的純文字，不經過 renderer。只開 axum 的 `multipart` feature、沒開 hornero 的時，這些錯誤經 `?` 會變成 500，log 會提示開啟 hornero 的 feature。
+
+### 大小上限
+
+整個 body 的上限是 axum 的 `DefaultBodyLimit`，預設 2 MiB，所有讀取 body 的 extractor 共用。超過時，讀取的那一刻才回 413，所以沒讀到上限的 handler 不受影響。
+
+- 整個應用：`Hornero::new(AppModule).layer(DefaultBodyLimit::max(20 * 1024 * 1024))`。
+- 只有上傳的路由：把它們放進自己的模組，在手寫的 `define` 裡用 `m.layer(..)`（`#[module]` 沒有設定 layer 的選項）。
+- 單一檔案的上限：用 `field.chunk()` 邊讀邊算。
+
+```rust
+use hornero::axum::extract::{DefaultBodyLimit, Multipart};
+use hornero::prelude::*;
+
+const MAX_FILE: usize = 1024;
+
+#[controller("/avatars")]
+struct AvatarController;
+
+#[routes]
+impl AvatarController {
+    #[post("/")]
+    async fn upload(&self, mut form: Multipart) -> Result<String, HttpError> {
+        let mut total = 0;
+        while let Some(mut field) = form.next_field().await? {
+            let mut size = 0;
+            while let Some(chunk) = field.chunk().await? {
+                size += chunk.len();
+                if size > MAX_FILE {
+                    return Err(HttpError::new(StatusCode::PAYLOAD_TOO_LARGE, "a file is over 1 KiB"));
+                }
+                // 在這裡把 chunk 寫進儲存空間
+            }
+            total += size;
+        }
+        Ok(format!("{total} bytes"))
+    }
+}
+
+/// 上傳的路由，body 上限 64 KiB；其他模組維持預設。
+struct AvatarModule;
+
+impl Module for AvatarModule {
+    fn define(&self, m: &mut ModuleDef) {
+        m.controller::<AvatarController>()
+            .layer(DefaultBodyLimit::max(64 * 1024));
+    }
+}
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+use hornero_testing::{MultipartForm, TestApp};
+
+let app = TestApp::new(AvatarModule).build().await.unwrap();
+let client = app.client();
+let small = MultipartForm::new().file("avatar", "a.png", "image/png", vec![0u8; 512]);
+assert_eq!(client.post("/avatars").multipart(small).await.text(), "512 bytes");
+
+// 一個檔案超過 1 KiB：handler 自己的 413。
+let big = MultipartForm::new().file("avatar", "a.png", "image/png", vec![0u8; 2048]);
+let res = client.post("/avatars").multipart(big).await;
+assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+assert_eq!(res.json::<serde_json::Value>()["detail"], "a file is over 1 KiB");
+
+// 每個檔案都不到 1 KiB，但合計超過模組的 64 KiB：axum 的 413。
+let many = (0..80).fold(MultipartForm::new(), |form, i| {
+    form.file("avatar", &format!("{i}.png"), "image/png", vec![0u8; 1000])
+});
+let res = client.post("/avatars").multipart(many).await;
+assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+assert_eq!(res.json::<serde_json::Value>()["detail"], "Request payload is too large");
+# }
+```
+
+timeout layer（例如上面的 30 秒 `TimeoutLayer`）也會中斷太慢的上傳。
+
+在 OpenAPI 文件裡，`Multipart` 參數推導成 `multipart/form-data` 的 body，但說不出欄位；用 `#[api_body]` 描述它們，見 [OpenAPI](16-openapi.md#補充推導不出來的部分)。
+
 ## 每個環境不同的設定
 
 `Source` 的後者覆寫前者，因此常見的分層是：程式內預設值 → `config.toml` → 環境變數。

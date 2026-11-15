@@ -233,7 +233,8 @@ impl HttpError {
             tracing::error!(
                 status = %self.status,
                 error = %chain.unwrap_or_default(),
-                "unhandled {raised}: add an ExceptionFilter for it to choose the status",
+                "unhandled {raised}: {}",
+                unhandled_hint(raised),
             );
             return;
         }
@@ -243,6 +244,16 @@ impl HttpError {
             }
             None => tracing::error!(status = %self.status, "{}", self.message),
         }
+    }
+}
+
+/// What to do about a raised error of the type `raised` that no filter mapped.
+fn unhandled_hint(raised: &str) -> &'static str {
+    // With hornero's feature on, these are answers and never raised: only axum's feature is on.
+    if raised.starts_with("axum::extract::multipart::") {
+        "enable hornero's `multipart` feature for axum's multipart errors to keep their status"
+    } else {
+        "add an ExceptionFilter for it to choose the status"
     }
 }
 
@@ -260,7 +271,8 @@ fn source_chain(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String
 
 /// What `?` does: carries `err` to the exception filter for its type, as a 500 until one maps it.
 /// axum's own rejections are answers instead, with their status, as when axum extracts them from
-/// a handler parameter: no filter sees them either way.
+/// a handler parameter: no filter sees them either way. So are the errors of reading a
+/// `Multipart` body, with the `multipart` feature.
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
     fn from(err: E) -> Self {
         if let Some(answer) = Self::axum_rejection(&err) {
@@ -275,8 +287,9 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for HttpError {
 impl HttpError {
     /// axum's own rejections know their status: `Query::from_request_parts(..).await?` inside an
     /// `Extractor` answers 400, as the same extractor in a handler does. So does a rejection's
-    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say). Only the types of
-    /// axum's default features: those of `ws` or `multipart` are not visible here, and a filter
+    /// variant forwarded on its own (`FailedToDeserializeQueryString`, say), and, with the
+    /// `multipart` feature, the errors of reading a `Multipart` body (400, or 413 past the body
+    /// limit). The types of axum's other optional features (`ws`) are not visible here: a filter
     /// maps them.
     fn axum_rejection<E: 'static>(err: &E) -> Option<Self> {
         use axum::extract::rejection::*;
@@ -321,6 +334,11 @@ impl HttpError {
             UnknownBodyError,
             InvalidUtf8,
         );
+        #[cfg(feature = "multipart")]
+        {
+            use axum::extract::multipart::{InvalidBoundary, MultipartError, MultipartRejection};
+            known!(MultipartRejection, InvalidBoundary, MultipartError);
+        }
         None
     }
 }
@@ -846,6 +864,12 @@ mod tests {
         let response = HttpError::conflict("taken").into_response();
         let attached = HttpError::in_response(&response).unwrap();
         assert_eq!(attached.message(), "taken");
+    }
+
+    #[test]
+    fn unhandled_multipart_errors_point_to_hornero_s_feature() {
+        assert!(unhandled_hint("axum::extract::multipart::MultipartError").contains("`multipart`"));
+        assert!(unhandled_hint("app::TodoError").contains("ExceptionFilter"));
     }
 
     #[test]

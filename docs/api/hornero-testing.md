@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["macros", "rt"] }
 | [`TestAppBuilder`](#testappbuilder) | 設定 override 與其他 `Hornero` 選項 |
 | [`TestClient`](#testclient) | in-process 的 HTTP client |
 | [`TestRequest`](#testrequest) | 建構中的 request，`.await` 就會送出 |
+| [`MultipartForm`](#multipartform) | `multipart/form-data` body |
 | [`TestResponse`](#testresponse) | 讀完 body 的回應 |
 
 使用方式見 [測試](../guide/09-testing.md)。
@@ -99,10 +100,30 @@ impl IntoFuture for TestRequest { type Output = TestResponse; /* ... */ }
 | `fn bearer(self, token: &str) -> Self` | `header("authorization", "Bearer {token}")` |
 | `fn peer_addr(self, addr: SocketAddr) -> Self` | 設定 handler 透過 `ConnectInfo<SocketAddr>` 看到的 client 位址；預設為 `127.0.0.1:40000` |
 | `fn json<T: Serialize + ?Sized>(self, body: &T) -> Self` | JSON body，並設定 `content-type: application/json` |
+| `fn multipart(self, form: MultipartForm) -> Self` | `multipart/form-data` body，並設定帶有 boundary 的 `content-type` |
 | `fn body(self, body: impl Into<Body>) -> Self` | 任意 body，例如 `String`、`&'static str`、`Vec<u8>`；不會設定 `content-type` |
 | `async fn send(self) -> TestResponse` | 送出 request 並讀完 body |
 
 `TestRequest` 實作了 `IntoFuture`，所以 `client.get("/").await` 與 `client.get("/").send().await` 相同。
+
+---
+
+## `MultipartForm`
+
+```rust,ignore
+#[derive(Debug, Clone, Default)]
+pub struct MultipartForm { /* ... */ }
+```
+
+[`TestRequest::multipart`](#testrequest) 的 body：文字欄位與檔案，依加入的順序送出。不需要任何 feature；讀取它的 handler 需要 `hornero` 的 `multipart` feature。
+
+| 方法 | 說明 |
+|---|---|
+| `fn new() -> Self` | 空的 form |
+| `fn text(self, name: &str, value: &str) -> Self` | 文字欄位 |
+| `fn file(self, name: &str, file_name: &str, content_type: &str, data: impl Into<Bytes>) -> Self` | 檔案：欄位名稱、檔名、content type 與內容 |
+
+boundary 會避開每個欄位的內容，所以內容可以是任意 bytes。欄位名稱或檔名含有 `"`、CR 或 LF，或 `content_type` 不是合法的 header 值時會 panic。要測試格式錯誤的 body，用 `header("content-type", ..)` 加上 `body(..)` 自己組。
 
 ---
 

@@ -312,7 +312,8 @@ assert!(body["error"].as_str().unwrap().starts_with("Failed to parse the request
 axum 的 rejection 怎麼變成錯誤：
 
 - axum 內建 extractor 的 rejection 保留它的狀態碼與訊息。在 [`Extractor`](06-scopes.md#需要-provider-的-extractor) 裡對它用 `?`（例如 `Query::<Page>::from_request_parts(parts, &()).await?`）也一樣是 400，不會變成 500；它和 handler 參數的 rejection 一樣是回答，filter 看不到。拆開 rejection、只用 `?` 轉出其中的變體（例如 `QueryRejection::FailedToDeserializeQueryString(inner)` 的 `inner`）也一樣。
-- 上一條只涵蓋 axum 預設 feature 裡的型別。選用 feature 的型別（`ws` 的 `WebSocketUpgradeRejection`、`multipart` 的 `MultipartRejection` 與 `next_field` 回傳的 `MultipartError` 等）hornero 不認得：當 handler 參數時照下面「其他 rejection」處理，狀態碼一樣保留；經 `?` 轉換時則是拋出的錯誤，沒有 filter 就是 500。需要時替該型別寫一個 filter，`catch` 回傳 `HttpError::new(err.status(), err.body_text())`。
+- 開啟 hornero 的 `multipart` feature 時，讀取 `Multipart` 的錯誤（`MultipartRejection`，以及 `next_field`、`bytes` 等回傳的 `MultipartError`）也一樣：格式錯誤是 400，超過 body 上限是 413，見 [檔案上傳](14-recipes.md#檔案上傳)。只開 axum 的 `multipart` feature 時 hornero 看不到這些型別，它們經 `?` 會變成 500，log 會提示開啟 hornero 的 feature。
+- 其他選用 feature 的型別（例如 `ws` 的 `WebSocketUpgradeRejection`）hornero 不認得：當 handler 參數時照下面「其他 rejection」處理，狀態碼一樣保留；經 `?` 轉換時則是拋出的錯誤，沒有 filter 就是 500。需要時替該型別寫一個 filter，`catch` 回傳 `HttpError::new(err.status(), err.body_text())`。
 - `Rejection = HttpError` 的 extractor（包括 `hornero-validation` 的 `Valid`）回傳的就是那個 `HttpError`。
 - 其他 rejection 取它的狀態碼、文字與 header（同名的多個值都保留），例如 `(StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")], "missing bearer token")`。描述原本 body 的 `Content-Type`、`Content-Length`、`Content-Encoding` 不保留，因為 renderer 會產生新的 body；有 `Content-Encoding`（例如 gzip）的 body 不當成文字讀，訊息改用狀態碼的名稱。
 - 不是 4xx / 5xx 的 rejection（例如導向登入頁的 `Redirect`）不是錯誤，原樣送出。

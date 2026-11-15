@@ -11,6 +11,9 @@ license.workspace = true
 openapi = ["dep:hornero-openapi", "hornero-macros/openapi"]
 # `openapi` plus Swagger UI served next to the document.
 swagger-ui = ["openapi", "hornero-openapi/swagger-ui"]
+# File uploads: axum's `Multipart` extractor, as `hornero::axum::extract::Multipart`, whose errors keep
+# axum's status (400, 413) when forwarded with `?`.
+multipart = ["hornero-core/multipart", "axum/multipart"]
 
 [dependencies]
 axum.workspace = true
